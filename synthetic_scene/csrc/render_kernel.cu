@@ -7,6 +7,7 @@
 namespace {
 
 constexpr int kMaxSpheres = 64;
+constexpr int kMaxPlanes = 64;
 
 struct Vec3 {
   float x;
@@ -14,11 +15,40 @@ struct Vec3 {
   float z;
 };
 
-__device__ __forceinline__ Vec3 make_vec3(float x, float y, float z) {
+struct CameraView {
+  const float* origin;
+  float fov_degrees;
+};
+
+struct RenderOptionsView {
+  const float* light_dir;
+  const float* background;
+};
+
+struct SphereView {
+  const float* centers;
+  const float* radii;
+  const float* colors;
+  int count;
+};
+
+struct PlaneView {
+  const float* points;
+  const float* normals;
+  const float* colors;
+  int count;
+};
+
+struct SceneView {
+  SphereView spheres;
+  PlaneView planes;
+};
+
+__host__ __device__ __forceinline__ Vec3 make_vec3(float x, float y, float z) {
   return Vec3{x, y, z};
 }
 
-__device__ __forceinline__ Vec3 load_vec3(const float* ptr) {
+__host__ __device__ __forceinline__ Vec3 load_vec3(const float* ptr) {
   return make_vec3(ptr[0], ptr[1], ptr[2]);
 }
 
@@ -43,30 +73,25 @@ __device__ __forceinline__ Vec3 normalize(Vec3 v) {
   return mul(v, rsqrtf(len2));
 }
 
-__global__ void render_spheres_kernel(
+__global__ void render_scene_kernel(
     float* image,
     int width,
     int height,
-    const float* camera_origin_ptr,
-    const float* sphere_centers_ptr,
-    const float* sphere_radii_ptr,
-    int sphere_count,
-    const float* light_dir_ptr,
-    float fov_degrees,
-    const float* background_ptr,
-    const float* sphere_colors_ptr) {
+    CameraView camera,
+    SceneView scene,
+    RenderOptionsView options) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= width || y >= height) {
     return;
   }
 
-  const Vec3 camera_origin = load_vec3(camera_origin_ptr);
-  const Vec3 light_dir = normalize(load_vec3(light_dir_ptr));
-  const Vec3 background = load_vec3(background_ptr);
+  const Vec3 camera_origin = load_vec3(camera.origin);
+  const Vec3 light_dir = normalize(load_vec3(options.light_dir));
+  const Vec3 background = load_vec3(options.background);
 
   const float aspect = static_cast<float>(width) / static_cast<float>(height);
-  const float fov_radians = fov_degrees * 0.017453292519943295f;
+  const float fov_radians = camera.fov_degrees * 0.017453292519943295f;
   const float image_plane_scale = tanf(0.5f * fov_radians);
   const float px = ((static_cast<float>(x) + 0.5f) / static_cast<float>(width) * 2.0f - 1.0f) *
       aspect * image_plane_scale;
@@ -81,15 +106,16 @@ __global__ void render_spheres_kernel(
   Vec3 color = background;
   float closest_t = 3.402823466e+38f;
   int closest_sphere = -1;
+  int closest_plane = -1;
 
   #pragma unroll
   for (int sphere_idx = 0; sphere_idx < kMaxSpheres; ++sphere_idx) {
-    if (sphere_idx >= sphere_count) {
+    if (sphere_idx >= scene.spheres.count) {
       break;
     }
 
-    const Vec3 sphere_center = load_vec3(sphere_centers_ptr + sphere_idx * 3);
-    const float sphere_radius = sphere_radii_ptr[sphere_idx];
+    const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_idx * 3);
+    const float sphere_radius = scene.spheres.radii[sphere_idx];
     const Vec3 oc = sub(ray_origin, sphere_center);
     const float b = 2.0f * dot(oc, ray_dir);
     const float c = dot(oc, oc) - sphere_radius * sphere_radius;
@@ -107,17 +133,48 @@ __global__ void render_spheres_kernel(
     if (t > 1.0e-4f && t < closest_t) {
       closest_t = t;
       closest_sphere = sphere_idx;
+      closest_plane = -1;
+    }
+  }
+
+  #pragma unroll
+  for (int plane_idx = 0; plane_idx < kMaxPlanes; ++plane_idx) {
+    if (plane_idx >= scene.planes.count) {
+      break;
+    }
+
+    const Vec3 plane_point = load_vec3(scene.planes.points + plane_idx * 3);
+    const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_idx * 3));
+    const float denom = dot(ray_dir, plane_normal);
+    if (fabsf(denom) < 1.0e-6f) {
+      continue;
+    }
+
+    const float t = dot(sub(plane_point, ray_origin), plane_normal) / denom;
+    if (t > 1.0e-4f && t < closest_t) {
+      closest_t = t;
+      closest_sphere = -1;
+      closest_plane = plane_idx;
     }
   }
 
   if (closest_sphere >= 0) {
-    const Vec3 sphere_center = load_vec3(sphere_centers_ptr + closest_sphere * 3);
-    const Vec3 sphere_color = load_vec3(sphere_colors_ptr + closest_sphere * 3);
+    const Vec3 sphere_center = load_vec3(scene.spheres.centers + closest_sphere * 3);
+    const Vec3 sphere_color = load_vec3(scene.spheres.colors + closest_sphere * 3);
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(sub(hit, sphere_center));
     const float shade = fmaxf(dot(normal, light_dir), 0.0f);
     const float ambient = 0.08f;
     color = mul(sphere_color, ambient + (1.0f - ambient) * shade);
+  } else if (closest_plane >= 0) {
+    Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + closest_plane * 3));
+    if (dot(plane_normal, ray_dir) > 0.0f) {
+      plane_normal = mul(plane_normal, -1.0f);
+    }
+    const Vec3 plane_color = load_vec3(scene.planes.colors + closest_plane * 3);
+    const float shade = fmaxf(dot(plane_normal, light_dir), 0.0f);
+    const float ambient = 0.08f;
+    color = mul(plane_color, ambient + (1.0f - ambient) * shade);
   }
 
   const int offset = (y * width + x) * 3;
@@ -128,35 +185,58 @@ __global__ void render_spheres_kernel(
 
 }  // namespace
 
-void render_spheres_cuda(
+void render_scene_cuda(
     torch::Tensor image,
     torch::Tensor camera_origin,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
+    torch::Tensor plane_points,
+    torch::Tensor plane_normals,
     torch::Tensor light_dir,
     double fov_degrees,
     torch::Tensor background,
-    torch::Tensor sphere_colors) {
+    torch::Tensor sphere_colors,
+    torch::Tensor plane_colors) {
   const int height = static_cast<int>(image.size(0));
   const int width = static_cast<int>(image.size(1));
   const int sphere_count = static_cast<int>(sphere_centers.size(0));
-  TORCH_CHECK(sphere_count <= kMaxSpheres, "render_spheres supports at most ", kMaxSpheres, " spheres");
+  const int plane_count = static_cast<int>(plane_points.size(0));
+  TORCH_CHECK(sphere_count <= kMaxSpheres, "render_scene supports at most ", kMaxSpheres, " spheres");
+  TORCH_CHECK(plane_count <= kMaxPlanes, "render_scene supports at most ", kMaxPlanes, " planes");
 
   const dim3 block(16, 16);
   const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
 
-  render_spheres_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+  const CameraView camera{
+      camera_origin.data_ptr<float>(),
+      static_cast<float>(fov_degrees),
+  };
+  const SceneView scene{
+      SphereView{
+          sphere_centers.data_ptr<float>(),
+          sphere_radii.data_ptr<float>(),
+          sphere_colors.data_ptr<float>(),
+          sphere_count,
+      },
+      PlaneView{
+          plane_points.data_ptr<float>(),
+          plane_normals.data_ptr<float>(),
+          plane_colors.data_ptr<float>(),
+          plane_count,
+      },
+  };
+  const RenderOptionsView options{
+      light_dir.data_ptr<float>(),
+      background.data_ptr<float>(),
+  };
+
+  render_scene_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
       image.data_ptr<float>(),
       width,
       height,
-      camera_origin.data_ptr<float>(),
-      sphere_centers.data_ptr<float>(),
-      sphere_radii.data_ptr<float>(),
-      sphere_count,
-      light_dir.data_ptr<float>(),
-      static_cast<float>(fov_degrees),
-      background.data_ptr<float>(),
-      sphere_colors.data_ptr<float>());
+      camera,
+      scene,
+      options);
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

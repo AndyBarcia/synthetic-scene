@@ -1,58 +1,106 @@
 #include <torch/extension.h>
 
-void render_spheres_cuda(
-    torch::Tensor image,
-    torch::Tensor camera_origin,
-    torch::Tensor sphere_centers,
-    torch::Tensor sphere_radii,
-    torch::Tensor light_dir,
-    double fov_degrees,
-    torch::Tensor background,
-    torch::Tensor sphere_colors);
+namespace py = pybind11;
 
-void render_spheres(
+void render_scene_cuda(
     torch::Tensor image,
     torch::Tensor camera_origin,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
+    torch::Tensor plane_points,
+    torch::Tensor plane_normals,
     torch::Tensor light_dir,
     double fov_degrees,
     torch::Tensor background,
-    torch::Tensor sphere_colors) {
+    torch::Tensor sphere_colors,
+    torch::Tensor plane_colors);
+
+py::dict require_dict(py::dict values, const char* key) {
+  const py::str py_key(key);
+  TORCH_CHECK(values.contains(py_key), "missing dictionary key: ", key);
+  return values[py_key].cast<py::dict>();
+}
+
+torch::Tensor require_tensor(py::dict values, const char* key) {
+  const py::str py_key(key);
+  TORCH_CHECK(values.contains(py_key), "missing dictionary key: ", key);
+  return values[py_key].cast<torch::Tensor>();
+}
+
+double require_double(py::dict values, const char* key) {
+  const py::str py_key(key);
+  TORCH_CHECK(values.contains(py_key), "missing dictionary key: ", key);
+  return values[py_key].cast<double>();
+}
+
+void render_scene(
+    torch::Tensor image,
+    py::dict camera,
+    py::dict scene,
+    py::dict options) {
+  const py::dict spheres = require_dict(scene, "spheres");
+  const py::dict planes = require_dict(scene, "planes");
+
+  const torch::Tensor camera_origin = require_tensor(camera, "origin");
+  const double fov_degrees = require_double(camera, "fov_degrees");
+  const torch::Tensor light_dir = require_tensor(options, "light_dir");
+  const torch::Tensor background = require_tensor(options, "background");
+
+  const torch::Tensor sphere_centers = require_tensor(spheres, "centers");
+  const torch::Tensor sphere_radii = require_tensor(spheres, "radii");
+  const torch::Tensor sphere_colors = require_tensor(spheres, "colors");
+
+  const torch::Tensor plane_points = require_tensor(planes, "points");
+  const torch::Tensor plane_normals = require_tensor(planes, "normals");
+  const torch::Tensor plane_colors = require_tensor(planes, "colors");
+
   TORCH_CHECK(image.is_cuda(), "image must be a CUDA tensor");
   TORCH_CHECK(image.dtype() == torch::kFloat32, "image must be float32");
   TORCH_CHECK(image.dim() == 3 && image.size(2) == 3, "image must be H x W x 3");
   TORCH_CHECK(camera_origin.is_cuda() && sphere_centers.is_cuda() && sphere_radii.is_cuda(), "scene tensors must be CUDA tensors");
-  TORCH_CHECK(light_dir.is_cuda() && background.is_cuda() && sphere_colors.is_cuda(), "scene tensors must be CUDA tensors");
+  TORCH_CHECK(plane_points.is_cuda() && plane_normals.is_cuda(), "scene tensors must be CUDA tensors");
+  TORCH_CHECK(light_dir.is_cuda() && background.is_cuda() && sphere_colors.is_cuda() && plane_colors.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(camera_origin.numel() == 3, "camera_origin must be vec3");
   TORCH_CHECK(sphere_centers.dim() == 2 && sphere_centers.size(1) == 3, "sphere_centers must be N x 3");
   TORCH_CHECK(sphere_radii.dim() == 1, "sphere_radii must be N");
+  TORCH_CHECK(plane_points.dim() == 2 && plane_points.size(1) == 3, "plane_points must be N x 3");
+  TORCH_CHECK(plane_normals.dim() == 2 && plane_normals.size(1) == 3, "plane_normals must be N x 3");
   TORCH_CHECK(sphere_colors.dim() == 2 && sphere_colors.size(1) == 3, "sphere_colors must be N x 3");
+  TORCH_CHECK(plane_colors.dim() == 2 && plane_colors.size(1) == 3, "plane_colors must be N x 3");
   TORCH_CHECK(sphere_centers.size(0) == sphere_radii.size(0), "sphere_centers and sphere_radii must have matching lengths");
   TORCH_CHECK(sphere_centers.size(0) == sphere_colors.size(0), "sphere_centers and sphere_colors must have matching lengths");
-  TORCH_CHECK(sphere_centers.size(0) > 0, "at least one sphere is required");
+  TORCH_CHECK(plane_points.size(0) == plane_normals.size(0), "plane_points and plane_normals must have matching lengths");
+  TORCH_CHECK(plane_points.size(0) == plane_colors.size(0), "plane_points and plane_colors must have matching lengths");
+  TORCH_CHECK(sphere_centers.size(0) > 0 || plane_points.size(0) > 0, "at least one object is required");
   TORCH_CHECK(light_dir.numel() == 3 && background.numel() == 3, "light/background vectors must be vec3");
   TORCH_CHECK(camera_origin.dtype() == torch::kFloat32, "camera_origin must be float32");
   TORCH_CHECK(sphere_centers.dtype() == torch::kFloat32, "sphere_centers must be float32");
   TORCH_CHECK(sphere_radii.dtype() == torch::kFloat32, "sphere_radii must be float32");
+  TORCH_CHECK(plane_points.dtype() == torch::kFloat32, "plane_points must be float32");
+  TORCH_CHECK(plane_normals.dtype() == torch::kFloat32, "plane_normals must be float32");
   TORCH_CHECK(light_dir.dtype() == torch::kFloat32, "light_dir must be float32");
   TORCH_CHECK(background.dtype() == torch::kFloat32, "background must be float32");
   TORCH_CHECK(sphere_colors.dtype() == torch::kFloat32, "sphere_colors must be float32");
+  TORCH_CHECK(plane_colors.dtype() == torch::kFloat32, "plane_colors must be float32");
   TORCH_CHECK(image.is_contiguous(), "image must be contiguous");
   TORCH_CHECK(camera_origin.is_contiguous() && sphere_centers.is_contiguous() && sphere_radii.is_contiguous(), "scene tensors must be contiguous");
-  TORCH_CHECK(light_dir.is_contiguous() && background.is_contiguous() && sphere_colors.is_contiguous(), "scene tensors must be contiguous");
+  TORCH_CHECK(plane_points.is_contiguous() && plane_normals.is_contiguous(), "scene tensors must be contiguous");
+  TORCH_CHECK(light_dir.is_contiguous() && background.is_contiguous() && sphere_colors.is_contiguous() && plane_colors.is_contiguous(), "scene tensors must be contiguous");
 
-  render_spheres_cuda(
+  render_scene_cuda(
       image,
       camera_origin,
       sphere_centers,
       sphere_radii,
+      plane_points,
+      plane_normals,
       light_dir,
       fov_degrees,
       background,
-      sphere_colors);
+      sphere_colors,
+      plane_colors);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("render_spheres", &render_spheres, "Render Lambert-shaded spheres (CUDA)");
+  m.def("render_scene", &render_scene, "Render Lambert-shaded geometric objects (CUDA)");
 }
