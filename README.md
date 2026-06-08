@@ -2,6 +2,8 @@
 
 Tiny CUDA/PyTorch synthetic scene renderer.
 
+![Example render](outputs/render.png)
+
 The renderer draws Lambert-shaded geometric objects entirely in CUDA and returns
 an `H x W x 3` float32 CUDA tensor that can be saved from Python. It supports up
 to 64 spheres, 64 oriented boxes, and 64 planes per render.
