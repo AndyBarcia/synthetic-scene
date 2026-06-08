@@ -1,3 +1,3 @@
-from .renderer import render_sphere, save_image
+from .renderer import render_spheres, save_image
 
-__all__ = ["render_sphere", "save_image"]
+__all__ = ["render_spheres", "save_image"]
