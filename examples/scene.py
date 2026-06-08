@@ -1,4 +1,4 @@
-from synthetic_scene import Scene, Spheres
+from synthetic_scene import OrientedBoxes, Scene, Spheres
 
 
 def default_scene() -> Scene:
@@ -14,6 +14,32 @@ def default_scene() -> Scene:
                 (0.9, 0.25, 0.18),
                 (0.2, 0.62, 0.95),
                 (0.95, 0.82, 0.22),
+            ],
+        ),
+        boxes=OrientedBoxes(
+            centers=[
+                (-1.65, -0.45, -3.45),
+                (1.65, -0.42, -3.75),
+            ],
+            half_sizes=[
+                (0.34, 0.42, 0.55),
+                (0.46, 0.32, 0.42),
+            ],
+            axes=[
+                (
+                    (0.866, 0.0, -0.5),
+                    (0.0, 1.0, 0.0),
+                    (0.5, 0.0, 0.866),
+                ),
+                (
+                    (0.707, 0.0, 0.707),
+                    (0.0, 1.0, 0.0),
+                    (-0.707, 0.0, 0.707),
+                ),
+            ],
+            colors=[
+                (0.42, 0.9, 0.48),
+                (0.78, 0.48, 0.95),
             ],
         ),
     )

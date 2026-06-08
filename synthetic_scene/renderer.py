@@ -40,9 +40,18 @@ class Planes:
 
 
 @dataclass(frozen=True)
+class OrientedBoxes:
+    centers: Vec3List = ()
+    half_sizes: Vec3List = ()
+    axes: Union[Sequence[Sequence[Vec3]], torch.Tensor] = ()
+    colors: Vec3List = ()
+
+
+@dataclass(frozen=True)
 class Scene:
     spheres: Spheres = field(default_factory=Spheres)
     planes: Planes = field(default_factory=Planes)
+    boxes: OrientedBoxes = field(default_factory=OrientedBoxes)
 
 
 def _vec3(value: Vec3, *, device: torch.device | str = "cuda") -> torch.Tensor:
@@ -61,6 +70,15 @@ def _vec3_list(value: Vec3List, *, device: torch.device | str = "cuda") -> torch
     return tensor.contiguous()
 
 
+def _mat3_list(value: Union[Sequence[Sequence[Vec3]], torch.Tensor], *, device: torch.device | str = "cuda") -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+    if tensor.numel() == 0:
+        return tensor.reshape(0, 3, 3).contiguous()
+    if tensor.ndim != 3 or tensor.shape[1:] != (3, 3):
+        raise ValueError("expected matrices with shape N x 3 x 3")
+    return tensor.contiguous()
+
+
 def render_scene(
     width: int = 512,
     height: int = 512,
@@ -69,7 +87,7 @@ def render_scene(
     camera: Camera | None = None,
     options: RenderOptions | None = None,
 ) -> torch.Tensor:
-    """Render Lambert-shaded spheres and infinite planes into an H x W x 3 CUDA tensor."""
+    """Render Lambert-shaded spheres, oriented boxes, and infinite planes into an H x W x 3 CUDA tensor."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to render with this extension")
     if width <= 0 or height <= 0:
@@ -86,18 +104,29 @@ def render_scene(
     points = _vec3_list(scene_data.planes.points, device=device)
     normals = _vec3_list(scene_data.planes.normals, device=device)
     plane_colors_tensor = _vec3_list(scene_data.planes.colors, device=device)
+    box_centers = _vec3_list(scene_data.boxes.centers, device=device)
+    box_half_sizes = _vec3_list(scene_data.boxes.half_sizes, device=device)
+    box_axes = _mat3_list(scene_data.boxes.axes, device=device)
+    box_colors = _vec3_list(scene_data.boxes.colors, device=device)
     sphere_count = centers.shape[0]
     plane_count = points.shape[0]
-    if sphere_count == 0 and plane_count == 0:
+    box_count = box_centers.shape[0]
+    if sphere_count == 0 and plane_count == 0 and box_count == 0:
         raise ValueError("at least one object is required")
     if radii.shape[0] != sphere_count or colors.shape[0] != sphere_count:
         raise ValueError("sphere_centers, sphere_radii, and sphere_colors must have matching lengths")
     if normals.shape[0] != plane_count or plane_colors_tensor.shape[0] != plane_count:
         raise ValueError("plane_points, plane_normals, and plane_colors must have matching lengths")
+    if box_half_sizes.shape[0] != box_count or box_axes.shape[0] != box_count or box_colors.shape[0] != box_count:
+        raise ValueError("box_centers, box_half_sizes, box_axes, and box_colors must have matching lengths")
     if bool((radii <= 0).any().item()):
         raise ValueError("sphere_radii must all be positive")
     if bool((normals.norm(dim=1) <= 1.0e-8).any().item()):
         raise ValueError("plane_normals must be non-zero")
+    if bool((box_half_sizes <= 0).any().item()):
+        raise ValueError("box_half_sizes must all be positive")
+    if bool((box_axes.norm(dim=2) <= 1.0e-8).any().item()):
+        raise ValueError("box_axes must contain non-zero axis vectors")
 
     image = torch.empty((height, width, 3), dtype=torch.float32, device=device)
     _cuda_renderer.render_scene(
@@ -116,6 +145,12 @@ def render_scene(
                 "points": points,
                 "normals": normals,
                 "colors": plane_colors_tensor,
+            },
+            "boxes": {
+                "centers": box_centers,
+                "half_sizes": box_half_sizes,
+                "axes": box_axes,
+                "colors": box_colors,
             },
         },
         {

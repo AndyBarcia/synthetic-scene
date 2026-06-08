@@ -8,6 +8,7 @@ namespace {
 
 constexpr int kMaxSpheres = 64;
 constexpr int kMaxPlanes = 64;
+constexpr int kMaxBoxes = 64;
 
 struct Vec3 {
   float x;
@@ -39,9 +40,18 @@ struct PlaneView {
   int count;
 };
 
+struct BoxView {
+  const float* centers;
+  const float* half_sizes;
+  const float* axes;
+  const float* colors;
+  int count;
+};
+
 struct SceneView {
   SphereView spheres;
   PlaneView planes;
+  BoxView boxes;
 };
 
 __host__ __device__ __forceinline__ Vec3 make_vec3(float x, float y, float z) {
@@ -71,6 +81,92 @@ __device__ __forceinline__ float dot(Vec3 a, Vec3 b) {
 __device__ __forceinline__ Vec3 normalize(Vec3 v) {
   const float len2 = fmaxf(dot(v, v), 1.0e-20f);
   return mul(v, rsqrtf(len2));
+}
+
+__device__ __forceinline__ bool intersect_box(
+    Vec3 ray_origin,
+    Vec3 ray_dir,
+    Vec3 center,
+    Vec3 half_size,
+    const float* axes,
+    float* out_t,
+    Vec3* out_normal) {
+  const Vec3 axis_x = normalize(load_vec3(axes + 0));
+  const Vec3 axis_y = normalize(load_vec3(axes + 3));
+  const Vec3 axis_z = normalize(load_vec3(axes + 6));
+  const Vec3 local_origin_delta = sub(ray_origin, center);
+
+  const float origin_local[3] = {
+      dot(local_origin_delta, axis_x),
+      dot(local_origin_delta, axis_y),
+      dot(local_origin_delta, axis_z),
+  };
+  const float dir_local[3] = {
+      dot(ray_dir, axis_x),
+      dot(ray_dir, axis_y),
+      dot(ray_dir, axis_z),
+  };
+  const float extents[3] = {half_size.x, half_size.y, half_size.z};
+  const Vec3 world_axes[3] = {axis_x, axis_y, axis_z};
+
+  float t_min = -3.402823466e+38f;
+  float t_max = 3.402823466e+38f;
+  Vec3 near_normal = make_vec3(0.0f, 0.0f, 0.0f);
+  Vec3 far_normal = make_vec3(0.0f, 0.0f, 0.0f);
+
+  #pragma unroll
+  for (int axis_idx = 0; axis_idx < 3; ++axis_idx) {
+    const float origin_axis = origin_local[axis_idx];
+    const float dir_axis = dir_local[axis_idx];
+    const float extent = extents[axis_idx];
+
+    if (fabsf(dir_axis) < 1.0e-6f) {
+      if (origin_axis < -extent || origin_axis > extent) {
+        return false;
+      }
+      continue;
+    }
+
+    const float inv_dir = 1.0f / dir_axis;
+    float t1 = (-extent - origin_axis) * inv_dir;
+    float t2 = (extent - origin_axis) * inv_dir;
+    Vec3 n1 = mul(world_axes[axis_idx], -1.0f);
+    Vec3 n2 = world_axes[axis_idx];
+    if (t1 > t2) {
+      const float tmp_t = t1;
+      t1 = t2;
+      t2 = tmp_t;
+      const Vec3 tmp_n = n1;
+      n1 = n2;
+      n2 = tmp_n;
+    }
+
+    if (t1 > t_min) {
+      t_min = t1;
+      near_normal = n1;
+    }
+    if (t2 < t_max) {
+      t_max = t2;
+      far_normal = n2;
+    }
+    if (t_min > t_max) {
+      return false;
+    }
+  }
+
+  float t = t_min;
+  Vec3 normal = near_normal;
+  if (t <= 1.0e-4f) {
+    t = t_max;
+    normal = far_normal;
+  }
+  if (t <= 1.0e-4f) {
+    return false;
+  }
+
+  *out_t = t;
+  *out_normal = normal;
+  return true;
 }
 
 __global__ void render_scene_kernel(
@@ -107,6 +203,8 @@ __global__ void render_scene_kernel(
   float closest_t = 3.402823466e+38f;
   int closest_sphere = -1;
   int closest_plane = -1;
+  int closest_box = -1;
+  Vec3 closest_box_normal = make_vec3(0.0f, 0.0f, 0.0f);
 
   #pragma unroll
   for (int sphere_idx = 0; sphere_idx < kMaxSpheres; ++sphere_idx) {
@@ -134,6 +232,27 @@ __global__ void render_scene_kernel(
       closest_t = t;
       closest_sphere = sphere_idx;
       closest_plane = -1;
+      closest_box = -1;
+    }
+  }
+
+  #pragma unroll
+  for (int box_idx = 0; box_idx < kMaxBoxes; ++box_idx) {
+    if (box_idx >= scene.boxes.count) {
+      break;
+    }
+
+    const Vec3 box_center = load_vec3(scene.boxes.centers + box_idx * 3);
+    const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_idx * 3);
+    float t = 0.0f;
+    Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
+    if (intersect_box(ray_origin, ray_dir, box_center, box_half_size, scene.boxes.axes + box_idx * 9, &t, &normal) &&
+        t < closest_t) {
+      closest_t = t;
+      closest_sphere = -1;
+      closest_plane = -1;
+      closest_box = box_idx;
+      closest_box_normal = normal;
     }
   }
 
@@ -155,6 +274,7 @@ __global__ void render_scene_kernel(
       closest_t = t;
       closest_sphere = -1;
       closest_plane = plane_idx;
+      closest_box = -1;
     }
   }
 
@@ -166,6 +286,15 @@ __global__ void render_scene_kernel(
     const float shade = fmaxf(dot(normal, light_dir), 0.0f);
     const float ambient = 0.08f;
     color = mul(sphere_color, ambient + (1.0f - ambient) * shade);
+  } else if (closest_box >= 0) {
+    Vec3 normal = normalize(closest_box_normal);
+    if (dot(normal, ray_dir) > 0.0f) {
+      normal = mul(normal, -1.0f);
+    }
+    const Vec3 box_color = load_vec3(scene.boxes.colors + closest_box * 3);
+    const float shade = fmaxf(dot(normal, light_dir), 0.0f);
+    const float ambient = 0.08f;
+    color = mul(box_color, ambient + (1.0f - ambient) * shade);
   } else if (closest_plane >= 0) {
     Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + closest_plane * 3));
     if (dot(plane_normal, ray_dir) > 0.0f) {
@@ -192,17 +321,23 @@ void render_scene_cuda(
     torch::Tensor sphere_radii,
     torch::Tensor plane_points,
     torch::Tensor plane_normals,
+    torch::Tensor box_centers,
+    torch::Tensor box_half_sizes,
+    torch::Tensor box_axes,
     torch::Tensor light_dir,
     double fov_degrees,
     torch::Tensor background,
     torch::Tensor sphere_colors,
-    torch::Tensor plane_colors) {
+    torch::Tensor plane_colors,
+    torch::Tensor box_colors) {
   const int height = static_cast<int>(image.size(0));
   const int width = static_cast<int>(image.size(1));
   const int sphere_count = static_cast<int>(sphere_centers.size(0));
   const int plane_count = static_cast<int>(plane_points.size(0));
+  const int box_count = static_cast<int>(box_centers.size(0));
   TORCH_CHECK(sphere_count <= kMaxSpheres, "render_scene supports at most ", kMaxSpheres, " spheres");
   TORCH_CHECK(plane_count <= kMaxPlanes, "render_scene supports at most ", kMaxPlanes, " planes");
+  TORCH_CHECK(box_count <= kMaxBoxes, "render_scene supports at most ", kMaxBoxes, " boxes");
 
   const dim3 block(16, 16);
   const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
@@ -223,6 +358,13 @@ void render_scene_cuda(
           plane_normals.data_ptr<float>(),
           plane_colors.data_ptr<float>(),
           plane_count,
+      },
+      BoxView{
+          box_centers.data_ptr<float>(),
+          box_half_sizes.data_ptr<float>(),
+          box_axes.data_ptr<float>(),
+          box_colors.data_ptr<float>(),
+          box_count,
       },
   };
   const RenderOptionsView options{
