@@ -62,8 +62,51 @@ class Scene:
 @dataclass(frozen=True)
 class RenderResult:
     image: torch.Tensor
+    visible_count: torch.Tensor
+    visible_classes: torch.Tensor
     instance_map: torch.Tensor
     semantic_map: torch.Tensor
+
+
+def _compact_visible_instances(
+    instance_map: torch.Tensor,
+    *,
+    sphere_count: int,
+    plane_count: int,
+    box_count: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return per-image visible classes and maps with compact 1-based IDs."""
+    batch_size = instance_map.shape[0]
+    max_gt = sphere_count + plane_count + box_count
+    visible_count = torch.empty((batch_size,), dtype=torch.int32, device=instance_map.device)
+    visible_classes = torch.zeros((batch_size, max_gt), dtype=torch.int32, device=instance_map.device)
+    compact_map = torch.empty_like(instance_map)
+
+    class_lookup = torch.zeros((max_gt + 1,), dtype=torch.int32, device=instance_map.device)
+    if sphere_count:
+        class_lookup[1 : sphere_count + 1] = 1
+    if plane_count:
+        plane_start = sphere_count + 1
+        class_lookup[plane_start : plane_start + plane_count] = 2
+    if box_count:
+        box_start = sphere_count + plane_count + 1
+        class_lookup[box_start : box_start + box_count] = 3
+
+    for batch_idx in range(batch_size):
+        labels = torch.unique(instance_map[batch_idx])
+        labels = labels[labels > 0]
+        count = int(labels.numel())
+        visible_count[batch_idx] = count
+        if count == 0:
+            compact_map[batch_idx].zero_()
+            continue
+
+        remap = torch.zeros((max_gt + 1,), dtype=torch.int32, device=instance_map.device)
+        remap[labels.to(torch.long)] = torch.arange(1, count + 1, dtype=torch.int32, device=instance_map.device)
+        compact_map[batch_idx] = remap[instance_map[batch_idx].to(torch.long)]
+        visible_classes[batch_idx, :count] = class_lookup[labels.to(torch.long)]
+
+    return visible_count, visible_classes, compact_map
 
 
 def _vec3(value: Vec3, *, device: torch.device | str = "cuda") -> torch.Tensor:
@@ -244,7 +287,19 @@ def render_scene(
         },
     )
     if return_maps:
-        return RenderResult(image=image, instance_map=instance_map, semantic_map=semantic_map)
+        visible_count, visible_classes, instance_map = _compact_visible_instances(
+            instance_map,
+            sphere_count=sphere_count,
+            plane_count=plane_count,
+            box_count=box_count,
+        )
+        return RenderResult(
+            image=image,
+            visible_count=visible_count,
+            visible_classes=visible_classes,
+            instance_map=instance_map,
+            semantic_map=semantic_map,
+        )
     return image
 
 

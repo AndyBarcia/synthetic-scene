@@ -5,7 +5,7 @@ Tiny CUDA/PyTorch synthetic scene renderer.
 ![Example render](outputs/render.png)
 
 The renderer draws Lambert-shaded geometric objects entirely in CUDA and can
-return batched RGB, instance, and semantic label tensors. It supports up to 64
+return batched RGB plus panoptic-friendly segmentation tensors. It supports up to 64
 spheres, 64 oriented boxes, and 64 planes per render.
 
 ## Build
@@ -88,9 +88,16 @@ save_label_map_visualization(result.semantic_map[0], "outputs/semantic_map.png")
 ```
 
 `instance_map` is a `B x H x W int32` tensor with `0` for background and one
-unique ID for each visible object. IDs are assigned in scene order: spheres
-first, then planes, then boxes. `semantic_map` is a `B x H x W int32` tensor
-with primitive class labels: `0 = background`, `1 = sphere`, `2 = plane`,
+sequential ID for each visible object in that image. `visible_count` is a
+`B int32` tensor with the number of visible objects per image, and
+`visible_classes` is a `B x MAX_GT int32` tensor where columns
+`0:visible_count[b]` contain the class labels corresponding to instance IDs
+`1:visible_count[b]` in `instance_map[b]`. `MAX_GT` is the total number of
+objects in the scene. Class labels are `1 = sphere`, `2 = plane`, `3 = box`;
+unused class slots and background pixels are `0`.
+
+`semantic_map` is also returned as a `B x H x W int32` compatibility tensor with
+primitive class labels per pixel: `0 = background`, `1 = sphere`, `2 = plane`,
 `3 = box`.
 Raw label maps are saved as 16-bit PNGs so the numeric IDs are preserved. The
 visualization helper maps each consecutive integer label to a deterministic

@@ -37,6 +37,8 @@ def main() -> None:
     print(f"wrote {output}")
     print(f"wrote {output.with_name('instance_map.png')}")
     print(f"wrote {output.with_name('semantic_map.png')}")
+    print(f"visible counts: {result.visible_count.tolist()}")
+    print(f"visible classes: {[classes[:count].tolist() for classes, count in zip(result.visible_classes, result.visible_count)]}")
 
 
 if __name__ == "__main__":
