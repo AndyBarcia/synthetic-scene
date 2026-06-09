@@ -1,6 +1,10 @@
+import os
+
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+
+os.environ["TORCH_CUDA_ARCH_LIST"] = "7.5 8.0"
 
 setup(
     name="synthetic_scene",
