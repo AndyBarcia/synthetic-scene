@@ -7,6 +7,7 @@ void render_scene_cuda(
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
     torch::Tensor camera_origin,
+    torch::Tensor camera_orientation,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
     torch::Tensor plane_points,
@@ -51,6 +52,7 @@ void render_scene(
   const py::dict boxes = require_dict(scene, "boxes");
 
   const torch::Tensor camera_origin = require_tensor(camera, "origin");
+  const torch::Tensor camera_orientation = require_tensor(camera, "orientation");
   const double fov_degrees = require_double(camera, "fov_degrees");
   const torch::Tensor light_dir = require_tensor(options, "light_dir");
   const torch::Tensor background = require_tensor(options, "background");
@@ -83,12 +85,17 @@ void render_scene(
           (semantic_map.dim() == 3 && semantic_map.size(0) == image.size(0) && semantic_map.size(1) == image.size(2) &&
            semantic_map.size(2) == image.size(3)),
       "semantic_map must be empty or B x H x W");
-  TORCH_CHECK(camera_origin.is_cuda() && sphere_centers.is_cuda() && sphere_radii.is_cuda(), "scene tensors must be CUDA tensors");
+  TORCH_CHECK(camera_origin.is_cuda() && camera_orientation.is_cuda(), "camera tensors must be CUDA tensors");
+  TORCH_CHECK(sphere_centers.is_cuda() && sphere_radii.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(plane_points.is_cuda() && plane_normals.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(box_centers.is_cuda() && box_half_sizes.is_cuda() && box_axes.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(light_dir.is_cuda() && background.is_cuda() && sphere_colors.is_cuda() && plane_colors.is_cuda() && box_colors.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(camera_origin.dim() == 2 && camera_origin.size(1) == 3, "camera_origin must be B x 3");
+  TORCH_CHECK(
+      camera_orientation.dim() == 3 && camera_orientation.size(1) == 3 && camera_orientation.size(2) == 3,
+      "camera_orientation must be B x 3 x 3");
   TORCH_CHECK(camera_origin.size(0) == image.size(0), "camera_origin batch size must match image batch size");
+  TORCH_CHECK(camera_orientation.size(0) == image.size(0), "camera_orientation batch size must match image batch size");
   TORCH_CHECK(sphere_centers.dim() == 2 && sphere_centers.size(1) == 3, "sphere_centers must be N x 3");
   TORCH_CHECK(sphere_radii.dim() == 1, "sphere_radii must be N");
   TORCH_CHECK(plane_points.dim() == 2 && plane_points.size(1) == 3, "plane_points must be N x 3");
@@ -109,6 +116,7 @@ void render_scene(
   TORCH_CHECK(sphere_centers.size(0) > 0 || plane_points.size(0) > 0 || box_centers.size(0) > 0, "at least one object is required");
   TORCH_CHECK(light_dir.numel() == 3 && background.numel() == 3, "light/background vectors must be vec3");
   TORCH_CHECK(camera_origin.dtype() == torch::kFloat32, "camera_origin must be float32");
+  TORCH_CHECK(camera_orientation.dtype() == torch::kFloat32, "camera_orientation must be float32");
   TORCH_CHECK(sphere_centers.dtype() == torch::kFloat32, "sphere_centers must be float32");
   TORCH_CHECK(sphere_radii.dtype() == torch::kFloat32, "sphere_radii must be float32");
   TORCH_CHECK(plane_points.dtype() == torch::kFloat32, "plane_points must be float32");
@@ -123,7 +131,8 @@ void render_scene(
   TORCH_CHECK(box_colors.dtype() == torch::kFloat32, "box_colors must be float32");
   TORCH_CHECK(image.is_contiguous(), "image must be contiguous");
   TORCH_CHECK(instance_map.is_contiguous() && semantic_map.is_contiguous(), "segmentation maps must be contiguous");
-  TORCH_CHECK(camera_origin.is_contiguous() && sphere_centers.is_contiguous() && sphere_radii.is_contiguous(), "scene tensors must be contiguous");
+  TORCH_CHECK(camera_origin.is_contiguous() && camera_orientation.is_contiguous(), "camera tensors must be contiguous");
+  TORCH_CHECK(sphere_centers.is_contiguous() && sphere_radii.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(plane_points.is_contiguous() && plane_normals.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(box_centers.is_contiguous() && box_half_sizes.is_contiguous() && box_axes.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(light_dir.is_contiguous() && background.is_contiguous() && sphere_colors.is_contiguous() && plane_colors.is_contiguous() && box_colors.is_contiguous(), "scene tensors must be contiguous");
@@ -133,6 +142,7 @@ void render_scene(
       instance_map,
       semantic_map,
       camera_origin,
+      camera_orientation,
       sphere_centers,
       sphere_radii,
       plane_points,

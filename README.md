@@ -34,7 +34,14 @@ image = render_scene(
     height=512,
     camera=[
         Camera(origin=(-0.2, 0.0, 0.0)),
-        Camera(origin=(0.2, 0.0, 0.0)),
+        Camera(
+            origin=(0.2, 1.0, 0.0),
+            orientation=(
+                (1.0, 0.0, 0.0),
+                (0.0, 0.94, -0.34),
+                (0.0, 0.34, 0.94),
+            ),
+        ),
     ],
     scene=Scene(
         spheres=Spheres(
@@ -65,6 +72,9 @@ image = render_scene(
 
 RGB tensors are returned as `B x 3 x H x W`. Passing a single camera, or leaving
 `camera` unset, returns a batch with `B = 1`.
+`Camera.orientation` is a `3 x 3` camera-to-world rotation matrix whose rows are
+the world-space right, up, and back axes; the default identity orientation looks
+down world `-Z`.
 
 To request segmentation ground truth, pass `return_maps=True`:
 

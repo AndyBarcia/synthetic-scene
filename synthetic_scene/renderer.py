@@ -16,6 +16,11 @@ Vec3List = Union[Sequence[Vec3], torch.Tensor]
 @dataclass(frozen=True)
 class Camera:
     origin: Vec3 = (0.0, 0.0, 0.0)
+    orientation: Union[Sequence[Vec3], torch.Tensor] = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
     fov_degrees: float = 45.0
 
 
@@ -77,6 +82,15 @@ def _camera_origins(cameras: Camera | Sequence[Camera], *, device: torch.device 
     return torch.stack(origins, dim=0).contiguous()
 
 
+def _camera_orientations(cameras: Camera | Sequence[Camera], *, device: torch.device | str = "cuda") -> torch.Tensor:
+    if isinstance(cameras, Camera):
+        return _mat3(cameras.orientation, device=device).reshape(1, 3, 3)
+    if len(cameras) == 0:
+        raise ValueError("at least one camera is required")
+    orientations = [_mat3(camera.orientation, device=device) for camera in cameras]
+    return torch.stack(orientations, dim=0).contiguous()
+
+
 def _camera_fov_degrees(cameras: Camera | Sequence[Camera]) -> float:
     if isinstance(cameras, Camera):
         return float(cameras.fov_degrees)
@@ -86,6 +100,16 @@ def _camera_fov_degrees(cameras: Camera | Sequence[Camera]) -> float:
     if any(float(camera.fov_degrees) != fov_degrees for camera in cameras):
         raise ValueError("batched cameras must share the same fov_degrees")
     return fov_degrees
+
+
+def _mat3(value: Union[Sequence[Vec3], torch.Tensor], *, device: torch.device | str = "cuda") -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+    if tensor.numel() != 9:
+        raise ValueError("expected a 3 x 3 matrix")
+    tensor = tensor.reshape(3, 3)
+    if bool((tensor.norm(dim=1) <= 1.0e-8).any().item()):
+        raise ValueError("camera orientation rows must be non-zero")
+    return tensor.contiguous()
 
 
 def _vec3_list(value: Vec3List, *, device: torch.device | str = "cuda") -> torch.Tensor:
@@ -181,6 +205,7 @@ def render_scene(
         raise ValueError("box_axes must contain non-zero axis vectors")
 
     camera_origins = _camera_origins(camera_data, device=device)
+    camera_orientations = _camera_orientations(camera_data, device=device)
     batch_size = camera_origins.shape[0]
 
     image = torch.empty((batch_size, 3, height, width), dtype=torch.float32, device=device)
@@ -192,6 +217,7 @@ def render_scene(
         semantic_map,
         {
             "origin": camera_origins,
+            "orientation": camera_orientations,
             "fov_degrees": _camera_fov_degrees(camera_data),
         },
         {

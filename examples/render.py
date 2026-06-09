@@ -14,7 +14,14 @@ def main() -> None:
         scene=default_scene(),
         camera=[
             Camera(origin=(-0.22, 0.0, 0.0)),
-            Camera(origin=(0.22, 1.0, 0.0)),
+            Camera(
+                origin=(0.22, 1.0, 0.0),
+                orientation=(
+                    (1.0, 0.0, 0.0),
+                    (0.0, 0.94, -0.34),
+                    (0.0, 0.34, 0.94),
+                ),
+            ),
         ],
         return_maps=True,
     )

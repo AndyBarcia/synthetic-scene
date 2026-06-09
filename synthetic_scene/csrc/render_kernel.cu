@@ -18,6 +18,7 @@ struct Vec3 {
 
 struct CameraView {
   const float* origin;
+  const float* orientation;
   float fov_degrees;
 };
 
@@ -186,6 +187,10 @@ __global__ void render_scene_kernel(
   }
 
   const Vec3 camera_origin = load_vec3(camera.origin + batch_idx * 3);
+  const float* camera_orientation = camera.orientation + batch_idx * 9;
+  const Vec3 camera_axis_x = normalize(load_vec3(camera_orientation + 0));
+  const Vec3 camera_axis_y = normalize(load_vec3(camera_orientation + 3));
+  const Vec3 camera_axis_z = normalize(load_vec3(camera_orientation + 6));
   const Vec3 light_dir = normalize(load_vec3(options.light_dir));
   const Vec3 background = load_vec3(options.background);
 
@@ -198,7 +203,7 @@ __global__ void render_scene_kernel(
       image_plane_scale;
 
   const Vec3 ray_origin = camera_origin;
-  const Vec3 ray_dir = normalize(make_vec3(px, py, -1.0f));
+  const Vec3 ray_dir = normalize(add(add(mul(camera_axis_x, px), mul(camera_axis_y, py)), mul(camera_axis_z, -1.0f)));
 
   const float a = dot(ray_dir, ray_dir);
 
@@ -338,6 +343,7 @@ void render_scene_cuda(
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
     torch::Tensor camera_origin,
+    torch::Tensor camera_orientation,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
     torch::Tensor plane_points,
@@ -366,6 +372,7 @@ void render_scene_cuda(
 
   const CameraView camera{
       camera_origin.data_ptr<float>(),
+      camera_orientation.data_ptr<float>(),
       static_cast<float>(fov_degrees),
   };
   const SceneView scene{
