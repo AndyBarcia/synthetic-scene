@@ -19,6 +19,12 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[index]
 
 
+def fmean(values: list[float]) -> float:
+    if not values:
+        raise ValueError("values must not be empty")
+    return float(sum(values) / len(values))
+
+
 def format_bytes(num_bytes: int) -> str:
     units = ["B", "KiB", "MiB", "GiB"]
     value = float(num_bytes)
@@ -52,6 +58,7 @@ def benchmark(width: int, height: int, warmup: int, iterations: int) -> None:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
 
+    image = None
     for _ in range(warmup):
         image = render_benchmark_scene(width, height)
     torch.cuda.synchronize(device)
@@ -89,8 +96,8 @@ def benchmark(width: int, height: int, warmup: int, iterations: int) -> None:
     image_bytes = width * height * 3 * torch.finfo(torch.float32).bits // 8
 
     pixels = width * height
-    mean_kernel = statistics.fmean(kernel_times_ms)
-    mean_host = statistics.fmean(host_times_ms)
+    mean_kernel = fmean(kernel_times_ms)
+    mean_host = fmean(host_times_ms)
 
     print(f"device: {torch.cuda.get_device_name(device)}")
     print(f"resolution: {width} x {height} ({pixels:,} pixels)")

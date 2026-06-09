@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence, Union
+from typing import Sequence, Union, overload
 
 import torch
 
@@ -54,6 +54,13 @@ class Scene:
     boxes: OrientedBoxes = field(default_factory=OrientedBoxes)
 
 
+@dataclass(frozen=True)
+class RenderResult:
+    image: torch.Tensor
+    instance_map: torch.Tensor
+    semantic_map: torch.Tensor
+
+
 def _vec3(value: Vec3, *, device: torch.device | str = "cuda") -> torch.Tensor:
     tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
     if tensor.numel() != 3:
@@ -79,6 +86,7 @@ def _mat3_list(value: Union[Sequence[Sequence[Vec3]], torch.Tensor], *, device: 
     return tensor.contiguous()
 
 
+@overload
 def render_scene(
     width: int = 512,
     height: int = 512,
@@ -86,8 +94,32 @@ def render_scene(
     scene: Scene | None = None,
     camera: Camera | None = None,
     options: RenderOptions | None = None,
-) -> torch.Tensor:
-    """Render Lambert-shaded spheres, oriented boxes, and infinite planes into an H x W x 3 CUDA tensor."""
+    return_maps: bool = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def render_scene(
+    width: int = 512,
+    height: int = 512,
+    *,
+    scene: Scene | None = None,
+    camera: Camera | None = None,
+    options: RenderOptions | None = None,
+    return_maps: bool,
+) -> torch.Tensor | RenderResult: ...
+
+
+def render_scene(
+    width: int = 512,
+    height: int = 512,
+    *,
+    scene: Scene | None = None,
+    camera: Camera | None = None,
+    options: RenderOptions | None = None,
+    return_maps: bool = False,
+) -> torch.Tensor | RenderResult:
+    """Render a scene into RGB, and optionally instance and primitive-class label maps."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to render with this extension")
     if width <= 0 or height <= 0:
@@ -129,8 +161,12 @@ def render_scene(
         raise ValueError("box_axes must contain non-zero axis vectors")
 
     image = torch.empty((height, width, 3), dtype=torch.float32, device=device)
+    instance_map = torch.empty((height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
+    semantic_map = torch.empty((height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
     _cuda_renderer.render_scene(
         image,
+        instance_map,
+        semantic_map,
         {
             "origin": _vec3(camera_data.origin, device=device),
             "fov_degrees": float(camera_data.fov_degrees),
@@ -158,6 +194,8 @@ def render_scene(
             "background": _vec3(options_data.background, device=device),
         },
     )
+    if return_maps:
+        return RenderResult(image=image, instance_map=instance_map, semantic_map=semantic_map)
     return image
 
 
@@ -179,3 +217,33 @@ def save_image(image: torch.Tensor, path: str | Path) -> None:
         .numpy()
     )
     Image.fromarray(image_u8, mode="RGB").save(path)
+
+
+def colorize_label_map(label_map: torch.Tensor, *, seed: int = 17) -> torch.Tensor:
+    """Map integer labels to deterministic RGB colors for visualization."""
+    if label_map.ndim != 2:
+        raise ValueError("expected label map with shape H x W")
+    if label_map.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        raise ValueError("expected an integer label map")
+
+    labels = label_map.detach().to(torch.int64).cpu()
+    unique_labels = torch.unique(labels)
+    colors = torch.zeros((int(unique_labels.max().item()) + 1, 3), dtype=torch.uint8)
+    for label in unique_labels.tolist():
+        if label == 0:
+            continue
+        generator = torch.Generator()
+        generator.manual_seed(seed + int(label) * 1009)
+        colors[int(label)] = torch.randint(48, 256, (3,), generator=generator, dtype=torch.uint8)
+    return colors[labels]
+
+
+def save_label_map_visualization(label_map: torch.Tensor, path: str | Path, *, seed: int = 17) -> None:
+    """Save an H x W integer label map as a colorized 8-bit RGB PNG."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required for save_label_map_visualization; install pillow") from exc
+
+    colors = colorize_label_map(label_map, seed=seed).numpy()
+    Image.fromarray(colors, mode="RGB").save(path)

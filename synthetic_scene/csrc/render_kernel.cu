@@ -171,6 +171,8 @@ __device__ __forceinline__ bool intersect_box(
 
 __global__ void render_scene_kernel(
     float* image,
+    int* instance_map,
+    int* semantic_map,
     int width,
     int height,
     CameraView camera,
@@ -204,6 +206,8 @@ __global__ void render_scene_kernel(
   int closest_sphere = -1;
   int closest_plane = -1;
   int closest_box = -1;
+  int instance_id = 0;
+  int semantic_id = 0;
   Vec3 closest_box_normal = make_vec3(0.0f, 0.0f, 0.0f);
 
   #pragma unroll
@@ -279,6 +283,8 @@ __global__ void render_scene_kernel(
   }
 
   if (closest_sphere >= 0) {
+    instance_id = closest_sphere + 1;
+    semantic_id = 1;
     const Vec3 sphere_center = load_vec3(scene.spheres.centers + closest_sphere * 3);
     const Vec3 sphere_color = load_vec3(scene.spheres.colors + closest_sphere * 3);
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
@@ -287,6 +293,8 @@ __global__ void render_scene_kernel(
     const float ambient = 0.08f;
     color = mul(sphere_color, ambient + (1.0f - ambient) * shade);
   } else if (closest_box >= 0) {
+    instance_id = scene.spheres.count + scene.planes.count + closest_box + 1;
+    semantic_id = 3;
     Vec3 normal = normalize(closest_box_normal);
     if (dot(normal, ray_dir) > 0.0f) {
       normal = mul(normal, -1.0f);
@@ -296,6 +304,8 @@ __global__ void render_scene_kernel(
     const float ambient = 0.08f;
     color = mul(box_color, ambient + (1.0f - ambient) * shade);
   } else if (closest_plane >= 0) {
+    instance_id = scene.spheres.count + closest_plane + 1;
+    semantic_id = 2;
     Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + closest_plane * 3));
     if (dot(plane_normal, ray_dir) > 0.0f) {
       plane_normal = mul(plane_normal, -1.0f);
@@ -310,12 +320,22 @@ __global__ void render_scene_kernel(
   image[offset + 0] = color.x;
   image[offset + 1] = color.y;
   image[offset + 2] = color.z;
+
+  const int map_offset = y * width + x;
+  if (instance_map != nullptr) {
+    instance_map[map_offset] = instance_id;
+  }
+  if (semantic_map != nullptr) {
+    semantic_map[map_offset] = semantic_id;
+  }
 }
 
 }  // namespace
 
 void render_scene_cuda(
     torch::Tensor image,
+    torch::Tensor instance_map,
+    torch::Tensor semantic_map,
     torch::Tensor camera_origin,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
@@ -374,6 +394,8 @@ void render_scene_cuda(
 
   render_scene_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
       image.data_ptr<float>(),
+      instance_map.numel() == 0 ? nullptr : instance_map.data_ptr<int>(),
+      semantic_map.numel() == 0 ? nullptr : semantic_map.data_ptr<int>(),
       width,
       height,
       camera,

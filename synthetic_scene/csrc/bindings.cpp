@@ -4,6 +4,8 @@ namespace py = pybind11;
 
 void render_scene_cuda(
     torch::Tensor image,
+    torch::Tensor instance_map,
+    torch::Tensor semantic_map,
     torch::Tensor camera_origin,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
@@ -39,6 +41,8 @@ double require_double(py::dict values, const char* key) {
 
 void render_scene(
     torch::Tensor image,
+    torch::Tensor instance_map,
+    torch::Tensor semantic_map,
     py::dict camera,
     py::dict scene,
     py::dict options) {
@@ -65,8 +69,16 @@ void render_scene(
   const torch::Tensor box_colors = require_tensor(boxes, "colors");
 
   TORCH_CHECK(image.is_cuda(), "image must be a CUDA tensor");
+  TORCH_CHECK(instance_map.is_cuda() && semantic_map.is_cuda(), "segmentation maps must be CUDA tensors");
   TORCH_CHECK(image.dtype() == torch::kFloat32, "image must be float32");
+  TORCH_CHECK(instance_map.dtype() == torch::kInt32 && semantic_map.dtype() == torch::kInt32, "segmentation maps must be int32");
   TORCH_CHECK(image.dim() == 3 && image.size(2) == 3, "image must be H x W x 3");
+  TORCH_CHECK(
+      instance_map.numel() == 0 || (instance_map.dim() == 2 && instance_map.size(0) == image.size(0) && instance_map.size(1) == image.size(1)),
+      "instance_map must be empty or H x W");
+  TORCH_CHECK(
+      semantic_map.numel() == 0 || (semantic_map.dim() == 2 && semantic_map.size(0) == image.size(0) && semantic_map.size(1) == image.size(1)),
+      "semantic_map must be empty or H x W");
   TORCH_CHECK(camera_origin.is_cuda() && sphere_centers.is_cuda() && sphere_radii.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(plane_points.is_cuda() && plane_normals.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(box_centers.is_cuda() && box_half_sizes.is_cuda() && box_axes.is_cuda(), "scene tensors must be CUDA tensors");
@@ -105,6 +117,7 @@ void render_scene(
   TORCH_CHECK(plane_colors.dtype() == torch::kFloat32, "plane_colors must be float32");
   TORCH_CHECK(box_colors.dtype() == torch::kFloat32, "box_colors must be float32");
   TORCH_CHECK(image.is_contiguous(), "image must be contiguous");
+  TORCH_CHECK(instance_map.is_contiguous() && semantic_map.is_contiguous(), "segmentation maps must be contiguous");
   TORCH_CHECK(camera_origin.is_contiguous() && sphere_centers.is_contiguous() && sphere_radii.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(plane_points.is_contiguous() && plane_normals.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(box_centers.is_contiguous() && box_half_sizes.is_contiguous() && box_axes.is_contiguous(), "scene tensors must be contiguous");
@@ -112,6 +125,8 @@ void render_scene(
 
   render_scene_cuda(
       image,
+      instance_map,
+      semantic_map,
       camera_origin,
       sphere_centers,
       sphere_radii,
