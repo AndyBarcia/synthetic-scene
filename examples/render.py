@@ -2,27 +2,19 @@ from pathlib import Path
 
 import torch
 
-from synthetic_scene import Camera, colorize_label_map, render_scene, save_image
+from synthetic_scene import colorize_label_map, random_scene, render_scene, save_image
 
-from .scene import default_scene
+
+RANDOM_SCENE_SEED = 42
 
 
 def main() -> None:
+    generated = random_scene(seed=RANDOM_SCENE_SEED, cameras=2)
     result = render_scene(
         width=768,
         height=512,
-        scene=default_scene(),
-        camera=[
-            Camera(origin=(-0.22, 0.0, 0.0)),
-            Camera(
-                origin=(0.22, 1.0, 0.0),
-                orientation=(
-                    (1.0, 0.0, 0.0),
-                    (0.0, 0.94, -0.34),
-                    (0.0, 0.34, 0.94),
-                ),
-            ),
-        ],
+        scene=generated.scene,
+        camera=generated.cameras,
         return_maps=True,
     )
     output = Path("outputs/render.png")

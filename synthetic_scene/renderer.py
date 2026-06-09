@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
-from typing import Sequence, Union, overload
+from typing import Sequence, Tuple, Union, overload
 from PIL import Image
 
 import torch
@@ -58,6 +59,12 @@ class Scene:
     spheres: Spheres = field(default_factory=Spheres)
     planes: Planes = field(default_factory=Planes)
     boxes: OrientedBoxes = field(default_factory=OrientedBoxes)
+
+
+@dataclass(frozen=True)
+class RandomScene:
+    scene: Scene
+    cameras: tuple[Camera, ...]
 
 
 @dataclass(frozen=True)
@@ -172,6 +179,219 @@ def _mat3_list(value: Union[Sequence[Sequence[Vec3]], torch.Tensor], *, device: 
     if tensor.ndim != 3 or tensor.shape[1:] != (3, 3):
         raise ValueError("expected matrices with shape N x 3 x 3")
     return tensor.contiguous()
+
+
+def _as_random_range(name: str, value: tuple[float, float]) -> tuple[float, float]:
+    if len(value) != 2:
+        raise ValueError(f"{name} must contain exactly two values")
+    low = float(value[0])
+    high = float(value[1])
+    if low > high:
+        raise ValueError(f"{name} lower bound must be <= upper bound")
+    return low, high
+
+
+def _rand_float(generator: torch.Generator, low: float, high: float) -> float:
+    if low == high:
+        return low
+    return float(torch.empty((), dtype=torch.float32).uniform_(low, high, generator=generator).item())
+
+
+def _rand_int(generator: torch.Generator, low: int, high: int) -> int:
+    if low == high:
+        return low
+    return int(torch.randint(low, high + 1, (), generator=generator).item())
+
+
+def _normalize3(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    length = math.sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2])
+    if length <= 1.0e-8:
+        raise ValueError("expected a non-zero vector")
+    return (vector[0] / length, vector[1] / length, vector[2] / length)
+
+
+def _cross3(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+Vec3Tuple = Tuple[float, float, float]
+Mat3Tuple = Tuple[Vec3Tuple, Vec3Tuple, Vec3Tuple]
+
+
+def _look_at_orientation(origin: Vec3Tuple, target: Vec3Tuple) -> Mat3Tuple:
+    forward = _normalize3((target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]))
+    back = (-forward[0], -forward[1], -forward[2])
+    world_up = (0.0, 1.0, 0.0)
+    right = _cross3(world_up, back)
+    if right[0] * right[0] + right[1] * right[1] + right[2] * right[2] <= 1.0e-8:
+        right = (1.0, 0.0, 0.0)
+    else:
+        right = _normalize3(right)
+    up = _normalize3(_cross3(back, right))
+    return (right, up, back)
+
+
+def _random_color(generator: torch.Generator) -> tuple[float, float, float]:
+    hue = _rand_float(generator, 0.0, 1.0)
+    saturation = _rand_float(generator, 0.55, 0.95)
+    value = _rand_float(generator, 0.55, 1.0)
+    sector = int(hue * 6.0)
+    frac = hue * 6.0 - sector
+    p = value * (1.0 - saturation)
+    q = value * (1.0 - frac * saturation)
+    t = value * (1.0 - (1.0 - frac) * saturation)
+    sector %= 6
+    if sector == 0:
+        return (value, t, p)
+    if sector == 1:
+        return (q, value, p)
+    if sector == 2:
+        return (p, value, t)
+    if sector == 3:
+        return (p, q, value)
+    if sector == 4:
+        return (t, p, value)
+    return (value, p, q)
+
+
+def _random_ground_xz(generator: torch.Generator, scatter_radius: float) -> tuple[float, float]:
+    radius = scatter_radius * math.sqrt(_rand_float(generator, 0.0, 1.0))
+    angle = _rand_float(generator, 0.0, math.tau)
+    return radius * math.cos(angle), radius * math.sin(angle)
+
+
+def _yaw_axes(yaw: float) -> Mat3Tuple:
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    return (
+        (cos_yaw, 0.0, -sin_yaw),
+        (0.0, 1.0, 0.0),
+        (sin_yaw, 0.0, cos_yaw),
+    )
+
+
+def random_scene(
+    seed: int,
+    *,
+    ground_objects: int = 10,
+    floating_objects: int = 5,
+    cameras: int = 4,
+    scatter_radius: float = 3.0,
+    ground_y: float = -1.0,
+    camera_distance: tuple[float, float] = (2.4, 5.0),
+    camera_height: tuple[float, float] = (0.35, 2.4),
+    fov_degrees: float = 50.0,
+) -> RandomScene:
+    """Generate a deterministic random scene and cameras from a seed."""
+    if ground_objects < 0 or floating_objects < 0:
+        raise ValueError("object counts must be non-negative")
+    if ground_objects + floating_objects <= 0:
+        raise ValueError("at least one non-plane object is required")
+    if cameras <= 0:
+        raise ValueError("cameras must be positive")
+    if scatter_radius <= 0.0:
+        raise ValueError("scatter_radius must be positive")
+    if fov_degrees <= 0.0 or fov_degrees >= 180.0:
+        raise ValueError("fov_degrees must be in the open interval (0, 180)")
+    camera_distance_min, camera_distance_max = _as_random_range("camera_distance", camera_distance)
+    camera_height_min, camera_height_max = _as_random_range("camera_height", camera_height)
+    if camera_distance_min <= 0.0:
+        raise ValueError("camera_distance values must be positive")
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+
+    sphere_centers: list[tuple[float, float, float]] = []
+    sphere_radii: list[float] = []
+    sphere_colors: list[tuple[float, float, float]] = []
+    box_centers: list[tuple[float, float, float]] = []
+    box_half_sizes: list[tuple[float, float, float]] = []
+    box_axes: list[Mat3Tuple] = []
+    box_colors: list[tuple[float, float, float]] = []
+    targets: list[tuple[float, float, float]] = []
+
+    for _ in range(ground_objects):
+        x, z = _random_ground_xz(generator, scatter_radius)
+        if _rand_float(generator, 0.0, 1.0) < 0.55:
+            radius = _rand_float(generator, 0.18, 0.65)
+            center = (x, ground_y + radius, z)
+            sphere_centers.append(center)
+            sphere_radii.append(radius)
+            sphere_colors.append(_random_color(generator))
+            targets.append(center)
+        else:
+            half_size = (
+                _rand_float(generator, 0.18, 0.6),
+                _rand_float(generator, 0.18, 0.75),
+                _rand_float(generator, 0.18, 0.6),
+            )
+            center = (x, ground_y + half_size[1], z)
+            box_centers.append(center)
+            box_half_sizes.append(half_size)
+            box_axes.append(_yaw_axes(_rand_float(generator, 0.0, math.tau)))
+            box_colors.append(_random_color(generator))
+            targets.append(center)
+
+    for _ in range(floating_objects):
+        x, z = _random_ground_xz(generator, scatter_radius * 0.9)
+        if _rand_float(generator, 0.0, 1.0) < 0.65:
+            radius = _rand_float(generator, 0.15, 0.5)
+            center = (x, _rand_float(generator, ground_y + 1.0, ground_y + 3.2), z)
+            sphere_centers.append(center)
+            sphere_radii.append(radius)
+            sphere_colors.append(_random_color(generator))
+            targets.append(center)
+        else:
+            half_size = (
+                _rand_float(generator, 0.14, 0.45),
+                _rand_float(generator, 0.14, 0.45),
+                _rand_float(generator, 0.14, 0.45),
+            )
+            center = (x, _rand_float(generator, ground_y + 1.1, ground_y + 3.4), z)
+            box_centers.append(center)
+            box_half_sizes.append(half_size)
+            box_axes.append(_yaw_axes(_rand_float(generator, 0.0, math.tau)))
+            box_colors.append(_random_color(generator))
+            targets.append(center)
+
+    if len(sphere_centers) > 64 or len(box_centers) > 64:
+        raise ValueError("random_scene generated more primitives than the renderer supports")
+
+    generated_cameras = []
+    for _ in range(cameras):
+        target = targets[_rand_int(generator, 0, len(targets) - 1)]
+        distance = _rand_float(generator, camera_distance_min, camera_distance_max)
+        angle = _rand_float(generator, 0.0, math.tau)
+        height = _rand_float(generator, camera_height_min, camera_height_max)
+        origin = (
+            target[0] + distance * math.cos(angle),
+            target[1] + height,
+            target[2] + distance * math.sin(angle),
+        )
+        generated_cameras.append(
+            Camera(
+                origin=origin,
+                orientation=_look_at_orientation(origin, target),
+                fov_degrees=fov_degrees,
+            )
+        )
+
+    return RandomScene(
+        scene=Scene(
+            spheres=Spheres(centers=sphere_centers, radii=sphere_radii, colors=sphere_colors),
+            planes=Planes(
+                points=[(0.0, ground_y, 0.0)],
+                normals=[(0.0, 1.0, 0.0)],
+                colors=[(0.45, 0.48, 0.43)],
+            ),
+            boxes=OrientedBoxes(centers=box_centers, half_sizes=box_half_sizes, axes=box_axes, colors=box_colors),
+        ),
+        cameras=tuple(generated_cameras),
+    )
 
 
 @overload

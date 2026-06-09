@@ -103,18 +103,39 @@ Raw label maps are saved as 16-bit PNGs so the numeric IDs are preserved. The
 visualization helper maps each consecutive integer label to a deterministic
 random RGB color, keeping background label `0` black.
 
+## Random Scenes
+
+For synthetic data generation, create a seeded random scene and matching cameras:
+
+```python
+from synthetic_scene import random_scene, render_scene
+
+generated = random_scene(seed=1234, cameras=8)
+result = render_scene(
+    width=768,
+    height=512,
+    scene=generated.scene,
+    camera=generated.cameras,
+    return_maps=True,
+)
+```
+
+Random scenes always include a ground plane, scatter objects around `(0, 0, 0)`,
+include both grounded and floating primitives, and place each camera close enough
+to look directly at a randomly selected scene object.
+
 ## Benchmark
 
 ```bash
 conda run -n clipdino-cu117 python -m examples.benchmark
 ```
 
-The benchmark renders the same scene as `examples.render` from 8 camera
-positions by default. You can sweep the image size, camera count, and sample
-count:
+The benchmark renders the same seeded random scene style as `examples.render`
+from 8 camera positions by default. You can sweep the image size, camera count,
+sample count, and random seed:
 
 ```bash
-conda run -n clipdino-cu117 python -m examples.benchmark --width 1920 --height 1080 --cameras 16 --iterations 200
+conda run -n clipdino-cu117 python -m examples.benchmark --width 1920 --height 1080 --cameras 16 --iterations 200 --seed 5678
 ```
 
 The benchmark reports CUDA event timing for the render kernel, synchronized host
