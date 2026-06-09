@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence, Union, overload
+from PIL import Image
 
 import torch
 
@@ -305,11 +306,6 @@ def render_scene(
 
 def save_image(image: torch.Tensor, path: str | Path) -> None:
     """Save an H x W x 3 float image tensor as an 8-bit PNG."""
-    try:
-        from PIL import Image
-    except ImportError as exc:
-        raise RuntimeError("Pillow is required for save_image; install pillow") from exc
-
     if image.ndim != 3 or image.shape[-1] != 3:
         raise ValueError("expected image with shape H x W x 3")
     image_u8 = (
@@ -344,10 +340,5 @@ def colorize_label_map(label_map: torch.Tensor, *, seed: int = 17) -> torch.Tens
 
 def save_label_map_visualization(label_map: torch.Tensor, path: str | Path, *, seed: int = 17) -> None:
     """Save an H x W integer label map as a colorized 8-bit RGB PNG."""
-    try:
-        from PIL import Image
-    except ImportError as exc:
-        raise RuntimeError("Pillow is required for save_label_map_visualization; install pillow") from exc
-
     colors = colorize_label_map(label_map, seed=seed).numpy()
     Image.fromarray(colors, mode="RGB").save(path)
