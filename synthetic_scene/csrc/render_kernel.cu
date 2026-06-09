@@ -2,13 +2,14 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-#include <cmath>
-
 namespace {
 
 constexpr int kMaxSpheres = 64;
 constexpr int kMaxPlanes = 64;
 constexpr int kMaxBoxes = 64;
+constexpr float kRayTMin = 1.0e-4f;
+constexpr float kParallelEpsilon = 1.0e-6f;
+constexpr float kFloatMax = 3.402823466e+38f;
 
 struct Vec3 {
   float x;
@@ -84,6 +85,55 @@ __device__ __forceinline__ Vec3 normalize(Vec3 v) {
   return mul(v, rsqrtf(len2));
 }
 
+__device__ __forceinline__ bool intersect_sphere(
+    Vec3 ray_origin,
+    Vec3 ray_dir,
+    Vec3 center,
+    float radius,
+    float* out_t) {
+  const Vec3 oc = sub(ray_origin, center);
+  const float a = dot(ray_dir, ray_dir);
+  const float b = 2.0f * dot(oc, ray_dir);
+  const float c = dot(oc, oc) - radius * radius;
+  const float discriminant = b * b - 4.0f * a * c;
+  if (discriminant < 0.0f) {
+    return false;
+  }
+
+  const float sqrt_disc = sqrtf(discriminant);
+  const float inv_2a = 0.5f / a;
+  float t = (-b - sqrt_disc) * inv_2a;
+  if (t <= kRayTMin) {
+    t = (-b + sqrt_disc) * inv_2a;
+  }
+  if (t <= kRayTMin) {
+    return false;
+  }
+
+  *out_t = t;
+  return true;
+}
+
+__device__ __forceinline__ bool intersect_plane(
+    Vec3 ray_origin,
+    Vec3 ray_dir,
+    Vec3 point,
+    Vec3 normal,
+    float* out_t) {
+  const float denom = dot(ray_dir, normal);
+  if (fabsf(denom) < kParallelEpsilon) {
+    return false;
+  }
+
+  const float t = dot(sub(point, ray_origin), normal) / denom;
+  if (t <= kRayTMin) {
+    return false;
+  }
+
+  *out_t = t;
+  return true;
+}
+
 __device__ __forceinline__ bool intersect_box(
     Vec3 ray_origin,
     Vec3 ray_dir,
@@ -110,8 +160,8 @@ __device__ __forceinline__ bool intersect_box(
   const float extents[3] = {half_size.x, half_size.y, half_size.z};
   const Vec3 world_axes[3] = {axis_x, axis_y, axis_z};
 
-  float t_min = -3.402823466e+38f;
-  float t_max = 3.402823466e+38f;
+  float t_min = -kFloatMax;
+  float t_max = kFloatMax;
   Vec3 near_normal = make_vec3(0.0f, 0.0f, 0.0f);
   Vec3 far_normal = make_vec3(0.0f, 0.0f, 0.0f);
 
@@ -121,7 +171,7 @@ __device__ __forceinline__ bool intersect_box(
     const float dir_axis = dir_local[axis_idx];
     const float extent = extents[axis_idx];
 
-    if (fabsf(dir_axis) < 1.0e-6f) {
+    if (fabsf(dir_axis) < kParallelEpsilon) {
       if (origin_axis < -extent || origin_axis > extent) {
         return false;
       }
@@ -157,11 +207,11 @@ __device__ __forceinline__ bool intersect_box(
 
   float t = t_min;
   Vec3 normal = near_normal;
-  if (t <= 1.0e-4f) {
+  if (t <= kRayTMin) {
     t = t_max;
     normal = far_normal;
   }
-  if (t <= 1.0e-4f) {
+  if (t <= kRayTMin) {
     return false;
   }
 
@@ -205,10 +255,8 @@ __global__ void render_scene_kernel(
   const Vec3 ray_origin = camera_origin;
   const Vec3 ray_dir = normalize(add(add(mul(camera_axis_x, px), mul(camera_axis_y, py)), mul(camera_axis_z, -1.0f)));
 
-  const float a = dot(ray_dir, ray_dir);
-
   Vec3 color = background;
-  float closest_t = 3.402823466e+38f;
+  float closest_t = kFloatMax;
   int closest_sphere = -1;
   int closest_plane = -1;
   int closest_box = -1;
@@ -224,21 +272,8 @@ __global__ void render_scene_kernel(
 
     const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_idx * 3);
     const float sphere_radius = scene.spheres.radii[sphere_idx];
-    const Vec3 oc = sub(ray_origin, sphere_center);
-    const float b = 2.0f * dot(oc, ray_dir);
-    const float c = dot(oc, oc) - sphere_radius * sphere_radius;
-    const float discriminant = b * b - 4.0f * a * c;
-    if (discriminant < 0.0f) {
-      continue;
-    }
-
-    const float sqrt_disc = sqrtf(discriminant);
-    const float inv_2a = 0.5f / a;
-    float t = (-b - sqrt_disc) * inv_2a;
-    if (t <= 1.0e-4f) {
-      t = (-b + sqrt_disc) * inv_2a;
-    }
-    if (t > 1.0e-4f && t < closest_t) {
+    float t = 0.0f;
+    if (intersect_sphere(ray_origin, ray_dir, sphere_center, sphere_radius, &t) && t < closest_t) {
       closest_t = t;
       closest_sphere = sphere_idx;
       closest_plane = -1;
@@ -274,13 +309,8 @@ __global__ void render_scene_kernel(
 
     const Vec3 plane_point = load_vec3(scene.planes.points + plane_idx * 3);
     const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_idx * 3));
-    const float denom = dot(ray_dir, plane_normal);
-    if (fabsf(denom) < 1.0e-6f) {
-      continue;
-    }
-
-    const float t = dot(sub(plane_point, ray_origin), plane_normal) / denom;
-    if (t > 1.0e-4f && t < closest_t) {
+    float t = 0.0f;
+    if (intersect_plane(ray_origin, ray_dir, plane_point, plane_normal, &t) && t < closest_t) {
       closest_t = t;
       closest_sphere = -1;
       closest_plane = plane_idx;
