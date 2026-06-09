@@ -180,11 +180,12 @@ __global__ void render_scene_kernel(
     RenderOptionsView options) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const int batch_idx = blockIdx.z;
   if (x >= width || y >= height) {
     return;
   }
 
-  const Vec3 camera_origin = load_vec3(camera.origin);
+  const Vec3 camera_origin = load_vec3(camera.origin + batch_idx * 3);
   const Vec3 light_dir = normalize(load_vec3(options.light_dir));
   const Vec3 background = load_vec3(options.background);
 
@@ -316,12 +317,12 @@ __global__ void render_scene_kernel(
     color = mul(plane_color, ambient + (1.0f - ambient) * shade);
   }
 
-  const int offset = (y * width + x) * 3;
-  image[offset + 0] = color.x;
-  image[offset + 1] = color.y;
-  image[offset + 2] = color.z;
+  const int image_offset = ((batch_idx * 3 * height + y) * width) + x;
+  image[image_offset + 0 * height * width] = color.x;
+  image[image_offset + 1 * height * width] = color.y;
+  image[image_offset + 2 * height * width] = color.z;
 
-  const int map_offset = y * width + x;
+  const int map_offset = (batch_idx * height + y) * width + x;
   if (instance_map != nullptr) {
     instance_map[map_offset] = instance_id;
   }
@@ -350,8 +351,9 @@ void render_scene_cuda(
     torch::Tensor sphere_colors,
     torch::Tensor plane_colors,
     torch::Tensor box_colors) {
-  const int height = static_cast<int>(image.size(0));
-  const int width = static_cast<int>(image.size(1));
+  const int batch_size = static_cast<int>(image.size(0));
+  const int height = static_cast<int>(image.size(2));
+  const int width = static_cast<int>(image.size(3));
   const int sphere_count = static_cast<int>(sphere_centers.size(0));
   const int plane_count = static_cast<int>(plane_points.size(0));
   const int box_count = static_cast<int>(box_centers.size(0));
@@ -360,7 +362,7 @@ void render_scene_cuda(
   TORCH_CHECK(box_count <= kMaxBoxes, "render_scene supports at most ", kMaxBoxes, " boxes");
 
   const dim3 block(16, 16);
-  const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+  const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y, batch_size);
 
   const CameraView camera{
       camera_origin.data_ptr<float>(),

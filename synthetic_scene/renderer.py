@@ -68,6 +68,26 @@ def _vec3(value: Vec3, *, device: torch.device | str = "cuda") -> torch.Tensor:
     return tensor.reshape(3).contiguous()
 
 
+def _camera_origins(cameras: Camera | Sequence[Camera], *, device: torch.device | str = "cuda") -> torch.Tensor:
+    if isinstance(cameras, Camera):
+        return _vec3(cameras.origin, device=device).reshape(1, 3)
+    if len(cameras) == 0:
+        raise ValueError("at least one camera is required")
+    origins = [_vec3(camera.origin, device=device) for camera in cameras]
+    return torch.stack(origins, dim=0).contiguous()
+
+
+def _camera_fov_degrees(cameras: Camera | Sequence[Camera]) -> float:
+    if isinstance(cameras, Camera):
+        return float(cameras.fov_degrees)
+    if len(cameras) == 0:
+        raise ValueError("at least one camera is required")
+    fov_degrees = float(cameras[0].fov_degrees)
+    if any(float(camera.fov_degrees) != fov_degrees for camera in cameras):
+        raise ValueError("batched cameras must share the same fov_degrees")
+    return fov_degrees
+
+
 def _vec3_list(value: Vec3List, *, device: torch.device | str = "cuda") -> torch.Tensor:
     tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
     if tensor.numel() == 0:
@@ -92,7 +112,7 @@ def render_scene(
     height: int = 512,
     *,
     scene: Scene | None = None,
-    camera: Camera | None = None,
+    camera: Camera | Sequence[Camera] | None = None,
     options: RenderOptions | None = None,
     return_maps: bool = False,
 ) -> torch.Tensor: ...
@@ -104,7 +124,7 @@ def render_scene(
     height: int = 512,
     *,
     scene: Scene | None = None,
-    camera: Camera | None = None,
+    camera: Camera | Sequence[Camera] | None = None,
     options: RenderOptions | None = None,
     return_maps: bool,
 ) -> torch.Tensor | RenderResult: ...
@@ -115,11 +135,11 @@ def render_scene(
     height: int = 512,
     *,
     scene: Scene | None = None,
-    camera: Camera | None = None,
+    camera: Camera | Sequence[Camera] | None = None,
     options: RenderOptions | None = None,
     return_maps: bool = False,
 ) -> torch.Tensor | RenderResult:
-    """Render a scene into RGB, and optionally instance and primitive-class label maps."""
+    """Render a scene into batched RGB, and optionally instance and primitive-class label maps."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to render with this extension")
     if width <= 0 or height <= 0:
@@ -160,16 +180,19 @@ def render_scene(
     if bool((box_axes.norm(dim=2) <= 1.0e-8).any().item()):
         raise ValueError("box_axes must contain non-zero axis vectors")
 
-    image = torch.empty((height, width, 3), dtype=torch.float32, device=device)
-    instance_map = torch.empty((height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
-    semantic_map = torch.empty((height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
+    camera_origins = _camera_origins(camera_data, device=device)
+    batch_size = camera_origins.shape[0]
+
+    image = torch.empty((batch_size, 3, height, width), dtype=torch.float32, device=device)
+    instance_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
+    semantic_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
     _cuda_renderer.render_scene(
         image,
         instance_map,
         semantic_map,
         {
-            "origin": _vec3(camera_data.origin, device=device),
-            "fov_degrees": float(camera_data.fov_degrees),
+            "origin": camera_origins,
+            "fov_degrees": _camera_fov_degrees(camera_data),
         },
         {
             "spheres": {

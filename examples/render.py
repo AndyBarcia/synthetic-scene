@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from synthetic_scene import render_scene, save_image, save_label_map_visualization
+import torch
+
+from synthetic_scene import Camera, colorize_label_map, render_scene, save_image
 
 from .scene import default_scene
 
@@ -10,18 +12,24 @@ def main() -> None:
         width=768,
         height=512,
         scene=default_scene(),
+        camera=[
+            Camera(origin=(-0.22, 0.0, 0.0)),
+            Camera(origin=(0.22, 1.0, 0.0)),
+        ],
         return_maps=True,
     )
     output = Path("outputs/render.png")
     output.parent.mkdir(parents=True, exist_ok=True)
-    save_image(result.image, output)
-    save_label_map_visualization(result.instance_map, output.with_name("instance_map.png"))
-    save_label_map_visualization(result.semantic_map, output.with_name("semantic_map.png"))
+    image_grid = torch.cat(result.image.permute(0, 2, 3, 1).unbind(0), dim=1)
+    save_image(image_grid, output)
+
+    instance_grid = torch.cat([colorize_label_map(label_map) for label_map in result.instance_map], dim=1)
+    semantic_grid = torch.cat([colorize_label_map(label_map) for label_map in result.semantic_map], dim=1)
+    save_image(instance_grid.to(torch.float32).div(255.0), output.with_name("instance_map.png"))
+    save_image(semantic_grid.to(torch.float32).div(255.0), output.with_name("semantic_map.png"))
     print(f"wrote {output}")
     print(f"wrote {output.with_name('instance_map.png')}")
     print(f"wrote {output.with_name('semantic_map.png')}")
-    print(f"wrote {output.with_name('instance_map_visualization.png')}")
-    print(f"wrote {output.with_name('semantic_map_visualization.png')}")
 
 
 if __name__ == "__main__":

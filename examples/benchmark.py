@@ -6,7 +6,7 @@ import time
 
 import torch
 
-from synthetic_scene import render_scene
+from synthetic_scene import Camera, render_scene
 
 from .scene import default_scene
 
@@ -35,19 +35,34 @@ def format_bytes(num_bytes: int) -> str:
     return f"{value:.2f} GiB"
 
 
-def render_benchmark_scene(width: int, height: int) -> torch.Tensor:
+def benchmark_cameras(count: int) -> list[Camera]:
+    if count <= 0:
+        raise ValueError("cameras must be positive")
+    if count == 1:
+        return [Camera()]
+    max_offset = 0.45
+    return [
+        Camera(origin=(-max_offset + 2.0 * max_offset * camera_idx / (count - 1), 0.0, 0.0))
+        for camera_idx in range(count)
+    ]
+
+
+def render_benchmark_scene(width: int, height: int, camera_count: int) -> torch.Tensor:
     return render_scene(
         width=width,
         height=height,
         scene=default_scene(),
+        camera=benchmark_cameras(camera_count),
     )
 
 
-def benchmark(width: int, height: int, warmup: int, iterations: int) -> None:
+def benchmark(width: int, height: int, cameras: int, warmup: int, iterations: int) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to benchmark this renderer")
     if width <= 0 or height <= 0:
         raise ValueError("width and height must be positive")
+    if cameras <= 0:
+        raise ValueError("cameras must be positive")
     if warmup < 0:
         raise ValueError("warmup must be non-negative")
     if iterations <= 0:
@@ -60,7 +75,7 @@ def benchmark(width: int, height: int, warmup: int, iterations: int) -> None:
 
     image = None
     for _ in range(warmup):
-        image = render_benchmark_scene(width, height)
+        image = render_benchmark_scene(width, height, cameras)
     torch.cuda.synchronize(device)
     del image
 
@@ -78,7 +93,7 @@ def benchmark(width: int, height: int, warmup: int, iterations: int) -> None:
 
         host_start = time.perf_counter()
         start_event.record()
-        image = render_benchmark_scene(width, height)
+        image = render_benchmark_scene(width, height, cameras)
         end_event.record()
         torch.cuda.synchronize(device)
         host_end = time.perf_counter()
@@ -93,14 +108,16 @@ def benchmark(width: int, height: int, warmup: int, iterations: int) -> None:
     after_reserved = torch.cuda.memory_reserved(device)
     peak_allocated = torch.cuda.max_memory_allocated(device)
     peak_reserved = torch.cuda.max_memory_reserved(device)
-    image_bytes = width * height * 3 * torch.finfo(torch.float32).bits // 8
+    image_bytes = cameras * width * height * 3 * torch.finfo(torch.float32).bits // 8
 
-    pixels = width * height
+    pixels_per_camera = width * height
+    pixels = cameras * pixels_per_camera
     mean_kernel = fmean(kernel_times_ms)
     mean_host = fmean(host_times_ms)
 
     print(f"device: {torch.cuda.get_device_name(device)}")
-    print(f"resolution: {width} x {height} ({pixels:,} pixels)")
+    print(f"resolution: {width} x {height} ({pixels_per_camera:,} pixels per camera)")
+    print(f"cameras: {cameras} ({pixels:,} total pixels)")
     print("scene: default")
     print(f"warmup / iterations: {warmup} / {iterations}")
     print()
@@ -128,6 +145,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark the CUDA scene renderer.")
     parser.add_argument("--width", type=int, default=768)
     parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--cameras", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     return parser.parse_args()
@@ -138,6 +156,7 @@ def main() -> None:
     benchmark(
         width=args.width,
         height=args.height,
+        cameras=args.cameras,
         warmup=args.warmup,
         iterations=args.iterations,
     )

@@ -72,18 +72,23 @@ void render_scene(
   TORCH_CHECK(instance_map.is_cuda() && semantic_map.is_cuda(), "segmentation maps must be CUDA tensors");
   TORCH_CHECK(image.dtype() == torch::kFloat32, "image must be float32");
   TORCH_CHECK(instance_map.dtype() == torch::kInt32 && semantic_map.dtype() == torch::kInt32, "segmentation maps must be int32");
-  TORCH_CHECK(image.dim() == 3 && image.size(2) == 3, "image must be H x W x 3");
+  TORCH_CHECK(image.dim() == 4 && image.size(1) == 3, "image must be B x 3 x H x W");
   TORCH_CHECK(
-      instance_map.numel() == 0 || (instance_map.dim() == 2 && instance_map.size(0) == image.size(0) && instance_map.size(1) == image.size(1)),
-      "instance_map must be empty or H x W");
+      instance_map.numel() == 0 ||
+          (instance_map.dim() == 3 && instance_map.size(0) == image.size(0) && instance_map.size(1) == image.size(2) &&
+           instance_map.size(2) == image.size(3)),
+      "instance_map must be empty or B x H x W");
   TORCH_CHECK(
-      semantic_map.numel() == 0 || (semantic_map.dim() == 2 && semantic_map.size(0) == image.size(0) && semantic_map.size(1) == image.size(1)),
-      "semantic_map must be empty or H x W");
+      semantic_map.numel() == 0 ||
+          (semantic_map.dim() == 3 && semantic_map.size(0) == image.size(0) && semantic_map.size(1) == image.size(2) &&
+           semantic_map.size(2) == image.size(3)),
+      "semantic_map must be empty or B x H x W");
   TORCH_CHECK(camera_origin.is_cuda() && sphere_centers.is_cuda() && sphere_radii.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(plane_points.is_cuda() && plane_normals.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(box_centers.is_cuda() && box_half_sizes.is_cuda() && box_axes.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(light_dir.is_cuda() && background.is_cuda() && sphere_colors.is_cuda() && plane_colors.is_cuda() && box_colors.is_cuda(), "scene tensors must be CUDA tensors");
-  TORCH_CHECK(camera_origin.numel() == 3, "camera_origin must be vec3");
+  TORCH_CHECK(camera_origin.dim() == 2 && camera_origin.size(1) == 3, "camera_origin must be B x 3");
+  TORCH_CHECK(camera_origin.size(0) == image.size(0), "camera_origin batch size must match image batch size");
   TORCH_CHECK(sphere_centers.dim() == 2 && sphere_centers.size(1) == 3, "sphere_centers must be N x 3");
   TORCH_CHECK(sphere_radii.dim() == 1, "sphere_radii must be N");
   TORCH_CHECK(plane_points.dim() == 2 && plane_points.size(1) == 3, "plane_points must be N x 3");
