@@ -204,6 +204,74 @@ __device__ __forceinline__ float centroid_axis(Vec3 centroid, int axis) {
   return centroid.z;
 }
 
+__device__ void build_bvh_nodes(
+    BvhPrimitive* primitives,
+    BvhNode* nodes,
+    int primitive_count,
+    int* node_count) {
+  *node_count = 0;
+  if (primitive_count <= 0) {
+    return;
+  }
+
+  BvhBuildTask stack[kMaxBvhNodes];
+  int stack_size = 0;
+  int next_node = 1;
+  nodes[0] = BvhNode{empty_aabb(), -1, -1, 0, primitive_count};
+  stack[stack_size++] = BvhBuildTask{0, primitive_count, 0};
+
+  while (stack_size > 0) {
+    const BvhBuildTask task = stack[--stack_size];
+    Aabb node_bounds = empty_aabb();
+    Aabb centroid_bounds = empty_aabb();
+    for (int item = 0; item < task.count; ++item) {
+      const BvhPrimitive primitive = primitives[task.start + item];
+      node_bounds = extend_aabb(node_bounds, primitive.bounds);
+      const Aabb centroid_bounds_item = Aabb{primitive.centroid, primitive.centroid};
+      centroid_bounds = extend_aabb(centroid_bounds, centroid_bounds_item);
+    }
+
+    BvhNode node = BvhNode{node_bounds, -1, -1, task.start, task.count};
+    if (task.count > kBvhLeafSize && next_node + 1 < kMaxBvhNodes) {
+      const Vec3 extent = sub(centroid_bounds.max, centroid_bounds.min);
+      int axis = 0;
+      if (extent.y > extent.x && extent.y >= extent.z) {
+        axis = 1;
+      } else if (extent.z > extent.x && extent.z > extent.y) {
+        axis = 2;
+      }
+
+      for (int i = 1; i < task.count; ++i) {
+        const BvhPrimitive key = primitives[task.start + i];
+        const float key_value = centroid_axis(key.centroid, axis);
+        int j = i - 1;
+        while (j >= 0 && centroid_axis(primitives[task.start + j].centroid, axis) > key_value) {
+          primitives[task.start + j + 1] = primitives[task.start + j];
+          --j;
+        }
+        primitives[task.start + j + 1] = key;
+      }
+
+      const int left_count = task.count / 2;
+      const int right_count = task.count - left_count;
+      if (left_count > 0 && right_count > 0) {
+        const int left_node = next_node++;
+        const int right_node = next_node++;
+        node.left = left_node;
+        node.right = right_node;
+        node.count = 0;
+        nodes[left_node] = BvhNode{empty_aabb(), -1, -1, task.start, left_count};
+        nodes[right_node] = BvhNode{empty_aabb(), -1, -1, task.start + left_count, right_count};
+        stack[stack_size++] = BvhBuildTask{task.start + left_count, right_count, right_node};
+        stack[stack_size++] = BvhBuildTask{task.start, left_count, left_node};
+      }
+    }
+    nodes[task.node_idx] = node;
+  }
+
+  *node_count = next_node;
+}
+
 __device__ __forceinline__ bool intersect_aabb(Vec3 ray_origin, Vec3 ray_dir, Aabb bounds, float max_t) {
   float t_min = kRayTMin;
   float t_max = max_t;
@@ -729,8 +797,12 @@ __global__ void render_scene_kernel(
     RenderOptionsView options) {
   __shared__ BvhPrimitive bvh_primitives[kMaxFinitePrimitives];
   __shared__ BvhNode bvh_nodes[kMaxBvhNodes];
+  __shared__ BvhPrimitive shadow_bvh_primitives[kMaxFinitePrimitives];
+  __shared__ BvhNode shadow_bvh_nodes[kMaxBvhNodes];
   __shared__ int finite_primitive_count;
   __shared__ int bvh_node_count;
+  __shared__ int shadow_primitive_count;
+  __shared__ int shadow_bvh_node_count;
 
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -753,6 +825,8 @@ __global__ void render_scene_kernel(
   if (thread_linear == 0) {
     finite_primitive_count = 0;
     bvh_node_count = 0;
+    shadow_primitive_count = 0;
+    shadow_bvh_node_count = 0;
   }
   __syncthreads();
 
@@ -761,6 +835,8 @@ __global__ void render_scene_kernel(
     const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
     const float sphere_radius = scene.spheres.radii[sphere_offset];
     const Aabb bounds = sphere_aabb(sphere_center, sphere_radius);
+    const int shadow_list_idx = atomicAdd(&shadow_primitive_count, 1);
+    shadow_bvh_primitives[shadow_list_idx] = BvhPrimitive{bounds, aabb_centroid(bounds), 1, sphere_idx};
     if (sphere_overlaps_block(
             sphere_center,
             sphere_radius,
@@ -782,6 +858,8 @@ __global__ void render_scene_kernel(
     const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
     const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
     const Aabb bounds = box_aabb(box_center, box_half_size, scene.boxes.axes + box_offset * 9);
+    const int shadow_list_idx = atomicAdd(&shadow_primitive_count, 1);
+    shadow_bvh_primitives[shadow_list_idx] = BvhPrimitive{bounds, aabb_centroid(bounds), 3, box_idx};
     if (box_overlaps_block(
             box_center,
             box_half_size,
@@ -801,63 +879,9 @@ __global__ void render_scene_kernel(
 
   __syncthreads();
 
-  if (thread_linear == 0 && finite_primitive_count > 0) {
-    BvhBuildTask stack[kMaxBvhNodes];
-    int stack_size = 0;
-    int next_node = 1;
-    bvh_nodes[0] = BvhNode{empty_aabb(), -1, -1, 0, finite_primitive_count};
-    stack[stack_size++] = BvhBuildTask{0, finite_primitive_count, 0};
-
-    while (stack_size > 0) {
-      const BvhBuildTask task = stack[--stack_size];
-      Aabb node_bounds = empty_aabb();
-      Aabb centroid_bounds = empty_aabb();
-      for (int item = 0; item < task.count; ++item) {
-        const BvhPrimitive primitive = bvh_primitives[task.start + item];
-        node_bounds = extend_aabb(node_bounds, primitive.bounds);
-        const Aabb centroid_bounds_item = Aabb{primitive.centroid, primitive.centroid};
-        centroid_bounds = extend_aabb(centroid_bounds, centroid_bounds_item);
-      }
-
-      BvhNode node = BvhNode{node_bounds, -1, -1, task.start, task.count};
-      if (task.count > kBvhLeafSize && next_node + 1 < kMaxBvhNodes) {
-        const Vec3 extent = sub(centroid_bounds.max, centroid_bounds.min);
-        int axis = 0;
-        if (extent.y > extent.x && extent.y >= extent.z) {
-          axis = 1;
-        } else if (extent.z > extent.x && extent.z > extent.y) {
-          axis = 2;
-        }
-
-        for (int i = 1; i < task.count; ++i) {
-          const BvhPrimitive key = bvh_primitives[task.start + i];
-          const float key_value = centroid_axis(key.centroid, axis);
-          int j = i - 1;
-          while (j >= 0 && centroid_axis(bvh_primitives[task.start + j].centroid, axis) > key_value) {
-            bvh_primitives[task.start + j + 1] = bvh_primitives[task.start + j];
-            --j;
-          }
-          bvh_primitives[task.start + j + 1] = key;
-        }
-
-        const int left_count = task.count / 2;
-        const int right_count = task.count - left_count;
-        if (left_count > 0 && right_count > 0) {
-          const int left_node = next_node++;
-          const int right_node = next_node++;
-          node.left = left_node;
-          node.right = right_node;
-          node.count = 0;
-          bvh_nodes[left_node] = BvhNode{empty_aabb(), -1, -1, task.start, left_count};
-          bvh_nodes[right_node] = BvhNode{empty_aabb(), -1, -1, task.start + left_count, right_count};
-          stack[stack_size++] = BvhBuildTask{task.start + left_count, right_count, right_node};
-          stack[stack_size++] = BvhBuildTask{task.start, left_count, left_node};
-        }
-      }
-      bvh_nodes[task.node_idx] = node;
-    }
-
-    bvh_node_count = next_node;
+  if (thread_linear == 0) {
+    build_bvh_nodes(bvh_primitives, bvh_nodes, finite_primitive_count, &bvh_node_count);
+    build_bvh_nodes(shadow_bvh_primitives, shadow_bvh_nodes, shadow_primitive_count, &shadow_bvh_node_count);
   }
 
   __syncthreads();
@@ -910,7 +934,7 @@ __global__ void render_scene_kernel(
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(sub(hit, sphere_center));
     color = apply_lighting(
-        sphere_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, 1,
+        sphere_color, hit, normal, ray_dir, light_dir, scene, shadow_bvh_primitives, shadow_bvh_nodes, shadow_bvh_node_count, options, batch_idx, 1,
         closest_sphere);
   } else if (closest_box >= 0) {
     const int box_offset = (batch_idx * scene.boxes.count + closest_box);
@@ -920,7 +944,7 @@ __global__ void render_scene_kernel(
     const Vec3 normal = normalize(closest_box_normal);
     const Vec3 box_color = load_vec3(scene.boxes.colors + box_offset * 3);
     color = apply_lighting(
-        box_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, 3,
+        box_color, hit, normal, ray_dir, light_dir, scene, shadow_bvh_primitives, shadow_bvh_nodes, shadow_bvh_node_count, options, batch_idx, 3,
         closest_box);
   } else if (closest_terrain >= 0) {
     instance_id = sphere_count + plane_count + 1;
@@ -934,9 +958,9 @@ __global__ void render_scene_kernel(
         ray_dir,
         light_dir,
         scene,
-        bvh_primitives,
-        bvh_nodes,
-        bvh_node_count,
+        shadow_bvh_primitives,
+        shadow_bvh_nodes,
+        shadow_bvh_node_count,
         options,
         batch_idx,
         4,
