@@ -19,8 +19,9 @@ class RenderOptions:
     light_dir: Vec3 = (-0.6, 0.7, 0.5)
     background: Vec3 = (0.02, 0.03, 0.04)
     fov_degrees: float = 45.0
+    ambient: float = 0.2
     shadows: bool = True
-    shadow_strength: float = 0.68
+    shadow_strength: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -283,6 +284,8 @@ def render_scene(
     scene_data = scene or Scene()
     if options_data.fov_degrees <= 0.0 or options_data.fov_degrees >= 180.0:
         raise ValueError("fov_degrees must be in the open interval (0, 180)")
+    if options_data.ambient < 0.0 or options_data.ambient > 1.0:
+        raise ValueError("ambient must be in the range [0, 1]")
     if options_data.shadow_strength < 0.0 or options_data.shadow_strength > 1.0:
         raise ValueError("shadow_strength must be in the range [0, 1]")
 
@@ -363,6 +366,7 @@ def render_scene(
             "light_dir": _vec3(options_data.light_dir, device=device),
             "background": _vec3(options_data.background, device=device),
             "fov_degrees": float(options_data.fov_degrees),
+            "ambient": float(options_data.ambient),
             "shadows": bool(options_data.shadows),
             "shadow_strength": float(options_data.shadow_strength),
         },

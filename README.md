@@ -33,7 +33,7 @@ from synthetic_scene import OrientedBoxes, Planes, RenderOptions, Scene, Spheres
 image = render_scene(
     width=768,
     height=512,
-    options=RenderOptions(shadows=True, shadow_strength=0.68),
+    options=RenderOptions(shadows=True, shadow_strength=1.0, ambient=0.16),
     scene=Scene(
         spheres=Spheres(
             centers=[(-0.8, 0.0, -3.0), (0.8, 0.0, -3.2)],
@@ -69,7 +69,9 @@ looking down `-Z`.
 Directional-light hard shadows are enabled by default. Set
 `RenderOptions(shadows=False)` to render direct Lambert shading without shadow
 rays, or tune `shadow_strength` in `[0, 1]` to control how much blocked direct
-light is darkened.
+light is removed. The default `1.0` leaves shadowed pixels at the same ambient
+floor as surfaces facing away from the light. Increase `ambient` to soften both
+cast shadows and unlit object sides together.
 
 To request segmentation ground truth, pass `return_maps=True`:
 

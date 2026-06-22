@@ -21,6 +21,7 @@ struct RenderOptionsView {
   const float* light_dir;
   const float* background;
   float fov_degrees;
+  float ambient;
   int shadows;
   float shadow_strength;
 };
@@ -306,7 +307,7 @@ __device__ __forceinline__ Vec3 apply_lighting(
     normal = mul(normal, -1.0f);
   }
 
-  const float ambient = 0.08f;
+  const float ambient = options.ambient;
   const float shade = fmaxf(dot(normal, light_dir), 0.0f);
   float direct = (1.0f - ambient) * shade;
   if (options.shadows && direct > 0.0f) {
@@ -486,6 +487,7 @@ void render_scene_cuda(
     torch::Tensor sphere_colors,
     torch::Tensor plane_colors,
     torch::Tensor box_colors,
+    double ambient,
     bool shadows,
     double shadow_strength) {
   const int batch_size = static_cast<int>(image.size(0));
@@ -529,6 +531,7 @@ void render_scene_cuda(
       light_dir.data_ptr<float>(),
       background.data_ptr<float>(),
       static_cast<float>(fov_degrees),
+      static_cast<float>(ambient),
       shadows ? 1 : 0,
       static_cast<float>(shadow_strength),
   };

@@ -171,6 +171,7 @@ void render_scene_cuda(
     torch::Tensor sphere_colors,
     torch::Tensor plane_colors,
     torch::Tensor box_colors,
+    double ambient,
     bool shadows,
     double shadow_strength);
 
@@ -356,6 +357,7 @@ void render_scene(
   const torch::Tensor light_dir = require_tensor(options, "light_dir");
   const torch::Tensor background = require_tensor(options, "background");
   const double fov_degrees = require_double(options, "fov_degrees");
+  const double ambient = require_double(options, "ambient");
   const bool shadows = require_bool(options, "shadows");
   const double shadow_strength = require_double(options, "shadow_strength");
 
@@ -418,6 +420,7 @@ void render_scene(
   TORCH_CHECK(box_centers.size(1) == box_colors.size(1), "box_centers and box_colors must have matching lengths");
   TORCH_CHECK(sphere_centers.size(1) > 0 || plane_points.size(1) > 0 || box_centers.size(1) > 0, "at least one object slot is required");
   TORCH_CHECK(light_dir.numel() == 3 && background.numel() == 3, "light/background vectors must be vec3");
+  TORCH_CHECK(ambient >= 0.0 && ambient <= 1.0, "ambient must be in the range [0, 1]");
   TORCH_CHECK(shadow_strength >= 0.0 && shadow_strength <= 1.0, "shadow_strength must be in the range [0, 1]");
   TORCH_CHECK(sphere_centers.dtype() == torch::kFloat32, "sphere_centers must be float32");
   TORCH_CHECK(sphere_radii.dtype() == torch::kFloat32, "sphere_radii must be float32");
@@ -460,6 +463,7 @@ void render_scene(
       sphere_colors,
       plane_colors,
       box_colors,
+      ambient,
       shadows,
       shadow_strength);
 }
