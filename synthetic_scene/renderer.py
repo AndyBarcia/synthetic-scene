@@ -42,9 +42,9 @@ class Planes:
 
 @dataclass(frozen=True)
 class Terrain:
-    heightmaps: torch.Tensor | Sequence[Sequence[float]] | Sequence[Sequence[Sequence[float]]] = ()
     origins: Vec3List = ((-4.0, -1.0, -7.0),)
-    cell_sizes: Sequence[float] | torch.Tensor = (0.25,)
+    phase_xs: Sequence[float] | torch.Tensor = (0.0,)
+    phase_zs: Sequence[float] | torch.Tensor = (0.0,)
     colors: Vec3List = ((0.36, 0.46, 0.30),)
     counts: Sequence[int] | torch.Tensor | None = None
 
@@ -167,21 +167,6 @@ def _scalar_batch(value: Sequence[float] | torch.Tensor, *, device: torch.device
     raise ValueError("expected scalars with shape N or B x N")
 
 
-def _heightmap_batch(
-    value: torch.Tensor | Sequence[Sequence[float]] | Sequence[Sequence[Sequence[float]]],
-    *,
-    device: torch.device | str = "cuda",
-) -> torch.Tensor:
-    tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
-    if tensor.numel() == 0:
-        return tensor.reshape(1, 0, 0).contiguous()
-    if tensor.ndim == 2:
-        return tensor.reshape(1, tensor.shape[0], tensor.shape[1]).contiguous()
-    if tensor.ndim == 3:
-        return tensor.contiguous()
-    raise ValueError("expected terrain heightmaps with shape H x W or B x H x W")
-
-
 def _mat3_batch(value: Union[Sequence[Sequence[Vec3]], torch.Tensor], *, device: torch.device | str = "cuda") -> torch.Tensor:
     tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
     if tensor.numel() == 0:
@@ -229,8 +214,8 @@ def _mat3_list(value: Union[Sequence[Sequence[Vec3]], torch.Tensor], *, device: 
 def random_scene(
     seed: int,
     *,
-    ground_objects: int = 10,
-    floating_objects: int = 5,
+    ground_objects: int = 0,
+    floating_objects: int = 1,
     batch_size: int = 4,
     scatter_radius: float = 3.0,
     ground_y: float = -1.0,
@@ -264,9 +249,9 @@ def random_scene(
                 counts=native["plane_counts"],
             ),
             terrain=Terrain(
-                heightmaps=native["terrain_heightmaps"],
                 origins=native["terrain_origins"],
-                cell_sizes=native["terrain_cell_sizes"],
+                phase_xs=native["terrain_phase_xs"],
+                phase_zs=native["terrain_phase_zs"],
                 colors=native["terrain_colors"],
                 counts=native["terrain_counts"],
             ),
@@ -333,9 +318,9 @@ def render_scene(
     points = _vec3_batch(scene_data.planes.points, device=device)
     normals = _vec3_batch(scene_data.planes.normals, device=device)
     plane_colors_tensor = _vec3_batch(scene_data.planes.colors, device=device)
-    terrain_heightmaps = _heightmap_batch(scene_data.terrain.heightmaps, device=device)
     terrain_origins = _vec3_batch(scene_data.terrain.origins, device=device)
-    terrain_cell_sizes = _scalar_batch(scene_data.terrain.cell_sizes, device=device)
+    terrain_phase_xs = _scalar_batch(scene_data.terrain.phase_xs, device=device)
+    terrain_phase_zs = _scalar_batch(scene_data.terrain.phase_zs, device=device)
     terrain_colors = _vec3_batch(scene_data.terrain.colors, device=device)
     box_centers = _vec3_batch(scene_data.boxes.centers, device=device)
     box_half_sizes = _vec3_batch(scene_data.boxes.half_sizes, device=device)
@@ -348,9 +333,9 @@ def render_scene(
         points,
         normals,
         plane_colors_tensor,
-        terrain_heightmaps,
         terrain_origins,
-        terrain_cell_sizes,
+        terrain_phase_xs,
+        terrain_phase_zs,
         terrain_colors,
         box_centers,
         box_half_sizes,
@@ -363,9 +348,9 @@ def render_scene(
     points = _expand_batch(points, batch_size)
     normals = _expand_batch(normals, batch_size)
     plane_colors_tensor = _expand_batch(plane_colors_tensor, batch_size)
-    terrain_heightmaps = _expand_batch(terrain_heightmaps, batch_size)
     terrain_origins = _expand_batch(terrain_origins, batch_size)
-    terrain_cell_sizes = _expand_batch(terrain_cell_sizes, batch_size)
+    terrain_phase_xs = _expand_batch(terrain_phase_xs, batch_size)
+    terrain_phase_zs = _expand_batch(terrain_phase_zs, batch_size)
     terrain_colors = _expand_batch(terrain_colors, batch_size)
     box_centers = _expand_batch(box_centers, batch_size)
     box_half_sizes = _expand_batch(box_half_sizes, batch_size)
@@ -373,7 +358,7 @@ def render_scene(
     box_colors = _expand_batch(box_colors, batch_size)
     sphere_count = centers.shape[1]
     plane_count = points.shape[1]
-    terrain_count = 1 if terrain_heightmaps.shape[1] >= 2 and terrain_heightmaps.shape[2] >= 2 else 0
+    terrain_count = 1 if terrain_origins.shape[1] > 0 else 0
     box_count = box_centers.shape[1]
     sphere_counts = _counts(scene_data.spheres.counts, batch_size=batch_size, count=sphere_count, device=device)
     plane_counts = _counts(scene_data.planes.counts, batch_size=batch_size, count=plane_count, device=device)
@@ -385,16 +370,14 @@ def render_scene(
         raise ValueError("sphere_centers, sphere_radii, and sphere_colors must have matching lengths")
     if normals.shape[1] != plane_count or plane_colors_tensor.shape[1] != plane_count:
         raise ValueError("plane_points, plane_normals, and plane_colors must have matching lengths")
-    if terrain_origins.shape[1] != 1 or terrain_cell_sizes.shape[1] != 1 or terrain_colors.shape[1] != 1:
-        raise ValueError("terrain origins, cell_sizes, and colors must each contain one entry")
+    if terrain_origins.shape[1] != 1 or terrain_phase_xs.shape[1] != 1 or terrain_phase_zs.shape[1] != 1 or terrain_colors.shape[1] != 1:
+        raise ValueError("terrain origins, phase_xs, phase_zs, and colors must each contain one entry")
     if box_half_sizes.shape[1] != box_count or box_axes.shape[1] != box_count or box_colors.shape[1] != box_count:
         raise ValueError("box_centers, box_half_sizes, box_axes, and box_colors must have matching lengths")
     if bool((radii <= 0).any().item()):
         raise ValueError("sphere_radii must all be positive")
     if bool((normals.norm(dim=2) <= 1.0e-8).any().item()):
         raise ValueError("plane_normals must be non-zero")
-    if bool((terrain_cell_sizes <= 0).any().item()):
-        raise ValueError("terrain cell_sizes must be positive")
     if bool((box_half_sizes <= 0).any().item()):
         raise ValueError("box_half_sizes must all be positive")
     if bool((box_axes.norm(dim=3) <= 1.0e-8).any().item()):
@@ -421,9 +404,9 @@ def render_scene(
                 "counts": plane_counts,
             },
             "terrain": {
-                "heightmaps": terrain_heightmaps,
                 "origins": terrain_origins,
-                "cell_sizes": terrain_cell_sizes,
+                "phase_xs": terrain_phase_xs,
+                "phase_zs": terrain_phase_zs,
                 "colors": terrain_colors,
                 "counts": terrain_counts,
             },

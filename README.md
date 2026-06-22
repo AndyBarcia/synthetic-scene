@@ -6,7 +6,7 @@ Tiny CUDA/PyTorch synthetic scene renderer.
 
 The renderer draws Lambert-shaded geometric objects entirely in CUDA and can
 return batched RGB plus panoptic-friendly segmentation tensors. It supports up
-to 64 spheres, 64 oriented boxes, 64 planes, and one heightmap terrain per
+to 64 spheres, 64 oriented boxes, 64 planes, and one procedural terrain per
 scene. Batched renders draw different camera-space scenes.
 
 ## Build
@@ -23,7 +23,7 @@ conda run -n clipdino-cu117 python -m examples.render
 
 The example writes `outputs/render.png` plus side-by-side colorized instance and
 semantic label-map visualizations. Random renders include a generated rolling
-terrain heightmap, and grounded objects are placed on that terrain.
+procedural terrain, and grounded objects are placed on that terrain.
 
 You can render a scene directly from Python:
 
@@ -46,14 +46,9 @@ image = render_scene(
             colors=[(0.12, 0.14, 0.18)],
         ),
         terrain=Terrain(
-            heightmaps=[
-                [-1.15, -1.10, -1.05, -1.10],
-                [-1.05, -0.92, -0.88, -0.98],
-                [-1.08, -0.96, -0.90, -1.00],
-                [-1.20, -1.08, -1.02, -1.12],
-            ],
-            origins=[(-2.0, -1.0, -4.5)],
-            cell_sizes=[1.25],
+            origins=[(0.0, -1.0, -7.0)],
+            phase_xs=[0.4],
+            phase_zs=[1.2],
             colors=[(0.36, 0.46, 0.30)],
         ),
         boxes=OrientedBoxes(
@@ -129,7 +124,7 @@ result = render_scene(
 )
 ```
 
-Random scenes always include a generated terrain heightmap, include both
+Random scenes always include a generated procedural terrain, include both
 grounded and floating primitives, and generate objects by sampling screen-space
 coordinates within the camera frustum plus a camera distance. Grounded
 primitives are placed by sampling the terrain height at their X/Z location.
