@@ -142,8 +142,13 @@ __device__ __forceinline__ Vec3 normalize(Vec3 v) {
 }
 
 __device__ __forceinline__ float smooth_height(float x, float z, float phase_x, float phase_z) {
-  return 0.28f * sinf(1.35f * x + phase_x) + 0.18f * cosf(1.85f * z + phase_z) +
-      0.08f * sinf(1.1f * (x + z) + phase_x * 0.7f);
+  const float forward_depth = fmaxf(-z, 0.0f);
+  const float far_rise = 0.055f * forward_depth + 0.0011f * forward_depth * forward_depth;
+  const float broad_undulation =
+      1.20f * sinf(0.18f * x + 0.11f * z + phase_x) + 0.85f * cosf(0.13f * x - 0.20f * z + phase_z);
+  const float foothills = 0.42f * sinf(0.46f * x + 0.34f * z + phase_x * 0.61f + phase_z * 0.23f);
+  const float worn_detail = 0.12f * sinf(0.95f * x - 0.58f * z + phase_z * 1.37f);
+  return far_rise + broad_undulation + foothills + worn_detail;
 }
 
 __device__ __forceinline__ float sample_terrain_height(const TerrainView& terrain, int batch_idx, float world_x, float world_z) {

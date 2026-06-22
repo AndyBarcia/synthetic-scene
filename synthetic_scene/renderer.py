@@ -209,7 +209,7 @@ def random_scene(
     scatter_radius: float = 50.0,
     ground_y: float = -1.0,
     depth_limit: float = 50.0,
-    terrain_dz: float = 0.05,
+    terrain_dz: float = 0.005,
     terrain_dz_growth: float = 0.0001,
     fov_degrees: float = 50.0,
     aspect_ratio: float = 1.5,
