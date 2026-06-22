@@ -202,6 +202,7 @@ def random_scene(
     scatter_radius: float = 3.0,
     ground_y: float = -1.0,
     fov_degrees: float = 50.0,
+    aspect_ratio: float = 1.5,
 ) -> RandomScene:
     """Generate deterministic random camera-space scenes from a seed."""
     native = _cuda_renderer.random_scene(
@@ -212,6 +213,7 @@ def random_scene(
         float(scatter_radius),
         float(ground_y),
         float(fov_degrees),
+        float(aspect_ratio),
     )
 
     return RandomScene(

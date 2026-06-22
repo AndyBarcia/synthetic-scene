@@ -60,7 +60,7 @@ def benchmark(width: int, height: int, batch_size: int, warmup: int, iterations:
     torch.cuda.set_device(device_index)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
-    generated = random_scene(seed=seed, batch_size=batch_size)
+    generated = random_scene(seed=seed, batch_size=batch_size, aspect_ratio=width / height)
 
     image = None
     for _ in range(warmup):

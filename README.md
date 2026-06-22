@@ -99,17 +99,20 @@ For synthetic data generation, create seeded random camera-space scenes:
 ```python
 from synthetic_scene import random_scene, render_scene
 
-generated = random_scene(seed=1234, batch_size=8)
+width = 768
+height = 512
+generated = random_scene(seed=1234, batch_size=8, aspect_ratio=width / height)
 result = render_scene(
-    width=768,
-    height=512,
+    width=width,
+    height=height,
     scene=generated.scene,
     return_maps=True,
 )
 ```
 
 Random scenes always include a ground plane, include both grounded and floating
-primitives, and generate objects directly in front of the camera in `-Z`.
+primitives, and generate objects by sampling screen-space coordinates within the
+camera frustum plus a camera distance.
 
 ## Benchmark
 

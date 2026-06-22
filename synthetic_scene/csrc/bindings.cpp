@@ -88,10 +88,23 @@ Vec3 random_color(at::Generator& generator) {
   return Vec3{value, p, q};
 }
 
-std::tuple<float, float> random_ground_xz(at::Generator& generator, float scatter_radius) {
-  const float radius = scatter_radius * std::sqrt(rand_float(generator, 0.0f, 1.0f));
-  const float angle = rand_float(generator, 0.0f, kTau);
-  return {radius * std::cos(angle), radius * std::sin(angle)};
+Vec3 random_frustum_point(
+    at::Generator& generator,
+    float fov_degrees,
+    float aspect_ratio,
+    float min_distance,
+    float max_distance,
+    float min_ndc_y,
+    float max_ndc_y) {
+  const float fov_radians = fov_degrees * 0.017453292519943295f;
+  const float image_plane_scale = std::tan(0.5f * fov_radians);
+  const float ndc_x = rand_float(generator, -1.0f, 1.0f);
+  const float ndc_y = rand_float(generator, min_ndc_y, max_ndc_y);
+  const float px = ndc_x * aspect_ratio * image_plane_scale;
+  const float py = ndc_y * image_plane_scale;
+  const Vec3 ray_dir = normalize3(Vec3{px, py, -1.0f});
+  const float distance = rand_float(generator, min_distance, max_distance);
+  return Vec3{ray_dir.x * distance, ray_dir.y * distance, ray_dir.z * distance};
 }
 
 Mat3 yaw_axes(float yaw) {
@@ -184,13 +197,15 @@ py::dict random_scene(
     int batch_size,
     float scatter_radius,
     float ground_y,
-    float fov_degrees) {
+    float fov_degrees,
+    float aspect_ratio) {
   TORCH_CHECK(c10::cuda::device_count() > 0, "CUDA is required to generate a native random scene");
   TORCH_CHECK(ground_objects >= 0 && floating_objects >= 0, "object counts must be non-negative");
   TORCH_CHECK(ground_objects + floating_objects > 0, "at least one non-plane object is required");
   TORCH_CHECK(batch_size > 0, "batch_size must be positive");
   TORCH_CHECK(scatter_radius > 0.0f, "scatter_radius must be positive");
   TORCH_CHECK(fov_degrees > 0.0f && fov_degrees < 180.0f, "fov_degrees must be in the open interval (0, 180)");
+  TORCH_CHECK(aspect_ratio > 0.0f, "aspect_ratio must be positive");
 
   at::Generator generator = at::detail::createCPUGenerator(static_cast<uint64_t>(seed));
   std::vector<float> sphere_centers;
@@ -227,9 +242,16 @@ py::dict random_scene(
     };
 
     for (int i = 0; i < ground_objects; ++i) {
-      const auto ground_xz = random_ground_xz(generator, scatter_radius);
-      const float x = std::get<0>(ground_xz);
-      const float z = -2.0f - std::fabs(std::get<1>(ground_xz));
+      const Vec3 frustum_point = random_frustum_point(
+          generator,
+          fov_degrees,
+          aspect_ratio,
+          2.0f,
+          2.0f + scatter_radius,
+          -0.82f,
+          -0.18f);
+      const float x = frustum_point.x;
+      const float z = frustum_point.z;
       if (rand_float(generator, 0.0f, 1.0f) < 0.55f) {
         const float radius = rand_float(generator, 0.18f, 0.65f);
         add_sphere(Vec3{x, ground_y + radius, z}, radius);
@@ -244,19 +266,27 @@ py::dict random_scene(
     }
 
     for (int i = 0; i < floating_objects; ++i) {
-      const auto ground_xz = random_ground_xz(generator, scatter_radius * 0.9f);
-      const float x = std::get<0>(ground_xz);
-      const float z = -2.0f - std::fabs(std::get<1>(ground_xz));
+      const Vec3 frustum_point = random_frustum_point(
+          generator,
+          fov_degrees,
+          aspect_ratio,
+          1.8f,
+          2.0f + scatter_radius * 0.9f,
+          0.15f,
+          0.85f);
+      const float x = frustum_point.x;
+      const float y = frustum_point.y;
+      const float z = frustum_point.z;
       if (rand_float(generator, 0.0f, 1.0f) < 0.65f) {
         const float radius = rand_float(generator, 0.15f, 0.5f);
-        add_sphere(Vec3{x, rand_float(generator, ground_y + 1.0f, ground_y + 3.2f), z}, radius);
+        add_sphere(Vec3{x, y, z}, radius);
       } else {
         const Vec3 half_size{
             rand_float(generator, 0.14f, 0.45f),
             rand_float(generator, 0.14f, 0.45f),
             rand_float(generator, 0.14f, 0.45f),
         };
-        add_box(Vec3{x, rand_float(generator, ground_y + 1.1f, ground_y + 3.4f), z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
+        add_box(Vec3{x, y, z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
       }
     }
 
@@ -432,6 +462,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("scatter_radius"),
       py::arg("ground_y"),
       py::arg("fov_degrees"),
+      py::arg("aspect_ratio"),
       "Generate random camera-space scene tensors directly from the native extension");
   m.def("render_scene", &render_scene, "Render Lambert-shaded geometric objects (CUDA)");
 }
