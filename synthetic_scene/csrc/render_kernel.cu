@@ -46,6 +46,16 @@ struct PlaneView {
   int count;
 };
 
+struct TerrainView {
+  const float* heightmaps;
+  const float* origins;
+  const float* cell_sizes;
+  const float* colors;
+  const int* counts;
+  int height;
+  int width;
+};
+
 struct BoxView {
   const float* centers;
   const float* half_sizes;
@@ -58,6 +68,7 @@ struct BoxView {
 struct SceneView {
   SphereView spheres;
   PlaneView planes;
+  TerrainView terrain;
   BoxView boxes;
 };
 
@@ -91,7 +102,9 @@ struct HitRecord {
   float t;
   int sphere;
   int box;
+  int terrain;
   Vec3 box_normal;
+  Vec3 terrain_normal;
 };
 
 __host__ __device__ __forceinline__ Vec3 make_vec3(float x, float y, float z) {
@@ -126,9 +139,205 @@ __device__ __forceinline__ float dot(Vec3 a, Vec3 b) {
   return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
+__device__ __forceinline__ Vec3 cross(Vec3 a, Vec3 b) {
+  return make_vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
 __device__ __forceinline__ Vec3 normalize(Vec3 v) {
   const float len2 = fmaxf(dot(v, v), 1.0e-20f);
   return mul(v, rsqrtf(len2));
+}
+
+__device__ __forceinline__ bool intersect_triangle(
+    Vec3 ray_origin,
+    Vec3 ray_dir,
+    Vec3 v0,
+    Vec3 v1,
+    Vec3 v2,
+    float* out_t,
+    Vec3* out_normal) {
+  const Vec3 edge1 = sub(v1, v0);
+  const Vec3 edge2 = sub(v2, v0);
+  const Vec3 pvec = cross(ray_dir, edge2);
+  const float det = dot(edge1, pvec);
+  if (fabsf(det) < kParallelEpsilon) {
+    return false;
+  }
+  const float inv_det = 1.0f / det;
+  const Vec3 tvec = sub(ray_origin, v0);
+  const float u = dot(tvec, pvec) * inv_det;
+  if (u < 0.0f || u > 1.0f) {
+    return false;
+  }
+  const Vec3 qvec = cross(tvec, edge1);
+  const float v = dot(ray_dir, qvec) * inv_det;
+  if (v < 0.0f || u + v > 1.0f) {
+    return false;
+  }
+  const float t = dot(edge2, qvec) * inv_det;
+  if (t <= kRayTMin) {
+    return false;
+  }
+  *out_t = t;
+  *out_normal = normalize(cross(edge1, edge2));
+  return true;
+}
+
+__device__ __forceinline__ float load_terrain_height(const TerrainView& terrain, int batch_idx, int row, int col) {
+  return terrain.heightmaps[(batch_idx * terrain.height + row) * terrain.width + col];
+}
+
+__device__ __forceinline__ Vec3 terrain_normal_at_hit(const TerrainView& terrain, int batch_idx, Vec3 hit) {
+  const Vec3 origin = load_vec3(terrain.origins + batch_idx * 3);
+  const float cell_size = terrain.cell_sizes[batch_idx];
+  const float inv_cell_size = 1.0f / cell_size;
+  const float local_x = (hit.x - origin.x) * inv_cell_size;
+  const float local_z = (hit.z - origin.z) * inv_cell_size;
+  const int cell_x = min(max(static_cast<int>(floorf(local_x)), 0), terrain.width - 2);
+  const int cell_z = min(max(static_cast<int>(floorf(local_z)), 0), terrain.height - 2);
+
+  const float x0 = origin.x + static_cast<float>(cell_x) * cell_size;
+  const float z0 = origin.z + static_cast<float>(cell_z) * cell_size;
+  const float x1 = x0 + cell_size;
+  const float z1 = z0 + cell_size;
+  const float fx = fminf(fmaxf((hit.x - x0) * inv_cell_size, 0.0f), 1.0f);
+  const float fz = fminf(fmaxf((hit.z - z0) * inv_cell_size, 0.0f), 1.0f);
+
+  const float h00 = load_terrain_height(terrain, batch_idx, cell_z, cell_x);
+  const float h10 = load_terrain_height(terrain, batch_idx, cell_z, cell_x + 1);
+  const float h01 = load_terrain_height(terrain, batch_idx, cell_z + 1, cell_x);
+  const float h11 = load_terrain_height(terrain, batch_idx, cell_z + 1, cell_x + 1);
+  const Vec3 v00 = make_vec3(x0, h00, z0);
+  const Vec3 v10 = make_vec3(x1, h10, z0);
+  const Vec3 v01 = make_vec3(x0, h01, z1);
+  const Vec3 v11 = make_vec3(x1, h11, z1);
+
+  if (fx + fz <= 1.0f) {
+    return normalize(cross(sub(v01, v00), sub(v10, v00)));
+  }
+  return normalize(cross(sub(v01, v10), sub(v11, v10)));
+}
+
+__device__ bool intersect_terrain(
+    Vec3 ray_origin,
+    Vec3 ray_dir,
+    const TerrainView& terrain,
+    int batch_idx,
+    float max_t,
+    float* out_t,
+    Vec3* out_normal) {
+  if (terrain.counts[batch_idx] <= 0 || terrain.height < 2 || terrain.width < 2) {
+    return false;
+  }
+
+  const Vec3 origin = load_vec3(terrain.origins + batch_idx * 3);
+  const float cell_size = terrain.cell_sizes[batch_idx];
+  const float min_x = origin.x;
+  const float max_x = origin.x + static_cast<float>(terrain.width - 1) * cell_size;
+  const float min_z = origin.z;
+  const float max_z = origin.z + static_cast<float>(terrain.height - 1) * cell_size;
+  float t_enter = kRayTMin;
+  float t_exit = max_t;
+
+  if (fabsf(ray_dir.x) < kParallelEpsilon) {
+    if (ray_origin.x < min_x || ray_origin.x > max_x) {
+      return false;
+    }
+  } else {
+    const float inv_x = 1.0f / ray_dir.x;
+    float tx0 = (min_x - ray_origin.x) * inv_x;
+    float tx1 = (max_x - ray_origin.x) * inv_x;
+    if (tx0 > tx1) {
+      const float tmp = tx0;
+      tx0 = tx1;
+      tx1 = tmp;
+    }
+    t_enter = fmaxf(t_enter, tx0);
+    t_exit = fminf(t_exit, tx1);
+  }
+
+  if (fabsf(ray_dir.z) < kParallelEpsilon) {
+    if (ray_origin.z < min_z || ray_origin.z > max_z) {
+      return false;
+    }
+  } else {
+    const float inv_z = 1.0f / ray_dir.z;
+    float tz0 = (min_z - ray_origin.z) * inv_z;
+    float tz1 = (max_z - ray_origin.z) * inv_z;
+    if (tz0 > tz1) {
+      const float tmp = tz0;
+      tz0 = tz1;
+      tz1 = tmp;
+    }
+    t_enter = fmaxf(t_enter, tz0);
+    t_exit = fminf(t_exit, tz1);
+  }
+
+  if (t_enter > t_exit) {
+    return false;
+  }
+
+  Vec3 p = add(ray_origin, mul(ray_dir, t_enter));
+  int cell_x = min(max(static_cast<int>(floorf((p.x - origin.x) / cell_size)), 0), terrain.width - 2);
+  int cell_z = min(max(static_cast<int>(floorf((p.z - origin.z) / cell_size)), 0), terrain.height - 2);
+  const int step_x = ray_dir.x > 0.0f ? 1 : -1;
+  const int step_z = ray_dir.z > 0.0f ? 1 : -1;
+  const float next_x = origin.x + static_cast<float>(ray_dir.x > 0.0f ? cell_x + 1 : cell_x) * cell_size;
+  const float next_z = origin.z + static_cast<float>(ray_dir.z > 0.0f ? cell_z + 1 : cell_z) * cell_size;
+  float t_max_x = fabsf(ray_dir.x) < kParallelEpsilon ? kFloatMax : (next_x - ray_origin.x) / ray_dir.x;
+  float t_max_z = fabsf(ray_dir.z) < kParallelEpsilon ? kFloatMax : (next_z - ray_origin.z) / ray_dir.z;
+  const float t_delta_x = fabsf(ray_dir.x) < kParallelEpsilon ? kFloatMax : fabsf(cell_size / ray_dir.x);
+  const float t_delta_z = fabsf(ray_dir.z) < kParallelEpsilon ? kFloatMax : fabsf(cell_size / ray_dir.z);
+
+  float best_t = max_t;
+  Vec3 best_normal = make_vec3(0.0f, 1.0f, 0.0f);
+  bool hit_any = false;
+  for (int step = 0; step < terrain.width + terrain.height + 512; ++step) {
+    if (cell_x < 0 || cell_x >= terrain.width - 1 || cell_z < 0 || cell_z >= terrain.height - 1) {
+      break;
+    }
+    const float segment_end = fminf(fminf(t_max_x, t_max_z), t_exit);
+    const float x0 = origin.x + static_cast<float>(cell_x) * cell_size;
+    const float z0 = origin.z + static_cast<float>(cell_z) * cell_size;
+    const float x1 = x0 + cell_size;
+    const float z1 = z0 + cell_size;
+    const float h00 = load_terrain_height(terrain, batch_idx, cell_z, cell_x);
+    const float h10 = load_terrain_height(terrain, batch_idx, cell_z, cell_x + 1);
+    const float h01 = load_terrain_height(terrain, batch_idx, cell_z + 1, cell_x);
+    const float h11 = load_terrain_height(terrain, batch_idx, cell_z + 1, cell_x + 1);
+    const Vec3 v00 = make_vec3(x0, h00, z0);
+    const Vec3 v10 = make_vec3(x1, h10, z0);
+    const Vec3 v01 = make_vec3(x0, h01, z1);
+    const Vec3 v11 = make_vec3(x1, h11, z1);
+    float t = 0.0f;
+    Vec3 normal = make_vec3(0.0f, 1.0f, 0.0f);
+    if (intersect_triangle(ray_origin, ray_dir, v00, v01, v10, &t, &normal) && t <= segment_end + 1.0e-4f && t < best_t) {
+      best_t = t;
+      best_normal = normal;
+      hit_any = true;
+    }
+    if (intersect_triangle(ray_origin, ray_dir, v10, v01, v11, &t, &normal) && t <= segment_end + 1.0e-4f && t < best_t) {
+      best_t = t;
+      best_normal = normal;
+      hit_any = true;
+    }
+    if (hit_any) {
+      break;
+    }
+    if (t_max_x < t_max_z) {
+      t_max_x += t_delta_x;
+      cell_x += step_x;
+    } else {
+      t_max_z += t_delta_z;
+      cell_z += step_z;
+    }
+  }
+  if (!hit_any) {
+    return false;
+  }
+  *out_t = best_t;
+  *out_normal = best_normal;
+  return true;
 }
 
 __device__ __forceinline__ Aabb empty_aabb() {
@@ -467,6 +676,140 @@ __device__ __forceinline__ bool box_overlaps_block(
       block_max_x, block_max_y);
 }
 
+
+__global__ void init_terrain_depth_kernel(float* terrain_depth, int count) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    terrain_depth[idx] = kFloatMax;
+  }
+}
+
+__device__ __forceinline__ float edge_function_2d(float ax, float ay, float bx, float by, float px, float py) {
+  return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+__device__ __forceinline__ void atomic_min_positive_float(float* addr, float value) {
+  // This relies on all values being non-negative finite floats. That is true for ray t here.
+  atomicMin(reinterpret_cast<unsigned int*>(addr), __float_as_uint(value));
+}
+
+__global__ void raster_terrain_kernel(
+    float* terrain_depth,
+    int width,
+    int height,
+    SceneView scene,
+    RenderOptionsView options) {
+  const int batch_idx = blockIdx.z;
+  if (scene.terrain.counts[batch_idx] <= 0 || scene.terrain.height < 2 || scene.terrain.width < 2) {
+    return;
+  }
+
+  const int cells_x = scene.terrain.width - 1;
+  const int cells_z = scene.terrain.height - 1;
+  const int tri_idx = blockIdx.x;
+  const int cell_idx = tri_idx >> 1;
+  const int local_tri = tri_idx & 1;
+  if (cell_idx >= cells_x * cells_z) {
+    return;
+  }
+
+  const int cell_z = cell_idx / cells_x;
+  const int cell_x = cell_idx - cell_z * cells_x;
+  const Vec3 terrain_origin = load_vec3(scene.terrain.origins + batch_idx * 3);
+  const float cell_size = scene.terrain.cell_sizes[batch_idx];
+  const float x0 = terrain_origin.x + static_cast<float>(cell_x) * cell_size;
+  const float z0 = terrain_origin.z + static_cast<float>(cell_z) * cell_size;
+  const float x1 = x0 + cell_size;
+  const float z1 = z0 + cell_size;
+
+  const float h00 = load_terrain_height(scene.terrain, batch_idx, cell_z, cell_x);
+  const float h10 = load_terrain_height(scene.terrain, batch_idx, cell_z, cell_x + 1);
+  const float h01 = load_terrain_height(scene.terrain, batch_idx, cell_z + 1, cell_x);
+  const float h11 = load_terrain_height(scene.terrain, batch_idx, cell_z + 1, cell_x + 1);
+
+  Vec3 v0;
+  Vec3 v1;
+  Vec3 v2;
+  if (local_tri == 0) {
+    v0 = make_vec3(x0, h00, z0);
+    v1 = make_vec3(x0, h01, z1);
+    v2 = make_vec3(x1, h10, z0);
+  } else {
+    v0 = make_vec3(x1, h10, z0);
+    v1 = make_vec3(x0, h01, z1);
+    v2 = make_vec3(x1, h11, z1);
+  }
+
+  const float aspect = static_cast<float>(width) / static_cast<float>(height);
+  const float fov_radians = options.fov_degrees * 0.017453292519943295f;
+  const float image_plane_scale = tanf(0.5f * fov_radians);
+
+  float sx0 = 0.0f;
+  float sy0 = 0.0f;
+  float sx1 = 0.0f;
+  float sy1 = 0.0f;
+  float sx2 = 0.0f;
+  float sy2 = 0.0f;
+  // Baseline implementation: skip near-plane-clipped terrain triangles. This is usually fine for terrain
+  // below/in front of the camera, and avoids adding clipping complexity in the first pass.
+  if (!project_to_pixel(v0, aspect, image_plane_scale, width, height, &sx0, &sy0) ||
+      !project_to_pixel(v1, aspect, image_plane_scale, width, height, &sx1, &sy1) ||
+      !project_to_pixel(v2, aspect, image_plane_scale, width, height, &sx2, &sy2)) {
+    return;
+  }
+
+  const float min_xf = floorf(fminf(sx0, fminf(sx1, sx2)));
+  const float max_xf = ceilf(fmaxf(sx0, fmaxf(sx1, sx2)));
+  const float min_yf = floorf(fminf(sy0, fminf(sy1, sy2)));
+  const float max_yf = ceilf(fmaxf(sy0, fmaxf(sy1, sy2)));
+  const int min_px = max(static_cast<int>(min_xf), 0);
+  const int max_px = min(static_cast<int>(max_xf), width - 1);
+  const int min_py = max(static_cast<int>(min_yf), 0);
+  const int max_py = min(static_cast<int>(max_yf), height - 1);
+  if (min_px > max_px || min_py > max_py) {
+    return;
+  }
+
+  const Vec3 plane_normal = cross(sub(v1, v0), sub(v2, v0));
+  const float plane_rhs = dot(plane_normal, v0);
+  const float area = edge_function_2d(sx0, sy0, sx1, sy1, sx2, sy2);
+  if (fabsf(area) < 1.0e-12f) {
+    return;
+  }
+
+  for (int py = min_py + threadIdx.y; py <= max_py; py += blockDim.y) {
+    const float sample_y = static_cast<float>(py) + 0.5f;
+    for (int px = min_px + threadIdx.x; px <= max_px; px += blockDim.x) {
+      const float sample_x = static_cast<float>(px) + 0.5f;
+      const float e0 = edge_function_2d(sx0, sy0, sx1, sy1, sample_x, sample_y);
+      const float e1 = edge_function_2d(sx1, sy1, sx2, sy2, sample_x, sample_y);
+      const float e2 = edge_function_2d(sx2, sy2, sx0, sy0, sample_x, sample_y);
+      const bool inside = area > 0.0f ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
+                                      : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
+      if (!inside) {
+        continue;
+      }
+
+      const float ray_x = ((static_cast<float>(px) + 0.5f) / static_cast<float>(width) * 2.0f - 1.0f) *
+          aspect * image_plane_scale;
+      const float ray_y = (1.0f - (static_cast<float>(py) + 0.5f) / static_cast<float>(height) * 2.0f) *
+          image_plane_scale;
+      const Vec3 ray_dir = normalize(make_vec3(ray_x, ray_y, -1.0f));
+      const float denom = dot(plane_normal, ray_dir);
+      if (fabsf(denom) < kParallelEpsilon) {
+        continue;
+      }
+      const float t = plane_rhs / denom;
+      if (t <= kRayTMin || !isfinite(t)) {
+        continue;
+      }
+
+      const int depth_offset = (batch_idx * height + py) * width + px;
+      atomic_min_positive_float(terrain_depth + depth_offset, t);
+    }
+  }
+}
+
 __device__ __forceinline__ bool is_shadowed(
     Vec3 ray_origin,
     Vec3 light_dir,
@@ -476,6 +819,7 @@ __device__ __forceinline__ bool is_shadowed(
     int node_count,
     int batch_idx,
     int plane_count,
+    int terrain_count,
     int skip_kind,
     int skip_idx) {
   if (node_count > 0) {
@@ -545,6 +889,9 @@ __device__ __forceinline__ bool is_shadowed(
     }
   }
 
+  // Terrain casting shadows is intentionally disabled in this rasterized-terrain path.
+  // Keeping the old heightfield DDA here can dominate runtime because shadow rays used kFloatMax.
+
   return false;
 }
 
@@ -562,6 +909,7 @@ __device__ __forceinline__ Vec3 apply_lighting(
     int batch_idx,
     int sphere_count,
     int plane_count,
+    int terrain_count,
     int box_count,
     int skip_kind,
     int skip_idx) {
@@ -583,6 +931,7 @@ __device__ __forceinline__ Vec3 apply_lighting(
             node_count,
             batch_idx,
             plane_count,
+            terrain_count,
             skip_kind,
             skip_idx)) {
       direct *= (1.0f - options.shadow_strength);
@@ -658,6 +1007,7 @@ __global__ void render_scene_kernel(
     float* image,
     int* instance_map,
     int* semantic_map,
+    const float* terrain_depth,
     int width,
     int height,
     SceneView scene,
@@ -674,6 +1024,7 @@ __global__ void render_scene_kernel(
   const int batch_idx = blockIdx.z;
   const int sphere_count = scene.spheres.counts[batch_idx];
   const int plane_count = scene.planes.counts[batch_idx];
+  const int terrain_count = scene.terrain.counts[batch_idx];
   const int box_count = scene.boxes.counts[batch_idx];
 
   const float aspect = static_cast<float>(width) / static_cast<float>(height);
@@ -819,15 +1170,17 @@ __global__ void render_scene_kernel(
   const Vec3 ray_dir = normalize(make_vec3(px, py, -1.0f));
 
   Vec3 color = background;
-  HitRecord finite_hit{kFloatMax, -1, -1, make_vec3(0.0f, 0.0f, 0.0f)};
+  HitRecord finite_hit{kFloatMax, -1, -1, -1, make_vec3(0.0f, 0.0f, 0.0f), make_vec3(0.0f, 1.0f, 0.0f)};
   intersect_finite_bvh(ray_origin, ray_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, batch_idx, &finite_hit);
   float closest_t = finite_hit.t;
   int closest_sphere = finite_hit.sphere;
   int closest_plane = -1;
   int closest_box = finite_hit.box;
+  int closest_terrain = -1;
   int instance_id = 0;
   int semantic_id = 0;
   Vec3 closest_box_normal = finite_hit.box_normal;
+  Vec3 closest_terrain_normal = finite_hit.terrain_normal;
 
   for (int list_idx = 0; list_idx < visible_plane_count; ++list_idx) {
     const int plane_idx = visible_planes[list_idx];
@@ -844,6 +1197,20 @@ __global__ void render_scene_kernel(
     }
   }
 
+  const int map_offset = (batch_idx * height + y) * width + x;
+  if (terrain_count > 0 && terrain_depth != nullptr) {
+    const float terrain_t = terrain_depth[map_offset];
+    if (terrain_t < closest_t) {
+      closest_t = terrain_t;
+      closest_sphere = -1;
+      closest_plane = -1;
+      closest_box = -1;
+      closest_terrain = 0;
+      const Vec3 terrain_hit = add(ray_origin, mul(ray_dir, closest_t));
+      closest_terrain_normal = terrain_normal_at_hit(scene.terrain, batch_idx, terrain_hit);
+    }
+  }
+
   if (closest_sphere >= 0) {
     const int sphere_offset = (batch_idx * scene.spheres.count + closest_sphere);
     instance_id = closest_sphere + 1;
@@ -853,17 +1220,17 @@ __global__ void render_scene_kernel(
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(sub(hit, sphere_center));
     color = apply_lighting(
-        sphere_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, sphere_count, plane_count, box_count, 1,
+        sphere_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, sphere_count, plane_count, terrain_count, box_count, 1,
         closest_sphere);
   } else if (closest_box >= 0) {
     const int box_offset = (batch_idx * scene.boxes.count + closest_box);
-    instance_id = sphere_count + plane_count + closest_box + 1;
+    instance_id = sphere_count + plane_count + terrain_count + closest_box + 1;
     semantic_id = 3;
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(closest_box_normal);
     const Vec3 box_color = load_vec3(scene.boxes.colors + box_offset * 3);
     color = apply_lighting(
-        box_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, sphere_count, plane_count, box_count, 3,
+        box_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, sphere_count, plane_count, terrain_count, box_count, 3,
         closest_box);
   } else if (closest_plane >= 0) {
     const int plane_offset = (batch_idx * scene.planes.count + closest_plane);
@@ -873,8 +1240,31 @@ __global__ void render_scene_kernel(
     const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_offset * 3));
     const Vec3 plane_color = load_vec3(scene.planes.colors + plane_offset * 3);
     color = apply_lighting(
-        plane_color, hit, plane_normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, sphere_count, plane_count,
+        plane_color, hit, plane_normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, sphere_count, plane_count, terrain_count,
         box_count, 2, closest_plane);
+  } else if (closest_terrain >= 0) {
+    instance_id = sphere_count + plane_count + 1;
+    semantic_id = 2;
+    const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
+    const Vec3 terrain_color = load_vec3(scene.terrain.colors + batch_idx * 3);
+    color = apply_lighting(
+        terrain_color,
+        hit,
+        closest_terrain_normal,
+        ray_dir,
+        light_dir,
+        scene,
+        bvh_primitives,
+        bvh_nodes,
+        bvh_node_count,
+        options,
+        batch_idx,
+        sphere_count,
+        plane_count,
+        terrain_count,
+        box_count,
+        4,
+        0);
   }
 
   const int image_offset = ((batch_idx * 3 * height + y) * width) + x;
@@ -882,7 +1272,6 @@ __global__ void render_scene_kernel(
   image[image_offset + 1 * height * width] = color.y;
   image[image_offset + 2 * height * width] = color.z;
 
-  const int map_offset = (batch_idx * height + y) * width + x;
   if (instance_map != nullptr) {
     instance_map[map_offset] = instance_id;
   }
@@ -903,6 +1292,10 @@ void render_scene_cuda(
     torch::Tensor plane_points,
     torch::Tensor plane_normals,
     torch::Tensor plane_counts,
+    torch::Tensor terrain_heightmaps,
+    torch::Tensor terrain_origins,
+    torch::Tensor terrain_cell_sizes,
+    torch::Tensor terrain_counts,
     torch::Tensor box_centers,
     torch::Tensor box_half_sizes,
     torch::Tensor box_axes,
@@ -912,6 +1305,7 @@ void render_scene_cuda(
     torch::Tensor background,
     torch::Tensor sphere_colors,
     torch::Tensor plane_colors,
+    torch::Tensor terrain_colors,
     torch::Tensor box_colors,
     double ambient,
     bool shadows,
@@ -921,6 +1315,8 @@ void render_scene_cuda(
   const int width = static_cast<int>(image.size(3));
   const int sphere_count = static_cast<int>(sphere_centers.size(1));
   const int plane_count = static_cast<int>(plane_points.size(1));
+  const int terrain_height = static_cast<int>(terrain_heightmaps.size(1));
+  const int terrain_width = static_cast<int>(terrain_heightmaps.size(2));
   const int box_count = static_cast<int>(box_centers.size(1));
   TORCH_CHECK(sphere_count <= kMaxSpheres, "render_scene supports at most ", kMaxSpheres, " spheres");
   TORCH_CHECK(plane_count <= kMaxPlanes, "render_scene supports at most ", kMaxPlanes, " planes");
@@ -944,6 +1340,15 @@ void render_scene_cuda(
           plane_counts.data_ptr<int>(),
           plane_count,
       },
+      TerrainView{
+          terrain_heightmaps.data_ptr<float>(),
+          terrain_origins.data_ptr<float>(),
+          terrain_cell_sizes.data_ptr<float>(),
+          terrain_colors.data_ptr<float>(),
+          terrain_counts.data_ptr<int>(),
+          terrain_height,
+          terrain_width,
+      },
       BoxView{
           box_centers.data_ptr<float>(),
           box_half_sizes.data_ptr<float>(),
@@ -962,10 +1367,26 @@ void render_scene_cuda(
       static_cast<float>(shadow_strength),
   };
 
+  auto terrain_depth = torch::empty({batch_size, height, width}, image.options());
+  const int terrain_depth_count = batch_size * height * width;
+  const int init_threads = 256;
+  const int init_blocks = (terrain_depth_count + init_threads - 1) / init_threads;
+  init_terrain_depth_kernel<<<init_blocks, init_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      terrain_depth.data_ptr<float>(), terrain_depth_count);
+
+  if (terrain_height > 1 && terrain_width > 1) {
+    const int terrain_triangle_count = 2 * (terrain_height - 1) * (terrain_width - 1);
+    const dim3 raster_block(8, 8);
+    const dim3 raster_grid(terrain_triangle_count, 1, batch_size);
+    raster_terrain_kernel<<<raster_grid, raster_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        terrain_depth.data_ptr<float>(), width, height, scene, options);
+  }
+
   render_scene_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
       image.data_ptr<float>(),
       instance_map.numel() == 0 ? nullptr : instance_map.data_ptr<int>(),
       semantic_map.numel() == 0 ? nullptr : semantic_map.data_ptr<int>(),
+      terrain_depth.data_ptr<float>(),
       width,
       height,
       scene,

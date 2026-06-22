@@ -5,9 +5,9 @@ Tiny CUDA/PyTorch synthetic scene renderer.
 ![Example render](outputs/render.png)
 
 The renderer draws Lambert-shaded geometric objects entirely in CUDA and can
-return batched RGB plus panoptic-friendly segmentation tensors. It supports up to 64
-spheres, 64 oriented boxes, and 64 planes per scene. Batched renders draw
-different camera-space scenes.
+return batched RGB plus panoptic-friendly segmentation tensors. It supports up
+to 64 spheres, 64 oriented boxes, 64 planes, and one heightmap terrain per
+scene. Batched renders draw different camera-space scenes.
 
 ## Build
 
@@ -22,13 +22,13 @@ conda run -n clipdino-cu117 python -m examples.render
 ```
 
 The example writes `outputs/render.png` plus side-by-side colorized instance and
-semantic label-map visualizations. By default, renders include a floor plane and
-a rear background plane.
+semantic label-map visualizations. Random renders include a generated rolling
+terrain heightmap, and grounded objects are placed on that terrain.
 
 You can render a scene directly from Python:
 
 ```python
-from synthetic_scene import OrientedBoxes, Planes, RenderOptions, Scene, Spheres, render_scene
+from synthetic_scene import OrientedBoxes, Planes, RenderOptions, Scene, Spheres, Terrain, render_scene
 
 image = render_scene(
     width=768,
@@ -41,9 +41,20 @@ image = render_scene(
             colors=[(0.9, 0.25, 0.18), (0.2, 0.65, 0.95)],
         ),
         planes=Planes(
-            points=[(0.0, -1.0, 0.0), (0.0, 0.0, -6.0)],
-            normals=[(0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
-            colors=[(0.52, 0.55, 0.58), (0.12, 0.14, 0.18)],
+            points=[(0.0, 0.0, -6.0)],
+            normals=[(0.0, 0.0, 1.0)],
+            colors=[(0.12, 0.14, 0.18)],
+        ),
+        terrain=Terrain(
+            heightmaps=[
+                [-1.15, -1.10, -1.05, -1.10],
+                [-1.05, -0.92, -0.88, -0.98],
+                [-1.08, -0.96, -0.90, -1.00],
+                [-1.20, -1.08, -1.02, -1.12],
+            ],
+            origins=[(-2.0, -1.0, -4.5)],
+            cell_sizes=[1.25],
+            colors=[(0.36, 0.46, 0.30)],
         ),
         boxes=OrientedBoxes(
             centers=[(0.0, -0.35, -2.6)],
@@ -90,12 +101,12 @@ sequential ID for each visible object in that image. `visible_count` is a
 `visible_classes` is a `B x MAX_GT int32` tensor where columns
 `0:visible_count[b]` contain the class labels corresponding to instance IDs
 `1:visible_count[b]` in `instance_map[b]`. `MAX_GT` is the total number of
-objects in the scene. Class labels are `1 = sphere`, `2 = plane`, `3 = box`;
-unused class slots and background pixels are `0`.
+objects in the scene. Class labels are `1 = sphere`, `2 = plane/terrain`,
+`3 = box`; unused class slots and background pixels are `0`.
 
 `semantic_map` is also returned as a `B x H x W int32` compatibility tensor with
-primitive class labels per pixel: `0 = background`, `1 = sphere`, `2 = plane`,
-`3 = box`.
+primitive class labels per pixel: `0 = background`, `1 = sphere`,
+`2 = plane/terrain`, `3 = box`.
 Raw label maps are saved as 16-bit PNGs so the numeric IDs are preserved. The
 visualization helper maps each consecutive integer label to a deterministic
 random RGB color, keeping background label `0` black.
@@ -118,9 +129,10 @@ result = render_scene(
 )
 ```
 
-Random scenes always include a ground plane, include both grounded and floating
-primitives, and generate objects by sampling screen-space coordinates within the
-camera frustum plus a camera distance.
+Random scenes always include a generated terrain heightmap, include both
+grounded and floating primitives, and generate objects by sampling screen-space
+coordinates within the camera frustum plus a camera distance. Grounded
+primitives are placed by sampling the terrain height at their X/Z location.
 
 ## Benchmark
 
