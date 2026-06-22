@@ -46,9 +46,12 @@ image = render_scene(
             colors=[(0.12, 0.14, 0.18)],
         ),
         terrain=Terrain(
-            origins=[(0.0, -1.0, -7.0)],
+            base_heights=[-1.0],
+            depth_limits=[7.0],
             phase_xs=[0.4],
             phase_zs=[1.2],
+            dz=[0.05],
+            dz_growth=[0.0001],
             colors=[(0.36, 0.46, 0.30)],
         ),
         boxes=OrientedBoxes(
@@ -115,7 +118,14 @@ from synthetic_scene import random_scene, render_scene
 
 width = 768
 height = 512
-generated = random_scene(seed=1234, batch_size=8, aspect_ratio=width / height)
+generated = random_scene(
+    seed=1234,
+    batch_size=8,
+    aspect_ratio=width / height,
+    depth_limit=7.0,
+    terrain_dz=0.05,
+    terrain_dz_growth=0.0001,
+)
 result = render_scene(
     width=width,
     height=height,

@@ -47,9 +47,12 @@ struct PlaneView {
 };
 
 struct TerrainView {
-  const float* origins;
+  const float* base_heights;
+  const float* depth_limits;
   const float* phase_xs;
   const float* phase_zs;
+  const float* dz;
+  const float* dz_growth;
   const float* colors;
   const int* counts;
 };
@@ -148,8 +151,7 @@ __device__ __forceinline__ float smooth_height(float x, float z, float phase_x, 
 }
 
 __device__ __forceinline__ float sample_terrain_height(const TerrainView& terrain, int batch_idx, float world_x, float world_z) {
-  const Vec3 origin = load_vec3(terrain.origins + batch_idx * 3);
-  return origin.y + smooth_height(world_x, world_z, terrain.phase_xs[batch_idx], terrain.phase_zs[batch_idx]);
+  return terrain.base_heights[batch_idx] + smooth_height(world_x, world_z, terrain.phase_xs[batch_idx], terrain.phase_zs[batch_idx]);
 }
 
 __device__ __forceinline__ Vec3 terrain_normal_at_hit(const TerrainView& terrain, int batch_idx, Vec3 hit) {
@@ -517,11 +519,10 @@ __global__ void voxel_space_terrain_kernel(
     return;
   }
 
-  const Vec3 terrain_origin = load_vec3(scene.terrain.origins + batch_idx * 3);
   // Existing camera convention: camera at the origin looking down -Z, with Y up.
   // Voxel Space marches positive forward_depth values and samples terrain Z as -forward_depth.
   float z = kCameraNear;
-  const float z_end = fmaxf(kCameraNear, -terrain_origin.z);
+  const float z_end = scene.terrain.depth_limits[batch_idx];
   if (z_end <= kCameraNear || z > z_end) {
     return;
   }
@@ -535,8 +536,11 @@ __global__ void voxel_space_terrain_kernel(
   const float scale_height = 0.5f * static_cast<float>(height) / image_plane_scale;
 
   int y_buffer = height;
-  float dz = 0.05f;
-  const float dz_growth = 0.0001f;
+  float dz = scene.terrain.dz[batch_idx];
+  const float dz_growth = scene.terrain.dz_growth[batch_idx];
+  if (dz <= 0.0f || dz_growth < 0.0f) {
+    return;
+  }
 
   while (z <= z_end && y_buffer > 0) {
     const float world_x = ray_x * z;
@@ -1048,9 +1052,12 @@ void render_scene_cuda(
     torch::Tensor plane_points,
     torch::Tensor plane_normals,
     torch::Tensor plane_counts,
-    torch::Tensor terrain_origins,
+    torch::Tensor terrain_base_heights,
+    torch::Tensor terrain_depth_limits,
     torch::Tensor terrain_phase_xs,
     torch::Tensor terrain_phase_zs,
+    torch::Tensor terrain_dz,
+    torch::Tensor terrain_dz_growth,
     torch::Tensor terrain_counts,
     torch::Tensor box_centers,
     torch::Tensor box_half_sizes,
@@ -1095,9 +1102,12 @@ void render_scene_cuda(
           plane_count,
       },
       TerrainView{
-          terrain_origins.data_ptr<float>(),
+          terrain_base_heights.data_ptr<float>(),
+          terrain_depth_limits.data_ptr<float>(),
           terrain_phase_xs.data_ptr<float>(),
           terrain_phase_zs.data_ptr<float>(),
+          terrain_dz.data_ptr<float>(),
+          terrain_dz_growth.data_ptr<float>(),
           terrain_colors.data_ptr<float>(),
           terrain_counts.data_ptr<int>(),
       },
@@ -1126,7 +1136,7 @@ void render_scene_cuda(
   init_terrain_depth_kernel<<<init_blocks, init_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
       terrain_depth.data_ptr<float>(), terrain_depth_count);
 
-  if (terrain_origins.size(1) > 0) {
+  if (terrain_depth_limits.size(1) > 0) {
     const int voxel_threads = 128;
     const dim3 voxel_grid((width + voxel_threads - 1) / voxel_threads, batch_size);
     voxel_space_terrain_kernel<<<voxel_grid, voxel_threads, 0, at::cuda::getCurrentCUDAStream()>>>(

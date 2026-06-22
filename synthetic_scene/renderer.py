@@ -42,9 +42,12 @@ class Planes:
 
 @dataclass(frozen=True)
 class Terrain:
-    origins: Vec3List = ((-4.0, -1.0, -7.0),)
+    base_heights: Sequence[float] | torch.Tensor = (-1.0,)
+    depth_limits: Sequence[float] | torch.Tensor = (7.0,)
     phase_xs: Sequence[float] | torch.Tensor = (0.0,)
     phase_zs: Sequence[float] | torch.Tensor = (0.0,)
+    dz: Sequence[float] | torch.Tensor = (0.05,)
+    dz_growth: Sequence[float] | torch.Tensor = (0.0001,)
     colors: Vec3List = ((0.36, 0.46, 0.30),)
     counts: Sequence[int] | torch.Tensor | None = None
 
@@ -214,11 +217,14 @@ def _mat3_list(value: Union[Sequence[Sequence[Vec3]], torch.Tensor], *, device: 
 def random_scene(
     seed: int,
     *,
-    ground_objects: int = 0,
-    floating_objects: int = 1,
+    ground_objects: int = 60,
+    floating_objects: int = 4,
     batch_size: int = 4,
-    scatter_radius: float = 3.0,
+    scatter_radius: float = 50.0,
     ground_y: float = -1.0,
+    depth_limit: float = 50.0,
+    terrain_dz: float = 0.05,
+    terrain_dz_growth: float = 0.0001,
     fov_degrees: float = 50.0,
     aspect_ratio: float = 1.5,
 ) -> RandomScene:
@@ -230,6 +236,9 @@ def random_scene(
         int(batch_size),
         float(scatter_radius),
         float(ground_y),
+        float(depth_limit),
+        float(terrain_dz),
+        float(terrain_dz_growth),
         float(fov_degrees),
         float(aspect_ratio),
     )
@@ -249,9 +258,12 @@ def random_scene(
                 counts=native["plane_counts"],
             ),
             terrain=Terrain(
-                origins=native["terrain_origins"],
+                base_heights=native["terrain_base_heights"],
+                depth_limits=native["terrain_depth_limits"],
                 phase_xs=native["terrain_phase_xs"],
                 phase_zs=native["terrain_phase_zs"],
+                dz=native["terrain_dz"],
+                dz_growth=native["terrain_dz_growth"],
                 colors=native["terrain_colors"],
                 counts=native["terrain_counts"],
             ),
@@ -318,9 +330,12 @@ def render_scene(
     points = _vec3_batch(scene_data.planes.points, device=device)
     normals = _vec3_batch(scene_data.planes.normals, device=device)
     plane_colors_tensor = _vec3_batch(scene_data.planes.colors, device=device)
-    terrain_origins = _vec3_batch(scene_data.terrain.origins, device=device)
+    terrain_base_heights = _scalar_batch(scene_data.terrain.base_heights, device=device)
+    terrain_depth_limits = _scalar_batch(scene_data.terrain.depth_limits, device=device)
     terrain_phase_xs = _scalar_batch(scene_data.terrain.phase_xs, device=device)
     terrain_phase_zs = _scalar_batch(scene_data.terrain.phase_zs, device=device)
+    terrain_dz = _scalar_batch(scene_data.terrain.dz, device=device)
+    terrain_dz_growth = _scalar_batch(scene_data.terrain.dz_growth, device=device)
     terrain_colors = _vec3_batch(scene_data.terrain.colors, device=device)
     box_centers = _vec3_batch(scene_data.boxes.centers, device=device)
     box_half_sizes = _vec3_batch(scene_data.boxes.half_sizes, device=device)
@@ -333,9 +348,12 @@ def render_scene(
         points,
         normals,
         plane_colors_tensor,
-        terrain_origins,
+        terrain_base_heights,
+        terrain_depth_limits,
         terrain_phase_xs,
         terrain_phase_zs,
+        terrain_dz,
+        terrain_dz_growth,
         terrain_colors,
         box_centers,
         box_half_sizes,
@@ -348,9 +366,12 @@ def render_scene(
     points = _expand_batch(points, batch_size)
     normals = _expand_batch(normals, batch_size)
     plane_colors_tensor = _expand_batch(plane_colors_tensor, batch_size)
-    terrain_origins = _expand_batch(terrain_origins, batch_size)
+    terrain_base_heights = _expand_batch(terrain_base_heights, batch_size)
+    terrain_depth_limits = _expand_batch(terrain_depth_limits, batch_size)
     terrain_phase_xs = _expand_batch(terrain_phase_xs, batch_size)
     terrain_phase_zs = _expand_batch(terrain_phase_zs, batch_size)
+    terrain_dz = _expand_batch(terrain_dz, batch_size)
+    terrain_dz_growth = _expand_batch(terrain_dz_growth, batch_size)
     terrain_colors = _expand_batch(terrain_colors, batch_size)
     box_centers = _expand_batch(box_centers, batch_size)
     box_half_sizes = _expand_batch(box_half_sizes, batch_size)
@@ -358,7 +379,7 @@ def render_scene(
     box_colors = _expand_batch(box_colors, batch_size)
     sphere_count = centers.shape[1]
     plane_count = points.shape[1]
-    terrain_count = 1 if terrain_origins.shape[1] > 0 else 0
+    terrain_count = 1 if terrain_depth_limits.shape[1] > 0 else 0
     box_count = box_centers.shape[1]
     sphere_counts = _counts(scene_data.spheres.counts, batch_size=batch_size, count=sphere_count, device=device)
     plane_counts = _counts(scene_data.planes.counts, batch_size=batch_size, count=plane_count, device=device)
@@ -370,14 +391,28 @@ def render_scene(
         raise ValueError("sphere_centers, sphere_radii, and sphere_colors must have matching lengths")
     if normals.shape[1] != plane_count or plane_colors_tensor.shape[1] != plane_count:
         raise ValueError("plane_points, plane_normals, and plane_colors must have matching lengths")
-    if terrain_origins.shape[1] != 1 or terrain_phase_xs.shape[1] != 1 or terrain_phase_zs.shape[1] != 1 or terrain_colors.shape[1] != 1:
-        raise ValueError("terrain origins, phase_xs, phase_zs, and colors must each contain one entry")
+    if (
+        terrain_base_heights.shape[1] != 1
+        or terrain_depth_limits.shape[1] != 1
+        or terrain_phase_xs.shape[1] != 1
+        or terrain_phase_zs.shape[1] != 1
+        or terrain_dz.shape[1] != 1
+        or terrain_dz_growth.shape[1] != 1
+        or terrain_colors.shape[1] != 1
+    ):
+        raise ValueError("terrain base_heights, depth_limits, phase_xs, phase_zs, dz, dz_growth, and colors must each contain one entry")
     if box_half_sizes.shape[1] != box_count or box_axes.shape[1] != box_count or box_colors.shape[1] != box_count:
         raise ValueError("box_centers, box_half_sizes, box_axes, and box_colors must have matching lengths")
     if bool((radii <= 0).any().item()):
         raise ValueError("sphere_radii must all be positive")
     if bool((normals.norm(dim=2) <= 1.0e-8).any().item()):
         raise ValueError("plane_normals must be non-zero")
+    if bool((terrain_depth_limits <= 0).any().item()):
+        raise ValueError("terrain depth_limits must be positive")
+    if bool((terrain_dz <= 0).any().item()):
+        raise ValueError("terrain dz must be positive")
+    if bool((terrain_dz_growth < 0).any().item()):
+        raise ValueError("terrain dz_growth must be non-negative")
     if bool((box_half_sizes <= 0).any().item()):
         raise ValueError("box_half_sizes must all be positive")
     if bool((box_axes.norm(dim=3) <= 1.0e-8).any().item()):
@@ -404,9 +439,12 @@ def render_scene(
                 "counts": plane_counts,
             },
             "terrain": {
-                "origins": terrain_origins,
+                "base_heights": terrain_base_heights,
+                "depth_limits": terrain_depth_limits,
                 "phase_xs": terrain_phase_xs,
                 "phase_zs": terrain_phase_zs,
+                "dz": terrain_dz,
+                "dz_growth": terrain_dz_growth,
                 "colors": terrain_colors,
                 "counts": terrain_counts,
             },

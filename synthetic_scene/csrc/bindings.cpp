@@ -166,9 +166,12 @@ void render_scene_cuda(
     torch::Tensor plane_points,
     torch::Tensor plane_normals,
     torch::Tensor plane_counts,
-    torch::Tensor terrain_origins,
+    torch::Tensor terrain_base_heights,
+    torch::Tensor terrain_depth_limits,
     torch::Tensor terrain_phase_xs,
     torch::Tensor terrain_phase_zs,
+    torch::Tensor terrain_dz,
+    torch::Tensor terrain_dz_growth,
     torch::Tensor terrain_counts,
     torch::Tensor box_centers,
     torch::Tensor box_half_sizes,
@@ -216,6 +219,9 @@ py::dict random_scene(
     int batch_size,
     float scatter_radius,
     float ground_y,
+    float depth_limit,
+    float dz,
+    float dz_growth,
     float fov_degrees,
     float aspect_ratio) {
   TORCH_CHECK(c10::cuda::device_count() > 0, "CUDA is required to generate a native random scene");
@@ -223,6 +229,9 @@ py::dict random_scene(
   TORCH_CHECK(ground_objects + floating_objects > 0, "at least one non-plane object is required");
   TORCH_CHECK(batch_size > 0, "batch_size must be positive");
   TORCH_CHECK(scatter_radius > 0.0f, "scatter_radius must be positive");
+  TORCH_CHECK(depth_limit > 0.0f, "depth_limit must be positive");
+  TORCH_CHECK(dz > 0.0f, "dz must be positive");
+  TORCH_CHECK(dz_growth >= 0.0f, "dz_growth must be non-negative");
   TORCH_CHECK(fov_degrees > 0.0f && fov_degrees < 180.0f, "fov_degrees must be in the open interval (0, 180)");
   TORCH_CHECK(aspect_ratio > 0.0f, "aspect_ratio must be positive");
 
@@ -236,9 +245,12 @@ py::dict random_scene(
   std::vector<float> box_axes;
   std::vector<float> box_colors;
   std::vector<int32_t> box_counts;
-  std::vector<float> terrain_origins;
+  std::vector<float> terrain_base_heights;
+  std::vector<float> terrain_depth_limits;
   std::vector<float> terrain_phase_xs;
   std::vector<float> terrain_phase_zs;
+  std::vector<float> terrain_dz;
+  std::vector<float> terrain_dz_growth;
   std::vector<float> terrain_colors;
   std::vector<int32_t> terrain_counts;
   const int max_objects = ground_objects + floating_objects;
@@ -249,12 +261,16 @@ py::dict random_scene(
       "random_scene generated more primitives than the renderer supports");
 
   for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-    const Vec3 terrain_origin{0.0f, ground_y, -2.0f - scatter_radius * 2.8f};
+    const float terrain_base_height = ground_y;
+    const float terrain_depth_limit = depth_limit;
     const float phase_x = rand_float(generator, 0.0f, kTau);
     const float phase_z = rand_float(generator, 0.0f, kTau);
-    append_vec3(terrain_origins, terrain_origin);
+    terrain_base_heights.push_back(terrain_base_height);
+    terrain_depth_limits.push_back(terrain_depth_limit);
     terrain_phase_xs.push_back(phase_x);
     terrain_phase_zs.push_back(phase_z);
+    terrain_dz.push_back(dz);
+    terrain_dz_growth.push_back(dz_growth);
     append_vec3(terrain_colors, Vec3{0.34f, 0.46f, 0.28f});
     terrain_counts.push_back(1);
 
@@ -285,7 +301,7 @@ py::dict random_scene(
           -0.18f);
       const float x = frustum_point.x;
       const float z = frustum_point.z;
-      const float terrain_y = terrain_origin.y + smooth_height(x, z, phase_x, phase_z);
+      const float terrain_y = terrain_base_height + smooth_height(x, z, phase_x, phase_z);
       if (rand_float(generator, 0.0f, 1.0f) < 0.55f) {
         const float radius = rand_float(generator, 0.18f, 0.65f);
         add_sphere(Vec3{x, terrain_y + radius, z}, radius);
@@ -355,9 +371,12 @@ py::dict random_scene(
   result["plane_normals"] = make_cuda_tensor(std::move(plane_normals), {batch_size, 0, 3});
   result["plane_colors"] = make_cuda_tensor(std::move(plane_colors), {batch_size, 0, 3});
   result["plane_counts"] = make_cuda_int_tensor(std::vector<int32_t>(batch_size, 0), {batch_size});
-  result["terrain_origins"] = make_cuda_tensor(std::move(terrain_origins), {batch_size, 1, 3});
+  result["terrain_base_heights"] = make_cuda_tensor(std::move(terrain_base_heights), {batch_size, 1});
+  result["terrain_depth_limits"] = make_cuda_tensor(std::move(terrain_depth_limits), {batch_size, 1});
   result["terrain_phase_xs"] = make_cuda_tensor(std::move(terrain_phase_xs), {batch_size, 1});
   result["terrain_phase_zs"] = make_cuda_tensor(std::move(terrain_phase_zs), {batch_size, 1});
+  result["terrain_dz"] = make_cuda_tensor(std::move(terrain_dz), {batch_size, 1});
+  result["terrain_dz_growth"] = make_cuda_tensor(std::move(terrain_dz_growth), {batch_size, 1});
   result["terrain_colors"] = make_cuda_tensor(std::move(terrain_colors), {batch_size, 1, 3});
   result["terrain_counts"] = make_cuda_int_tensor(std::move(terrain_counts), {batch_size});
   result["box_centers"] = make_cuda_tensor(std::move(box_centers), {batch_size, box_count, 3});
@@ -396,9 +415,12 @@ void render_scene(
   const torch::Tensor plane_colors = require_tensor(planes, "colors");
   const torch::Tensor plane_counts = require_tensor(planes, "counts");
 
-  const torch::Tensor terrain_origins = require_tensor(terrain, "origins");
+  const torch::Tensor terrain_base_heights = require_tensor(terrain, "base_heights");
+  const torch::Tensor terrain_depth_limits = require_tensor(terrain, "depth_limits");
   const torch::Tensor terrain_phase_xs = require_tensor(terrain, "phase_xs");
   const torch::Tensor terrain_phase_zs = require_tensor(terrain, "phase_zs");
+  const torch::Tensor terrain_dz = require_tensor(terrain, "dz");
+  const torch::Tensor terrain_dz_growth = require_tensor(terrain, "dz_growth");
   const torch::Tensor terrain_colors = require_tensor(terrain, "colors");
   const torch::Tensor terrain_counts = require_tensor(terrain, "counts");
 
@@ -425,7 +447,10 @@ void render_scene(
       "semantic_map must be empty or B x H x W");
   TORCH_CHECK(sphere_centers.is_cuda() && sphere_radii.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(plane_points.is_cuda() && plane_normals.is_cuda(), "scene tensors must be CUDA tensors");
-  TORCH_CHECK(terrain_origins.is_cuda() && terrain_phase_xs.is_cuda() && terrain_phase_zs.is_cuda(), "scene tensors must be CUDA tensors");
+  TORCH_CHECK(
+      terrain_base_heights.is_cuda() && terrain_depth_limits.is_cuda() && terrain_phase_xs.is_cuda() &&
+          terrain_phase_zs.is_cuda() && terrain_dz.is_cuda() && terrain_dz_growth.is_cuda(),
+      "scene tensors must be CUDA tensors");
   TORCH_CHECK(box_centers.is_cuda() && box_half_sizes.is_cuda() && box_axes.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(
       light_dir.is_cuda() && background.is_cuda() && sphere_colors.is_cuda() && plane_colors.is_cuda() &&
@@ -436,9 +461,12 @@ void render_scene(
   TORCH_CHECK(sphere_radii.dim() == 2, "sphere_radii must be B x N");
   TORCH_CHECK(plane_points.dim() == 3 && plane_points.size(2) == 3, "plane_points must be B x N x 3");
   TORCH_CHECK(plane_normals.dim() == 3 && plane_normals.size(2) == 3, "plane_normals must be B x N x 3");
-  TORCH_CHECK(terrain_origins.dim() == 3 && terrain_origins.size(1) == 1 && terrain_origins.size(2) == 3, "terrain_origins must be B x 1 x 3");
+  TORCH_CHECK(terrain_base_heights.dim() == 2 && terrain_base_heights.size(1) == 1, "terrain_base_heights must be B x 1");
+  TORCH_CHECK(terrain_depth_limits.dim() == 2 && terrain_depth_limits.size(1) == 1, "terrain_depth_limits must be B x 1");
   TORCH_CHECK(terrain_phase_xs.dim() == 2 && terrain_phase_xs.size(1) == 1, "terrain_phase_xs must be B x 1");
   TORCH_CHECK(terrain_phase_zs.dim() == 2 && terrain_phase_zs.size(1) == 1, "terrain_phase_zs must be B x 1");
+  TORCH_CHECK(terrain_dz.dim() == 2 && terrain_dz.size(1) == 1, "terrain_dz must be B x 1");
+  TORCH_CHECK(terrain_dz_growth.dim() == 2 && terrain_dz_growth.size(1) == 1, "terrain_dz_growth must be B x 1");
   TORCH_CHECK(box_centers.dim() == 3 && box_centers.size(2) == 3, "box_centers must be B x N x 3");
   TORCH_CHECK(box_half_sizes.dim() == 3 && box_half_sizes.size(2) == 3, "box_half_sizes must be B x N x 3");
   TORCH_CHECK(box_axes.dim() == 4 && box_axes.size(2) == 3 && box_axes.size(3) == 3, "box_axes must be B x N x 3 x 3");
@@ -449,7 +477,7 @@ void render_scene(
   TORCH_CHECK(sphere_counts.dim() == 1 && plane_counts.dim() == 1 && terrain_counts.dim() == 1 && box_counts.dim() == 1, "primitive counts must be B");
   TORCH_CHECK(sphere_centers.size(0) == image.size(0), "scene batch size must match image batch size");
   TORCH_CHECK(
-      plane_points.size(0) == image.size(0) && terrain_origins.size(0) == image.size(0) && box_centers.size(0) == image.size(0),
+      plane_points.size(0) == image.size(0) && terrain_depth_limits.size(0) == image.size(0) && box_centers.size(0) == image.size(0),
       "scene batch size must match image batch size");
   TORCH_CHECK(
       sphere_counts.size(0) == image.size(0) && plane_counts.size(0) == image.size(0) &&
@@ -463,7 +491,7 @@ void render_scene(
   TORCH_CHECK(box_centers.size(1) == box_axes.size(1), "box_centers and box_axes must have matching lengths");
   TORCH_CHECK(box_centers.size(1) == box_colors.size(1), "box_centers and box_colors must have matching lengths");
   TORCH_CHECK(
-      sphere_centers.size(1) > 0 || plane_points.size(1) > 0 || terrain_origins.size(1) > 0 || box_centers.size(1) > 0,
+      sphere_centers.size(1) > 0 || plane_points.size(1) > 0 || terrain_depth_limits.size(1) > 0 || box_centers.size(1) > 0,
       "at least one object slot is required");
   TORCH_CHECK(light_dir.numel() == 3 && background.numel() == 3, "light/background vectors must be vec3");
   TORCH_CHECK(ambient >= 0.0 && ambient <= 1.0, "ambient must be in the range [0, 1]");
@@ -472,9 +500,12 @@ void render_scene(
   TORCH_CHECK(sphere_radii.dtype() == torch::kFloat32, "sphere_radii must be float32");
   TORCH_CHECK(plane_points.dtype() == torch::kFloat32, "plane_points must be float32");
   TORCH_CHECK(plane_normals.dtype() == torch::kFloat32, "plane_normals must be float32");
-  TORCH_CHECK(terrain_origins.dtype() == torch::kFloat32, "terrain_origins must be float32");
+  TORCH_CHECK(terrain_base_heights.dtype() == torch::kFloat32, "terrain_base_heights must be float32");
+  TORCH_CHECK(terrain_depth_limits.dtype() == torch::kFloat32, "terrain_depth_limits must be float32");
   TORCH_CHECK(terrain_phase_xs.dtype() == torch::kFloat32, "terrain_phase_xs must be float32");
   TORCH_CHECK(terrain_phase_zs.dtype() == torch::kFloat32, "terrain_phase_zs must be float32");
+  TORCH_CHECK(terrain_dz.dtype() == torch::kFloat32, "terrain_dz must be float32");
+  TORCH_CHECK(terrain_dz_growth.dtype() == torch::kFloat32, "terrain_dz_growth must be float32");
   TORCH_CHECK(box_centers.dtype() == torch::kFloat32, "box_centers must be float32");
   TORCH_CHECK(box_half_sizes.dtype() == torch::kFloat32, "box_half_sizes must be float32");
   TORCH_CHECK(box_axes.dtype() == torch::kFloat32, "box_axes must be float32");
@@ -492,7 +523,11 @@ void render_scene(
   TORCH_CHECK(instance_map.is_contiguous() && semantic_map.is_contiguous(), "segmentation maps must be contiguous");
   TORCH_CHECK(sphere_centers.is_contiguous() && sphere_radii.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(plane_points.is_contiguous() && plane_normals.is_contiguous(), "scene tensors must be contiguous");
-  TORCH_CHECK(terrain_origins.is_contiguous() && terrain_phase_xs.is_contiguous() && terrain_phase_zs.is_contiguous(), "scene tensors must be contiguous");
+  TORCH_CHECK(
+      terrain_base_heights.is_contiguous() && terrain_depth_limits.is_contiguous() &&
+          terrain_phase_xs.is_contiguous() && terrain_phase_zs.is_contiguous() &&
+          terrain_dz.is_contiguous() && terrain_dz_growth.is_contiguous(),
+      "scene tensors must be contiguous");
   TORCH_CHECK(box_centers.is_contiguous() && box_half_sizes.is_contiguous() && box_axes.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(
       light_dir.is_contiguous() && background.is_contiguous() && sphere_colors.is_contiguous() && plane_colors.is_contiguous() &&
@@ -510,9 +545,12 @@ void render_scene(
       plane_points,
       plane_normals,
       plane_counts,
-      terrain_origins,
+      terrain_base_heights,
+      terrain_depth_limits,
       terrain_phase_xs,
       terrain_phase_zs,
+      terrain_dz,
+      terrain_dz_growth,
       terrain_counts,
       box_centers,
       box_half_sizes,
@@ -540,6 +578,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("batch_size"),
       py::arg("scatter_radius"),
       py::arg("ground_y"),
+      py::arg("depth_limit"),
+      py::arg("dz"),
+      py::arg("dz_growth"),
       py::arg("fov_degrees"),
       py::arg("aspect_ratio"),
       "Generate random camera-space scene tensors directly from the native extension");
