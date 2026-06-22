@@ -6,8 +6,8 @@ Tiny CUDA/PyTorch synthetic scene renderer.
 
 The renderer draws Lambert-shaded geometric objects entirely in CUDA and can
 return batched RGB plus panoptic-friendly segmentation tensors. It supports up
-to 64 spheres, 64 oriented boxes, 64 planes, and one procedural terrain per
-scene. Batched renders draw different camera-space scenes.
+to 64 spheres, 64 oriented boxes, and one procedural terrain per scene. Batched
+renders draw different camera-space scenes.
 
 ## Build
 
@@ -28,7 +28,7 @@ procedural terrain, and grounded objects are placed on that terrain.
 You can render a scene directly from Python:
 
 ```python
-from synthetic_scene import OrientedBoxes, Planes, RenderOptions, Scene, Spheres, Terrain, render_scene
+from synthetic_scene import OrientedBoxes, RenderOptions, Scene, Spheres, Terrain, render_scene
 
 image = render_scene(
     width=768,
@@ -39,11 +39,6 @@ image = render_scene(
             centers=[(-0.8, 0.0, -3.0), (0.8, 0.0, -3.2)],
             radii=[0.55, 0.65],
             colors=[(0.9, 0.25, 0.18), (0.2, 0.65, 0.95)],
-        ),
-        planes=Planes(
-            points=[(0.0, 0.0, -6.0)],
-            normals=[(0.0, 0.0, 1.0)],
-            colors=[(0.12, 0.14, 0.18)],
         ),
         terrain=Terrain(
             base_heights=[-1.0],
@@ -99,12 +94,12 @@ sequential ID for each visible object in that image. `visible_count` is a
 `visible_classes` is a `B x MAX_GT int32` tensor where columns
 `0:visible_count[b]` contain the class labels corresponding to instance IDs
 `1:visible_count[b]` in `instance_map[b]`. `MAX_GT` is the total number of
-objects in the scene. Class labels are `1 = sphere`, `2 = plane/terrain`,
-`3 = box`; unused class slots and background pixels are `0`.
+objects in the scene. Class labels are `1 = sphere`, `2 = terrain`, `3 = box`;
+unused class slots and background pixels are `0`.
 
 `semantic_map` is also returned as a `B x H x W int32` compatibility tensor with
 primitive class labels per pixel: `0 = background`, `1 = sphere`,
-`2 = plane/terrain`, `3 = box`.
+`2 = terrain`, `3 = box`.
 Raw label maps are saved as 16-bit PNGs so the numeric IDs are preserved. The
 visualization helper maps each consecutive integer label to a deterministic
 random RGB color, keeping background label `0` black.

@@ -5,7 +5,6 @@
 namespace {
 
 constexpr int kMaxSpheres = 64;
-constexpr int kMaxPlanes = 64;
 constexpr int kMaxBoxes = 64;
 constexpr int kMaxFinitePrimitives = kMaxSpheres + kMaxBoxes;
 constexpr int kMaxBvhNodes = 2 * kMaxFinitePrimitives - 1;
@@ -39,9 +38,6 @@ struct SphereView {
 };
 
 struct PlaneView {
-  const float* points;
-  const float* normals;
-  const float* colors;
   const int* counts;
   int count;
 };
@@ -259,26 +255,6 @@ __device__ __forceinline__ bool intersect_sphere(
   if (t <= kRayTMin) {
     t = (-b + sqrt_disc) * inv_2a;
   }
-  if (t <= kRayTMin) {
-    return false;
-  }
-
-  *out_t = t;
-  return true;
-}
-
-__device__ __forceinline__ bool intersect_plane(
-    Vec3 ray_origin,
-    Vec3 ray_dir,
-    Vec3 point,
-    Vec3 normal,
-    float* out_t) {
-  const float denom = dot(ray_dir, normal);
-  if (fabsf(denom) < kParallelEpsilon) {
-    return false;
-  }
-
-  const float t = dot(sub(point, ray_origin), normal) / denom;
   if (t <= kRayTMin) {
     return false;
   }
@@ -578,8 +554,6 @@ __device__ __forceinline__ bool is_shadowed(
     const BvhNode* nodes,
     int node_count,
     int batch_idx,
-    int plane_count,
-    int terrain_count,
     int skip_kind,
     int skip_idx) {
   if (node_count > 0) {
@@ -631,24 +605,6 @@ __device__ __forceinline__ bool is_shadowed(
     }
   }
 
-  #pragma unroll
-  for (int plane_idx = 0; plane_idx < kMaxPlanes; ++plane_idx) {
-    if (plane_idx >= plane_count) {
-      break;
-    }
-    if (skip_kind == 2 && plane_idx == skip_idx) {
-      continue;
-    }
-
-    const int plane_offset = (batch_idx * scene.planes.count + plane_idx);
-    const Vec3 plane_point = load_vec3(scene.planes.points + plane_offset * 3);
-    const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_offset * 3));
-    float t = 0.0f;
-    if (intersect_plane(ray_origin, light_dir, plane_point, plane_normal, &t)) {
-      return true;
-    }
-  }
-
   // Terrain casting shadows is intentionally disabled in this rasterized-terrain path.
   // Keeping the old heightfield DDA here can dominate runtime because shadow rays used kFloatMax.
 
@@ -667,10 +623,6 @@ __device__ __forceinline__ Vec3 apply_lighting(
     int node_count,
     const RenderOptionsView& options,
     int batch_idx,
-    int sphere_count,
-    int plane_count,
-    int terrain_count,
-    int box_count,
     int skip_kind,
     int skip_idx) {
   if (dot(normal, ray_dir) > 0.0f) {
@@ -690,8 +642,6 @@ __device__ __forceinline__ Vec3 apply_lighting(
             nodes,
             node_count,
             batch_idx,
-            plane_count,
-            terrain_count,
             skip_kind,
             skip_idx)) {
       direct *= (1.0f - options.shadow_strength);
@@ -772,18 +722,16 @@ __global__ void render_scene_kernel(
     int height,
     SceneView scene,
     RenderOptionsView options) {
-  __shared__ int visible_planes[kMaxPlanes];
   __shared__ BvhPrimitive bvh_primitives[kMaxFinitePrimitives];
   __shared__ BvhNode bvh_nodes[kMaxBvhNodes];
   __shared__ int finite_primitive_count;
   __shared__ int bvh_node_count;
-  __shared__ int visible_plane_count;
 
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   const int batch_idx = blockIdx.z;
   const int sphere_count = scene.spheres.counts[batch_idx];
-  const int plane_count = scene.planes.counts[batch_idx];
+  const int plane_count = 0;
   const int terrain_count = scene.terrain.counts[batch_idx];
   const int box_count = scene.boxes.counts[batch_idx];
 
@@ -800,7 +748,6 @@ __global__ void render_scene_kernel(
   if (thread_linear == 0) {
     finite_primitive_count = 0;
     bvh_node_count = 0;
-    visible_plane_count = 0;
   }
   __syncthreads();
 
@@ -845,11 +792,6 @@ __global__ void render_scene_kernel(
       const int list_idx = atomicAdd(&finite_primitive_count, 1);
       bvh_primitives[list_idx] = BvhPrimitive{bounds, aabb_centroid(bounds), 3, box_idx};
     }
-  }
-
-  for (int plane_idx = thread_linear; plane_idx < plane_count; plane_idx += threads_per_block) {
-    const int list_idx = atomicAdd(&visible_plane_count, 1);
-    visible_planes[list_idx] = plane_idx;
   }
 
   __syncthreads();
@@ -934,7 +876,6 @@ __global__ void render_scene_kernel(
   intersect_finite_bvh(ray_origin, ray_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, batch_idx, &finite_hit);
   float closest_t = finite_hit.t;
   int closest_sphere = finite_hit.sphere;
-  int closest_plane = -1;
   int closest_box = finite_hit.box;
   int closest_terrain = -1;
   int instance_id = 0;
@@ -942,28 +883,12 @@ __global__ void render_scene_kernel(
   Vec3 closest_box_normal = finite_hit.box_normal;
   Vec3 closest_terrain_normal = finite_hit.terrain_normal;
 
-  for (int list_idx = 0; list_idx < visible_plane_count; ++list_idx) {
-    const int plane_idx = visible_planes[list_idx];
-
-    const int plane_offset = (batch_idx * scene.planes.count + plane_idx);
-    const Vec3 plane_point = load_vec3(scene.planes.points + plane_offset * 3);
-    const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_offset * 3));
-    float t = 0.0f;
-    if (intersect_plane(ray_origin, ray_dir, plane_point, plane_normal, &t) && t < closest_t) {
-      closest_t = t;
-      closest_sphere = -1;
-      closest_plane = plane_idx;
-      closest_box = -1;
-    }
-  }
-
   const int map_offset = (batch_idx * height + y) * width + x;
   if (terrain_count > 0 && terrain_depth != nullptr) {
     const float terrain_t = terrain_depth[map_offset];
     if (terrain_t < closest_t) {
       closest_t = terrain_t;
       closest_sphere = -1;
-      closest_plane = -1;
       closest_box = -1;
       closest_terrain = 0;
       const Vec3 terrain_hit = add(ray_origin, mul(ray_dir, closest_t));
@@ -980,7 +905,7 @@ __global__ void render_scene_kernel(
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(sub(hit, sphere_center));
     color = apply_lighting(
-        sphere_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, sphere_count, plane_count, terrain_count, box_count, 1,
+        sphere_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, 1,
         closest_sphere);
   } else if (closest_box >= 0) {
     const int box_offset = (batch_idx * scene.boxes.count + closest_box);
@@ -990,18 +915,8 @@ __global__ void render_scene_kernel(
     const Vec3 normal = normalize(closest_box_normal);
     const Vec3 box_color = load_vec3(scene.boxes.colors + box_offset * 3);
     color = apply_lighting(
-        box_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, sphere_count, plane_count, terrain_count, box_count, 3,
+        box_color, hit, normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, 3,
         closest_box);
-  } else if (closest_plane >= 0) {
-    const int plane_offset = (batch_idx * scene.planes.count + closest_plane);
-    instance_id = sphere_count + closest_plane + 1;
-    semantic_id = 2;
-    const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
-    const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_offset * 3));
-    const Vec3 plane_color = load_vec3(scene.planes.colors + plane_offset * 3);
-    color = apply_lighting(
-        plane_color, hit, plane_normal, ray_dir, light_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, options, batch_idx, sphere_count, plane_count, terrain_count,
-        box_count, 2, closest_plane);
   } else if (closest_terrain >= 0) {
     instance_id = sphere_count + plane_count + 1;
     semantic_id = 2;
@@ -1019,10 +934,6 @@ __global__ void render_scene_kernel(
         bvh_node_count,
         options,
         batch_idx,
-        sphere_count,
-        plane_count,
-        terrain_count,
-        box_count,
         4,
         0);
   }
@@ -1080,7 +991,6 @@ void render_scene_cuda(
   const int plane_count = static_cast<int>(plane_points.size(1));
   const int box_count = static_cast<int>(box_centers.size(1));
   TORCH_CHECK(sphere_count <= kMaxSpheres, "render_scene supports at most ", kMaxSpheres, " spheres");
-  TORCH_CHECK(plane_count <= kMaxPlanes, "render_scene supports at most ", kMaxPlanes, " planes");
   TORCH_CHECK(box_count <= kMaxBoxes, "render_scene supports at most ", kMaxBoxes, " boxes");
 
   const dim3 block(16, 16);
@@ -1095,9 +1005,6 @@ void render_scene_cuda(
           sphere_count,
       },
       PlaneView{
-          plane_points.data_ptr<float>(),
-          plane_normals.data_ptr<float>(),
-          plane_colors.data_ptr<float>(),
           plane_counts.data_ptr<int>(),
           plane_count,
       },
