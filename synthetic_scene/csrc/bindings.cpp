@@ -170,7 +170,9 @@ void render_scene_cuda(
     torch::Tensor background,
     torch::Tensor sphere_colors,
     torch::Tensor plane_colors,
-    torch::Tensor box_colors);
+    torch::Tensor box_colors,
+    bool shadows,
+    double shadow_strength);
 
 py::dict require_dict(py::dict values, const char* key) {
   const py::str py_key(key);
@@ -188,6 +190,12 @@ double require_double(py::dict values, const char* key) {
   const py::str py_key(key);
   TORCH_CHECK(values.contains(py_key), "missing dictionary key: ", key);
   return values[py_key].cast<double>();
+}
+
+bool require_bool(py::dict values, const char* key) {
+  const py::str py_key(key);
+  TORCH_CHECK(values.contains(py_key), "missing dictionary key: ", key);
+  return values[py_key].cast<bool>();
 }
 
 py::dict random_scene(
@@ -348,6 +356,8 @@ void render_scene(
   const torch::Tensor light_dir = require_tensor(options, "light_dir");
   const torch::Tensor background = require_tensor(options, "background");
   const double fov_degrees = require_double(options, "fov_degrees");
+  const bool shadows = require_bool(options, "shadows");
+  const double shadow_strength = require_double(options, "shadow_strength");
 
   const torch::Tensor sphere_centers = require_tensor(spheres, "centers");
   const torch::Tensor sphere_radii = require_tensor(spheres, "radii");
@@ -408,6 +418,7 @@ void render_scene(
   TORCH_CHECK(box_centers.size(1) == box_colors.size(1), "box_centers and box_colors must have matching lengths");
   TORCH_CHECK(sphere_centers.size(1) > 0 || plane_points.size(1) > 0 || box_centers.size(1) > 0, "at least one object slot is required");
   TORCH_CHECK(light_dir.numel() == 3 && background.numel() == 3, "light/background vectors must be vec3");
+  TORCH_CHECK(shadow_strength >= 0.0 && shadow_strength <= 1.0, "shadow_strength must be in the range [0, 1]");
   TORCH_CHECK(sphere_centers.dtype() == torch::kFloat32, "sphere_centers must be float32");
   TORCH_CHECK(sphere_radii.dtype() == torch::kFloat32, "sphere_radii must be float32");
   TORCH_CHECK(plane_points.dtype() == torch::kFloat32, "plane_points must be float32");
@@ -448,7 +459,9 @@ void render_scene(
       background,
       sphere_colors,
       plane_colors,
-      box_colors);
+      box_colors,
+      shadows,
+      shadow_strength);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

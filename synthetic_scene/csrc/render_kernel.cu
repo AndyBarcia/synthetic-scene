@@ -21,6 +21,8 @@ struct RenderOptionsView {
   const float* light_dir;
   const float* background;
   float fov_degrees;
+  int shadows;
+  float shadow_strength;
 };
 
 struct SphereView {
@@ -218,6 +220,105 @@ __device__ __forceinline__ bool intersect_box(
   return true;
 }
 
+__device__ __forceinline__ bool is_shadowed(
+    Vec3 ray_origin,
+    Vec3 light_dir,
+    const SceneView& scene,
+    int batch_idx,
+    int sphere_count,
+    int plane_count,
+    int box_count,
+    int skip_kind,
+    int skip_idx) {
+  #pragma unroll
+  for (int sphere_idx = 0; sphere_idx < kMaxSpheres; ++sphere_idx) {
+    if (sphere_idx >= sphere_count) {
+      break;
+    }
+    if (skip_kind == 1 && sphere_idx == skip_idx) {
+      continue;
+    }
+
+    const int sphere_offset = (batch_idx * scene.spheres.count + sphere_idx);
+    const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
+    const float sphere_radius = scene.spheres.radii[sphere_offset];
+    float t = 0.0f;
+    if (intersect_sphere(ray_origin, light_dir, sphere_center, sphere_radius, &t)) {
+      return true;
+    }
+  }
+
+  #pragma unroll
+  for (int box_idx = 0; box_idx < kMaxBoxes; ++box_idx) {
+    if (box_idx >= box_count) {
+      break;
+    }
+    if (skip_kind == 3 && box_idx == skip_idx) {
+      continue;
+    }
+
+    const int box_offset = (batch_idx * scene.boxes.count + box_idx);
+    const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
+    const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
+    float t = 0.0f;
+    Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
+    if (intersect_box(ray_origin, light_dir, box_center, box_half_size, scene.boxes.axes + box_offset * 9, &t, &normal)) {
+      return true;
+    }
+  }
+
+  #pragma unroll
+  for (int plane_idx = 0; plane_idx < kMaxPlanes; ++plane_idx) {
+    if (plane_idx >= plane_count) {
+      break;
+    }
+    if (skip_kind == 2 && plane_idx == skip_idx) {
+      continue;
+    }
+
+    const int plane_offset = (batch_idx * scene.planes.count + plane_idx);
+    const Vec3 plane_point = load_vec3(scene.planes.points + plane_offset * 3);
+    const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_offset * 3));
+    float t = 0.0f;
+    if (intersect_plane(ray_origin, light_dir, plane_point, plane_normal, &t)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+__device__ __forceinline__ Vec3 apply_lighting(
+    Vec3 base_color,
+    Vec3 hit,
+    Vec3 normal,
+    Vec3 ray_dir,
+    Vec3 light_dir,
+    const SceneView& scene,
+    const RenderOptionsView& options,
+    int batch_idx,
+    int sphere_count,
+    int plane_count,
+    int box_count,
+    int skip_kind,
+    int skip_idx) {
+  if (dot(normal, ray_dir) > 0.0f) {
+    normal = mul(normal, -1.0f);
+  }
+
+  const float ambient = 0.08f;
+  const float shade = fmaxf(dot(normal, light_dir), 0.0f);
+  float direct = (1.0f - ambient) * shade;
+  if (options.shadows && direct > 0.0f) {
+    const Vec3 shadow_origin = add(hit, mul(normal, 1.0e-3f));
+    if (is_shadowed(shadow_origin, light_dir, scene, batch_idx, sphere_count, plane_count, box_count, skip_kind, skip_idx)) {
+      direct *= (1.0f - options.shadow_strength);
+    }
+  }
+
+  return mul(base_color, ambient + direct);
+}
+
 __global__ void render_scene_kernel(
     float* image,
     int* instance_map,
@@ -324,33 +425,29 @@ __global__ void render_scene_kernel(
     const Vec3 sphere_color = load_vec3(scene.spheres.colors + sphere_offset * 3);
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(sub(hit, sphere_center));
-    const float shade = fmaxf(dot(normal, light_dir), 0.0f);
-    const float ambient = 0.08f;
-    color = mul(sphere_color, ambient + (1.0f - ambient) * shade);
+    color = apply_lighting(
+        sphere_color, hit, normal, ray_dir, light_dir, scene, options, batch_idx, sphere_count, plane_count, box_count, 1,
+        closest_sphere);
   } else if (closest_box >= 0) {
     const int box_offset = (batch_idx * scene.boxes.count + closest_box);
     instance_id = sphere_count + plane_count + closest_box + 1;
     semantic_id = 3;
-    Vec3 normal = normalize(closest_box_normal);
-    if (dot(normal, ray_dir) > 0.0f) {
-      normal = mul(normal, -1.0f);
-    }
+    const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
+    const Vec3 normal = normalize(closest_box_normal);
     const Vec3 box_color = load_vec3(scene.boxes.colors + box_offset * 3);
-    const float shade = fmaxf(dot(normal, light_dir), 0.0f);
-    const float ambient = 0.08f;
-    color = mul(box_color, ambient + (1.0f - ambient) * shade);
+    color = apply_lighting(
+        box_color, hit, normal, ray_dir, light_dir, scene, options, batch_idx, sphere_count, plane_count, box_count, 3,
+        closest_box);
   } else if (closest_plane >= 0) {
     const int plane_offset = (batch_idx * scene.planes.count + closest_plane);
     instance_id = sphere_count + closest_plane + 1;
     semantic_id = 2;
-    Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_offset * 3));
-    if (dot(plane_normal, ray_dir) > 0.0f) {
-      plane_normal = mul(plane_normal, -1.0f);
-    }
+    const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
+    const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_offset * 3));
     const Vec3 plane_color = load_vec3(scene.planes.colors + plane_offset * 3);
-    const float shade = fmaxf(dot(plane_normal, light_dir), 0.0f);
-    const float ambient = 0.08f;
-    color = mul(plane_color, ambient + (1.0f - ambient) * shade);
+    color = apply_lighting(
+        plane_color, hit, plane_normal, ray_dir, light_dir, scene, options, batch_idx, sphere_count, plane_count,
+        box_count, 2, closest_plane);
   }
 
   const int image_offset = ((batch_idx * 3 * height + y) * width) + x;
@@ -388,7 +485,9 @@ void render_scene_cuda(
     torch::Tensor background,
     torch::Tensor sphere_colors,
     torch::Tensor plane_colors,
-    torch::Tensor box_colors) {
+    torch::Tensor box_colors,
+    bool shadows,
+    double shadow_strength) {
   const int batch_size = static_cast<int>(image.size(0));
   const int height = static_cast<int>(image.size(2));
   const int width = static_cast<int>(image.size(3));
@@ -430,6 +529,8 @@ void render_scene_cuda(
       light_dir.data_ptr<float>(),
       background.data_ptr<float>(),
       static_cast<float>(fov_degrees),
+      shadows ? 1 : 0,
+      static_cast<float>(shadow_strength),
   };
 
   render_scene_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(

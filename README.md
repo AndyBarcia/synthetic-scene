@@ -28,11 +28,12 @@ a rear background plane.
 You can render a scene directly from Python:
 
 ```python
-from synthetic_scene import OrientedBoxes, Planes, Scene, Spheres, render_scene
+from synthetic_scene import OrientedBoxes, Planes, RenderOptions, Scene, Spheres, render_scene
 
 image = render_scene(
     width=768,
     height=512,
+    options=RenderOptions(shadows=True, shadow_strength=0.68),
     scene=Scene(
         spheres=Spheres(
             centers=[(-0.8, 0.0, -3.0), (0.8, 0.0, -3.2)],
@@ -64,6 +65,11 @@ RGB tensors are returned as `B x 3 x H x W`. Unbatched scene tensors return
 `B = 1`; scene tensors shaped as `B x N x ...` render one independent scene per
 batch item. Object coordinates are camera-space, with the camera at the origin
 looking down `-Z`.
+
+Directional-light hard shadows are enabled by default. Set
+`RenderOptions(shadows=False)` to render direct Lambert shading without shadow
+rays, or tune `shadow_strength` in `[0, 1]` to control how much blocked direct
+light is darkened.
 
 To request segmentation ground truth, pass `return_maps=True`:
 
