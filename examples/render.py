@@ -9,12 +9,11 @@ RANDOM_SCENE_SEED = 42
 
 
 def main() -> None:
-    generated = random_scene(seed=RANDOM_SCENE_SEED, cameras=2)
+    generated = random_scene(seed=RANDOM_SCENE_SEED, batch_size=2)
     result = render_scene(
         width=768,
         height=512,
         scene=generated.scene,
-        camera=generated.cameras,
         return_maps=True,
     )
     output = Path("outputs/render.png")

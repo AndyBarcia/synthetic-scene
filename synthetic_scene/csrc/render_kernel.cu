@@ -17,21 +17,17 @@ struct Vec3 {
   float z;
 };
 
-struct CameraView {
-  const float* origin;
-  const float* orientation;
-  float fov_degrees;
-};
-
 struct RenderOptionsView {
   const float* light_dir;
   const float* background;
+  float fov_degrees;
 };
 
 struct SphereView {
   const float* centers;
   const float* radii;
   const float* colors;
+  const int* counts;
   int count;
 };
 
@@ -39,6 +35,7 @@ struct PlaneView {
   const float* points;
   const float* normals;
   const float* colors;
+  const int* counts;
   int count;
 };
 
@@ -47,6 +44,7 @@ struct BoxView {
   const float* half_sizes;
   const float* axes;
   const float* colors;
+  const int* counts;
   int count;
 };
 
@@ -226,7 +224,6 @@ __global__ void render_scene_kernel(
     int* semantic_map,
     int width,
     int height,
-    CameraView camera,
     SceneView scene,
     RenderOptionsView options) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -236,24 +233,22 @@ __global__ void render_scene_kernel(
     return;
   }
 
-  const Vec3 camera_origin = load_vec3(camera.origin + batch_idx * 3);
-  const float* camera_orientation = camera.orientation + batch_idx * 9;
-  const Vec3 camera_axis_x = normalize(load_vec3(camera_orientation + 0));
-  const Vec3 camera_axis_y = normalize(load_vec3(camera_orientation + 3));
-  const Vec3 camera_axis_z = normalize(load_vec3(camera_orientation + 6));
   const Vec3 light_dir = normalize(load_vec3(options.light_dir));
   const Vec3 background = load_vec3(options.background);
+  const int sphere_count = scene.spheres.counts[batch_idx];
+  const int plane_count = scene.planes.counts[batch_idx];
+  const int box_count = scene.boxes.counts[batch_idx];
 
   const float aspect = static_cast<float>(width) / static_cast<float>(height);
-  const float fov_radians = camera.fov_degrees * 0.017453292519943295f;
+  const float fov_radians = options.fov_degrees * 0.017453292519943295f;
   const float image_plane_scale = tanf(0.5f * fov_radians);
   const float px = ((static_cast<float>(x) + 0.5f) / static_cast<float>(width) * 2.0f - 1.0f) *
       aspect * image_plane_scale;
   const float py = (1.0f - (static_cast<float>(y) + 0.5f) / static_cast<float>(height) * 2.0f) *
       image_plane_scale;
 
-  const Vec3 ray_origin = camera_origin;
-  const Vec3 ray_dir = normalize(add(add(mul(camera_axis_x, px), mul(camera_axis_y, py)), mul(camera_axis_z, -1.0f)));
+  const Vec3 ray_origin = make_vec3(0.0f, 0.0f, 0.0f);
+  const Vec3 ray_dir = normalize(make_vec3(px, py, -1.0f));
 
   Vec3 color = background;
   float closest_t = kFloatMax;
@@ -266,12 +261,13 @@ __global__ void render_scene_kernel(
 
   #pragma unroll
   for (int sphere_idx = 0; sphere_idx < kMaxSpheres; ++sphere_idx) {
-    if (sphere_idx >= scene.spheres.count) {
+    if (sphere_idx >= sphere_count) {
       break;
     }
 
-    const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_idx * 3);
-    const float sphere_radius = scene.spheres.radii[sphere_idx];
+    const int sphere_offset = (batch_idx * scene.spheres.count + sphere_idx);
+    const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
+    const float sphere_radius = scene.spheres.radii[sphere_offset];
     float t = 0.0f;
     if (intersect_sphere(ray_origin, ray_dir, sphere_center, sphere_radius, &t) && t < closest_t) {
       closest_t = t;
@@ -283,15 +279,16 @@ __global__ void render_scene_kernel(
 
   #pragma unroll
   for (int box_idx = 0; box_idx < kMaxBoxes; ++box_idx) {
-    if (box_idx >= scene.boxes.count) {
+    if (box_idx >= box_count) {
       break;
     }
 
-    const Vec3 box_center = load_vec3(scene.boxes.centers + box_idx * 3);
-    const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_idx * 3);
+    const int box_offset = (batch_idx * scene.boxes.count + box_idx);
+    const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
+    const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
     float t = 0.0f;
     Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
-    if (intersect_box(ray_origin, ray_dir, box_center, box_half_size, scene.boxes.axes + box_idx * 9, &t, &normal) &&
+    if (intersect_box(ray_origin, ray_dir, box_center, box_half_size, scene.boxes.axes + box_offset * 9, &t, &normal) &&
         t < closest_t) {
       closest_t = t;
       closest_sphere = -1;
@@ -303,12 +300,13 @@ __global__ void render_scene_kernel(
 
   #pragma unroll
   for (int plane_idx = 0; plane_idx < kMaxPlanes; ++plane_idx) {
-    if (plane_idx >= scene.planes.count) {
+    if (plane_idx >= plane_count) {
       break;
     }
 
-    const Vec3 plane_point = load_vec3(scene.planes.points + plane_idx * 3);
-    const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_idx * 3));
+    const int plane_offset = (batch_idx * scene.planes.count + plane_idx);
+    const Vec3 plane_point = load_vec3(scene.planes.points + plane_offset * 3);
+    const Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_offset * 3));
     float t = 0.0f;
     if (intersect_plane(ray_origin, ray_dir, plane_point, plane_normal, &t) && t < closest_t) {
       closest_t = t;
@@ -319,34 +317,37 @@ __global__ void render_scene_kernel(
   }
 
   if (closest_sphere >= 0) {
+    const int sphere_offset = (batch_idx * scene.spheres.count + closest_sphere);
     instance_id = closest_sphere + 1;
     semantic_id = 1;
-    const Vec3 sphere_center = load_vec3(scene.spheres.centers + closest_sphere * 3);
-    const Vec3 sphere_color = load_vec3(scene.spheres.colors + closest_sphere * 3);
+    const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
+    const Vec3 sphere_color = load_vec3(scene.spheres.colors + sphere_offset * 3);
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(sub(hit, sphere_center));
     const float shade = fmaxf(dot(normal, light_dir), 0.0f);
     const float ambient = 0.08f;
     color = mul(sphere_color, ambient + (1.0f - ambient) * shade);
   } else if (closest_box >= 0) {
-    instance_id = scene.spheres.count + scene.planes.count + closest_box + 1;
+    const int box_offset = (batch_idx * scene.boxes.count + closest_box);
+    instance_id = sphere_count + plane_count + closest_box + 1;
     semantic_id = 3;
     Vec3 normal = normalize(closest_box_normal);
     if (dot(normal, ray_dir) > 0.0f) {
       normal = mul(normal, -1.0f);
     }
-    const Vec3 box_color = load_vec3(scene.boxes.colors + closest_box * 3);
+    const Vec3 box_color = load_vec3(scene.boxes.colors + box_offset * 3);
     const float shade = fmaxf(dot(normal, light_dir), 0.0f);
     const float ambient = 0.08f;
     color = mul(box_color, ambient + (1.0f - ambient) * shade);
   } else if (closest_plane >= 0) {
-    instance_id = scene.spheres.count + closest_plane + 1;
+    const int plane_offset = (batch_idx * scene.planes.count + closest_plane);
+    instance_id = sphere_count + closest_plane + 1;
     semantic_id = 2;
-    Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + closest_plane * 3));
+    Vec3 plane_normal = normalize(load_vec3(scene.planes.normals + plane_offset * 3));
     if (dot(plane_normal, ray_dir) > 0.0f) {
       plane_normal = mul(plane_normal, -1.0f);
     }
-    const Vec3 plane_color = load_vec3(scene.planes.colors + closest_plane * 3);
+    const Vec3 plane_color = load_vec3(scene.planes.colors + plane_offset * 3);
     const float shade = fmaxf(dot(plane_normal, light_dir), 0.0f);
     const float ambient = 0.08f;
     color = mul(plane_color, ambient + (1.0f - ambient) * shade);
@@ -372,15 +373,16 @@ void render_scene_cuda(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
-    torch::Tensor camera_origin,
-    torch::Tensor camera_orientation,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
+    torch::Tensor sphere_counts,
     torch::Tensor plane_points,
     torch::Tensor plane_normals,
+    torch::Tensor plane_counts,
     torch::Tensor box_centers,
     torch::Tensor box_half_sizes,
     torch::Tensor box_axes,
+    torch::Tensor box_counts,
     torch::Tensor light_dir,
     double fov_degrees,
     torch::Tensor background,
@@ -390,9 +392,9 @@ void render_scene_cuda(
   const int batch_size = static_cast<int>(image.size(0));
   const int height = static_cast<int>(image.size(2));
   const int width = static_cast<int>(image.size(3));
-  const int sphere_count = static_cast<int>(sphere_centers.size(0));
-  const int plane_count = static_cast<int>(plane_points.size(0));
-  const int box_count = static_cast<int>(box_centers.size(0));
+  const int sphere_count = static_cast<int>(sphere_centers.size(1));
+  const int plane_count = static_cast<int>(plane_points.size(1));
+  const int box_count = static_cast<int>(box_centers.size(1));
   TORCH_CHECK(sphere_count <= kMaxSpheres, "render_scene supports at most ", kMaxSpheres, " spheres");
   TORCH_CHECK(plane_count <= kMaxPlanes, "render_scene supports at most ", kMaxPlanes, " planes");
   TORCH_CHECK(box_count <= kMaxBoxes, "render_scene supports at most ", kMaxBoxes, " boxes");
@@ -400,22 +402,19 @@ void render_scene_cuda(
   const dim3 block(16, 16);
   const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y, batch_size);
 
-  const CameraView camera{
-      camera_origin.data_ptr<float>(),
-      camera_orientation.data_ptr<float>(),
-      static_cast<float>(fov_degrees),
-  };
   const SceneView scene{
       SphereView{
           sphere_centers.data_ptr<float>(),
           sphere_radii.data_ptr<float>(),
           sphere_colors.data_ptr<float>(),
+          sphere_counts.data_ptr<int>(),
           sphere_count,
       },
       PlaneView{
           plane_points.data_ptr<float>(),
           plane_normals.data_ptr<float>(),
           plane_colors.data_ptr<float>(),
+          plane_counts.data_ptr<int>(),
           plane_count,
       },
       BoxView{
@@ -423,12 +422,14 @@ void render_scene_cuda(
           box_half_sizes.data_ptr<float>(),
           box_axes.data_ptr<float>(),
           box_colors.data_ptr<float>(),
+          box_counts.data_ptr<int>(),
           box_count,
       },
   };
   const RenderOptionsView options{
       light_dir.data_ptr<float>(),
       background.data_ptr<float>(),
+      static_cast<float>(fov_degrees),
   };
 
   render_scene_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -437,7 +438,6 @@ void render_scene_cuda(
       semantic_map.numel() == 0 ? nullptr : semantic_map.data_ptr<int>(),
       width,
       height,
-      camera,
       scene,
       options);
 

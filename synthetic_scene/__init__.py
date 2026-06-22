@@ -1,5 +1,4 @@
 from .renderer import (
-    Camera,
     OrientedBoxes,
     Planes,
     RenderOptions,
@@ -15,7 +14,6 @@ from .renderer import (
 )
 
 __all__ = [
-    "Camera",
     "OrientedBoxes",
     "Planes",
     "RenderOptions",

@@ -6,7 +6,8 @@ Tiny CUDA/PyTorch synthetic scene renderer.
 
 The renderer draws Lambert-shaded geometric objects entirely in CUDA and can
 return batched RGB plus panoptic-friendly segmentation tensors. It supports up to 64
-spheres, 64 oriented boxes, and 64 planes per render.
+spheres, 64 oriented boxes, and 64 planes per scene. Batched renders draw
+different camera-space scenes.
 
 ## Build
 
@@ -27,22 +28,11 @@ a rear background plane.
 You can render a scene directly from Python:
 
 ```python
-from synthetic_scene import Camera, OrientedBoxes, Planes, Scene, Spheres, render_scene
+from synthetic_scene import OrientedBoxes, Planes, Scene, Spheres, render_scene
 
 image = render_scene(
     width=768,
     height=512,
-    camera=[
-        Camera(origin=(-0.2, 0.0, 0.0)),
-        Camera(
-            origin=(0.2, 1.0, 0.0),
-            orientation=(
-                (1.0, 0.0, 0.0),
-                (0.0, 0.94, -0.34),
-                (0.0, 0.34, 0.94),
-            ),
-        ),
-    ],
     scene=Scene(
         spheres=Spheres(
             centers=[(-0.8, 0.0, -3.0), (0.8, 0.0, -3.2)],
@@ -70,11 +60,10 @@ image = render_scene(
 )
 ```
 
-RGB tensors are returned as `B x 3 x H x W`. Passing a single camera, or leaving
-`camera` unset, returns a batch with `B = 1`.
-`Camera.orientation` is a `3 x 3` camera-to-world rotation matrix whose rows are
-the world-space right, up, and back axes; the default identity orientation looks
-down world `-Z`.
+RGB tensors are returned as `B x 3 x H x W`. Unbatched scene tensors return
+`B = 1`; scene tensors shaped as `B x N x ...` render one independent scene per
+batch item. Object coordinates are camera-space, with the camera at the origin
+looking down `-Z`.
 
 To request segmentation ground truth, pass `return_maps=True`:
 
@@ -105,24 +94,22 @@ random RGB color, keeping background label `0` black.
 
 ## Random Scenes
 
-For synthetic data generation, create a seeded random scene and matching cameras:
+For synthetic data generation, create seeded random camera-space scenes:
 
 ```python
 from synthetic_scene import random_scene, render_scene
 
-generated = random_scene(seed=1234, cameras=8)
+generated = random_scene(seed=1234, batch_size=8)
 result = render_scene(
     width=768,
     height=512,
     scene=generated.scene,
-    camera=generated.cameras,
     return_maps=True,
 )
 ```
 
-Random scenes always include a ground plane, scatter objects around `(0, 0, 0)`,
-include both grounded and floating primitives, and place each camera close enough
-to look directly at a randomly selected scene object.
+Random scenes always include a ground plane, include both grounded and floating
+primitives, and generate objects directly in front of the camera in `-Z`.
 
 ## Benchmark
 
@@ -131,11 +118,11 @@ conda run -n clipdino-cu117 python -m examples.benchmark
 ```
 
 The benchmark renders the same seeded random scene style as `examples.render`
-from 8 camera positions by default. You can sweep the image size, camera count,
+with a batch size of 8 by default. You can sweep the image size, batch size,
 sample count, and random seed:
 
 ```bash
-conda run -n clipdino-cu117 python -m examples.benchmark --width 1920 --height 1080 --cameras 16 --iterations 200 --seed 5678
+conda run -n clipdino-cu117 python -m examples.benchmark --width 1920 --height 1080 --batch-size 16 --iterations 200 --seed 5678
 ```
 
 The benchmark reports CUDA event timing for the render kernel, synchronized host

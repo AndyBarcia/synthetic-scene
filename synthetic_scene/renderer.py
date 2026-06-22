@@ -15,20 +15,10 @@ Vec3List = Union[Sequence[Vec3], torch.Tensor]
 
 
 @dataclass(frozen=True)
-class Camera:
-    origin: Vec3 = (0.0, 0.0, 0.0)
-    orientation: Union[Sequence[Vec3], torch.Tensor] = (
-        (1.0, 0.0, 0.0),
-        (0.0, 1.0, 0.0),
-        (0.0, 0.0, 1.0),
-    )
-    fov_degrees: float = 45.0
-
-
-@dataclass(frozen=True)
 class RenderOptions:
     light_dir: Vec3 = (-0.6, 0.7, 0.5)
     background: Vec3 = (0.02, 0.03, 0.04)
+    fov_degrees: float = 45.0
 
 
 @dataclass(frozen=True)
@@ -36,6 +26,7 @@ class Spheres:
     centers: Vec3List = ((0.0, 0.0, -3.0),)
     radii: Sequence[float] | torch.Tensor = (1.0,)
     colors: Vec3List = ((0.9, 0.35, 0.18),)
+    counts: Sequence[int] | torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +34,7 @@ class Planes:
     points: Vec3List = ((0.0, -1.0, 0.0), (0.0, 0.0, -6.0))
     normals: Vec3List = ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
     colors: Vec3List = ((0.52, 0.55, 0.58), (0.12, 0.14, 0.18))
+    counts: Sequence[int] | torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +43,7 @@ class OrientedBoxes:
     half_sizes: Vec3List = ()
     axes: Union[Sequence[Sequence[Vec3]], torch.Tensor] = ()
     colors: Vec3List = ()
+    counts: Sequence[int] | torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -63,7 +56,6 @@ class Scene:
 @dataclass(frozen=True)
 class RandomScene:
     scene: Scene
-    cameras: tuple[Camera, ...]
 
 
 @dataclass(frozen=True)
@@ -78,28 +70,31 @@ class RenderResult:
 def _compact_visible_instances(
     instance_map: torch.Tensor,
     *,
-    sphere_count: int,
-    plane_count: int,
-    box_count: int,
+    sphere_counts: torch.Tensor,
+    plane_counts: torch.Tensor,
+    box_counts: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return per-image visible classes and maps with compact 1-based IDs."""
     batch_size = instance_map.shape[0]
-    max_gt = sphere_count + plane_count + box_count
+    max_gt = int((sphere_counts + plane_counts + box_counts).max().item())
     visible_count = torch.empty((batch_size,), dtype=torch.int32, device=instance_map.device)
     visible_classes = torch.zeros((batch_size, max_gt), dtype=torch.int32, device=instance_map.device)
     compact_map = torch.empty_like(instance_map)
 
-    class_lookup = torch.zeros((max_gt + 1,), dtype=torch.int32, device=instance_map.device)
-    if sphere_count:
-        class_lookup[1 : sphere_count + 1] = 1
-    if plane_count:
-        plane_start = sphere_count + 1
-        class_lookup[plane_start : plane_start + plane_count] = 2
-    if box_count:
-        box_start = sphere_count + plane_count + 1
-        class_lookup[box_start : box_start + box_count] = 3
-
     for batch_idx in range(batch_size):
+        sphere_count = int(sphere_counts[batch_idx].item())
+        plane_count = int(plane_counts[batch_idx].item())
+        box_count = int(box_counts[batch_idx].item())
+        class_lookup = torch.zeros((max_gt + 1,), dtype=torch.int32, device=instance_map.device)
+        if sphere_count:
+            class_lookup[1 : sphere_count + 1] = 1
+        if plane_count:
+            plane_start = sphere_count + 1
+            class_lookup[plane_start : plane_start + plane_count] = 2
+        if box_count:
+            box_start = sphere_count + plane_count + 1
+            class_lookup[box_start : box_start + box_count] = 3
+
         labels = torch.unique(instance_map[batch_idx])
         labels = labels[labels > 0]
         count = int(labels.numel())
@@ -123,45 +118,6 @@ def _vec3(value: Vec3, *, device: torch.device | str = "cuda") -> torch.Tensor:
     return tensor.reshape(3).contiguous()
 
 
-def _camera_origins(cameras: Camera | Sequence[Camera], *, device: torch.device | str = "cuda") -> torch.Tensor:
-    if isinstance(cameras, Camera):
-        return _vec3(cameras.origin, device=device).reshape(1, 3)
-    if len(cameras) == 0:
-        raise ValueError("at least one camera is required")
-    origins = [_vec3(camera.origin, device=device) for camera in cameras]
-    return torch.stack(origins, dim=0).contiguous()
-
-
-def _camera_orientations(cameras: Camera | Sequence[Camera], *, device: torch.device | str = "cuda") -> torch.Tensor:
-    if isinstance(cameras, Camera):
-        return _mat3(cameras.orientation, device=device).reshape(1, 3, 3)
-    if len(cameras) == 0:
-        raise ValueError("at least one camera is required")
-    orientations = [_mat3(camera.orientation, device=device) for camera in cameras]
-    return torch.stack(orientations, dim=0).contiguous()
-
-
-def _camera_fov_degrees(cameras: Camera | Sequence[Camera]) -> float:
-    if isinstance(cameras, Camera):
-        return float(cameras.fov_degrees)
-    if len(cameras) == 0:
-        raise ValueError("at least one camera is required")
-    fov_degrees = float(cameras[0].fov_degrees)
-    if any(float(camera.fov_degrees) != fov_degrees for camera in cameras):
-        raise ValueError("batched cameras must share the same fov_degrees")
-    return fov_degrees
-
-
-def _mat3(value: Union[Sequence[Vec3], torch.Tensor], *, device: torch.device | str = "cuda") -> torch.Tensor:
-    tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
-    if tensor.numel() != 9:
-        raise ValueError("expected a 3 x 3 matrix")
-    tensor = tensor.reshape(3, 3)
-    if bool((tensor.norm(dim=1) <= 1.0e-8).any().item()):
-        raise ValueError("camera orientation rows must be non-zero")
-    return tensor.contiguous()
-
-
 def _vec3_list(value: Vec3List, *, device: torch.device | str = "cuda") -> torch.Tensor:
     tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
     if tensor.numel() == 0:
@@ -169,6 +125,63 @@ def _vec3_list(value: Vec3List, *, device: torch.device | str = "cuda") -> torch
     if tensor.ndim != 2 or tensor.shape[1] != 3:
         raise ValueError("expected vectors with shape N x 3")
     return tensor.contiguous()
+
+
+def _vec3_batch(value: Vec3List, *, device: torch.device | str = "cuda") -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+    if tensor.numel() == 0:
+        return tensor.reshape(1, 0, 3).contiguous()
+    if tensor.ndim == 2 and tensor.shape[1] == 3:
+        return tensor.reshape(1, tensor.shape[0], 3).contiguous()
+    if tensor.ndim == 3 and tensor.shape[2] == 3:
+        return tensor.contiguous()
+    raise ValueError("expected vectors with shape N x 3 or B x N x 3")
+
+
+def _scalar_batch(value: Sequence[float] | torch.Tensor, *, device: torch.device | str = "cuda") -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+    if tensor.numel() == 0:
+        return tensor.reshape(1, 0).contiguous()
+    if tensor.ndim == 1:
+        return tensor.reshape(1, tensor.shape[0]).contiguous()
+    if tensor.ndim == 2:
+        return tensor.contiguous()
+    raise ValueError("expected scalars with shape N or B x N")
+
+
+def _mat3_batch(value: Union[Sequence[Sequence[Vec3]], torch.Tensor], *, device: torch.device | str = "cuda") -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+    if tensor.numel() == 0:
+        return tensor.reshape(1, 0, 3, 3).contiguous()
+    if tensor.ndim == 3 and tensor.shape[1:] == (3, 3):
+        return tensor.reshape(1, tensor.shape[0], 3, 3).contiguous()
+    if tensor.ndim == 4 and tensor.shape[2:] == (3, 3):
+        return tensor.contiguous()
+    raise ValueError("expected matrices with shape N x 3 x 3 or B x N x 3 x 3")
+
+
+def _counts(value: Sequence[int] | torch.Tensor | None, *, batch_size: int, count: int, device: torch.device | str = "cuda") -> torch.Tensor:
+    if value is None:
+        return torch.full((batch_size,), count, dtype=torch.int32, device=device)
+    tensor = torch.as_tensor(value, dtype=torch.int32, device=device).reshape(-1).contiguous()
+    if tensor.shape[0] != batch_size:
+        raise ValueError("primitive counts must have shape B")
+    if bool(((tensor < 0) | (tensor > count)).any().item()):
+        raise ValueError("primitive counts must be in range [0, N]")
+    return tensor
+
+
+def _broadcast_batch(*tensors: torch.Tensor) -> int:
+    batch_size = max(tensor.shape[0] for tensor in tensors)
+    if any(tensor.shape[0] not in (1, batch_size) for tensor in tensors):
+        raise ValueError("batched scene tensors must use the same B dimension")
+    return batch_size
+
+
+def _expand_batch(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+    if tensor.shape[0] == batch_size:
+        return tensor.contiguous()
+    return tensor.expand((batch_size, *tensor.shape[1:])).contiguous()
 
 
 def _mat3_list(value: Union[Sequence[Sequence[Vec3]], torch.Tensor], *, device: torch.device | str = "cuda") -> torch.Tensor:
@@ -185,32 +198,20 @@ def random_scene(
     *,
     ground_objects: int = 10,
     floating_objects: int = 5,
-    cameras: int = 4,
+    batch_size: int = 4,
     scatter_radius: float = 3.0,
     ground_y: float = -1.0,
-    camera_distance: tuple[float, float] = (2.4, 5.0),
-    camera_height: tuple[float, float] = (0.35, 2.4),
     fov_degrees: float = 50.0,
 ) -> RandomScene:
-    """Generate a deterministic random scene and cameras from a seed."""
+    """Generate deterministic random camera-space scenes from a seed."""
     native = _cuda_renderer.random_scene(
         int(seed),
         int(ground_objects),
         int(floating_objects),
-        int(cameras),
+        int(batch_size),
         float(scatter_radius),
         float(ground_y),
-        camera_distance,
-        camera_height,
         float(fov_degrees),
-    )
-    camera_tuple = tuple(
-        Camera(
-            origin=native["camera_origins"][camera_idx],
-            orientation=native["camera_orientations"][camera_idx],
-            fov_degrees=fov_degrees,
-        )
-        for camera_idx in range(cameras)
     )
 
     return RandomScene(
@@ -219,20 +220,22 @@ def random_scene(
                 centers=native["sphere_centers"],
                 radii=native["sphere_radii"],
                 colors=native["sphere_colors"],
+                counts=native["sphere_counts"],
             ),
             planes=Planes(
                 points=native["plane_points"],
                 normals=native["plane_normals"],
                 colors=native["plane_colors"],
+                counts=native["plane_counts"],
             ),
             boxes=OrientedBoxes(
                 centers=native["box_centers"],
                 half_sizes=native["box_half_sizes"],
                 axes=native["box_axes"],
                 colors=native["box_colors"],
+                counts=native["box_counts"],
             ),
         ),
-        cameras=camera_tuple,
     )
 
 
@@ -242,7 +245,6 @@ def render_scene(
     height: int = 512,
     *,
     scene: Scene | None = None,
-    camera: Camera | Sequence[Camera] | None = None,
     options: RenderOptions | None = None,
     return_maps: bool = False,
 ) -> torch.Tensor: ...
@@ -254,7 +256,6 @@ def render_scene(
     height: int = 512,
     *,
     scene: Scene | None = None,
-    camera: Camera | Sequence[Camera] | None = None,
     options: RenderOptions | None = None,
     return_maps: bool,
 ) -> torch.Tensor | RenderResult: ...
@@ -265,54 +266,64 @@ def render_scene(
     height: int = 512,
     *,
     scene: Scene | None = None,
-    camera: Camera | Sequence[Camera] | None = None,
     options: RenderOptions | None = None,
     return_maps: bool = False,
 ) -> torch.Tensor | RenderResult:
-    """Render a scene into batched RGB, and optionally instance and primitive-class label maps."""
+    """Render camera-space scenes into batched RGB, and optionally label maps."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to render with this extension")
     if width <= 0 or height <= 0:
         raise ValueError("width and height must be positive")
 
-    camera_data = camera or Camera()
     options_data = options or RenderOptions()
     scene_data = scene or Scene()
+    if options_data.fov_degrees <= 0.0 or options_data.fov_degrees >= 180.0:
+        raise ValueError("fov_degrees must be in the open interval (0, 180)")
 
     device = torch.device("cuda")
-    centers = _vec3_list(scene_data.spheres.centers, device=device)
-    radii = torch.as_tensor(scene_data.spheres.radii, dtype=torch.float32, device=device).reshape(-1).contiguous()
-    colors = _vec3_list(scene_data.spheres.colors, device=device)
-    points = _vec3_list(scene_data.planes.points, device=device)
-    normals = _vec3_list(scene_data.planes.normals, device=device)
-    plane_colors_tensor = _vec3_list(scene_data.planes.colors, device=device)
-    box_centers = _vec3_list(scene_data.boxes.centers, device=device)
-    box_half_sizes = _vec3_list(scene_data.boxes.half_sizes, device=device)
-    box_axes = _mat3_list(scene_data.boxes.axes, device=device)
-    box_colors = _vec3_list(scene_data.boxes.colors, device=device)
-    sphere_count = centers.shape[0]
-    plane_count = points.shape[0]
-    box_count = box_centers.shape[0]
-    if sphere_count == 0 and plane_count == 0 and box_count == 0:
+    centers = _vec3_batch(scene_data.spheres.centers, device=device)
+    radii = _scalar_batch(scene_data.spheres.radii, device=device)
+    colors = _vec3_batch(scene_data.spheres.colors, device=device)
+    points = _vec3_batch(scene_data.planes.points, device=device)
+    normals = _vec3_batch(scene_data.planes.normals, device=device)
+    plane_colors_tensor = _vec3_batch(scene_data.planes.colors, device=device)
+    box_centers = _vec3_batch(scene_data.boxes.centers, device=device)
+    box_half_sizes = _vec3_batch(scene_data.boxes.half_sizes, device=device)
+    box_axes = _mat3_batch(scene_data.boxes.axes, device=device)
+    box_colors = _vec3_batch(scene_data.boxes.colors, device=device)
+    batch_size = _broadcast_batch(centers, radii, colors, points, normals, plane_colors_tensor, box_centers, box_half_sizes, box_axes, box_colors)
+    centers = _expand_batch(centers, batch_size)
+    radii = _expand_batch(radii, batch_size)
+    colors = _expand_batch(colors, batch_size)
+    points = _expand_batch(points, batch_size)
+    normals = _expand_batch(normals, batch_size)
+    plane_colors_tensor = _expand_batch(plane_colors_tensor, batch_size)
+    box_centers = _expand_batch(box_centers, batch_size)
+    box_half_sizes = _expand_batch(box_half_sizes, batch_size)
+    box_axes = _expand_batch(box_axes, batch_size)
+    box_colors = _expand_batch(box_colors, batch_size)
+    sphere_count = centers.shape[1]
+    plane_count = points.shape[1]
+    box_count = box_centers.shape[1]
+    sphere_counts = _counts(scene_data.spheres.counts, batch_size=batch_size, count=sphere_count, device=device)
+    plane_counts = _counts(scene_data.planes.counts, batch_size=batch_size, count=plane_count, device=device)
+    box_counts = _counts(scene_data.boxes.counts, batch_size=batch_size, count=box_count, device=device)
+    if bool(((sphere_counts + plane_counts + box_counts) <= 0).any().item()):
         raise ValueError("at least one object is required")
-    if radii.shape[0] != sphere_count or colors.shape[0] != sphere_count:
+    if radii.shape[1] != sphere_count or colors.shape[1] != sphere_count:
         raise ValueError("sphere_centers, sphere_radii, and sphere_colors must have matching lengths")
-    if normals.shape[0] != plane_count or plane_colors_tensor.shape[0] != plane_count:
+    if normals.shape[1] != plane_count or plane_colors_tensor.shape[1] != plane_count:
         raise ValueError("plane_points, plane_normals, and plane_colors must have matching lengths")
-    if box_half_sizes.shape[0] != box_count or box_axes.shape[0] != box_count or box_colors.shape[0] != box_count:
+    if box_half_sizes.shape[1] != box_count or box_axes.shape[1] != box_count or box_colors.shape[1] != box_count:
         raise ValueError("box_centers, box_half_sizes, box_axes, and box_colors must have matching lengths")
     if bool((radii <= 0).any().item()):
         raise ValueError("sphere_radii must all be positive")
-    if bool((normals.norm(dim=1) <= 1.0e-8).any().item()):
+    if bool((normals.norm(dim=2) <= 1.0e-8).any().item()):
         raise ValueError("plane_normals must be non-zero")
     if bool((box_half_sizes <= 0).any().item()):
         raise ValueError("box_half_sizes must all be positive")
-    if bool((box_axes.norm(dim=2) <= 1.0e-8).any().item()):
+    if bool((box_axes.norm(dim=3) <= 1.0e-8).any().item()):
         raise ValueError("box_axes must contain non-zero axis vectors")
-
-    camera_origins = _camera_origins(camera_data, device=device)
-    camera_orientations = _camera_orientations(camera_data, device=device)
-    batch_size = camera_origins.shape[0]
 
     image = torch.empty((batch_size, 3, height, width), dtype=torch.float32, device=device)
     instance_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
@@ -322,39 +333,38 @@ def render_scene(
         instance_map,
         semantic_map,
         {
-            "origin": camera_origins,
-            "orientation": camera_orientations,
-            "fov_degrees": _camera_fov_degrees(camera_data),
-        },
-        {
             "spheres": {
                 "centers": centers,
                 "radii": radii,
                 "colors": colors,
+                "counts": sphere_counts,
             },
             "planes": {
                 "points": points,
                 "normals": normals,
                 "colors": plane_colors_tensor,
+                "counts": plane_counts,
             },
             "boxes": {
                 "centers": box_centers,
                 "half_sizes": box_half_sizes,
                 "axes": box_axes,
                 "colors": box_colors,
+                "counts": box_counts,
             },
         },
         {
             "light_dir": _vec3(options_data.light_dir, device=device),
             "background": _vec3(options_data.background, device=device),
+            "fov_degrees": float(options_data.fov_degrees),
         },
     )
     if return_maps:
         visible_count, visible_classes, instance_map = _compact_visible_instances(
             instance_map,
-            sphere_count=sphere_count,
-            plane_count=plane_count,
-            box_count=box_count,
+            sphere_counts=sphere_counts,
+            plane_counts=plane_counts,
+            box_counts=box_counts,
         )
         return RenderResult(
             image=image,

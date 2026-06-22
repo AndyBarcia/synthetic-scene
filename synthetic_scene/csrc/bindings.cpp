@@ -60,20 +60,6 @@ Vec3 cross3(Vec3 a, Vec3 b) {
   };
 }
 
-Mat3 look_at_orientation(Vec3 origin, Vec3 target) {
-  const Vec3 forward = normalize3(Vec3{target.x - origin.x, target.y - origin.y, target.z - origin.z});
-  const Vec3 back{-forward.x, -forward.y, -forward.z};
-  const Vec3 world_up{0.0f, 1.0f, 0.0f};
-  Vec3 right = cross3(world_up, back);
-  if (right.x * right.x + right.y * right.y + right.z * right.z <= 1.0e-8f) {
-    right = Vec3{1.0f, 0.0f, 0.0f};
-  } else {
-    right = normalize3(right);
-  }
-  const Vec3 up = normalize3(cross3(back, right));
-  return Mat3{{right, up, back}};
-}
-
 Vec3 random_color(at::Generator& generator) {
   const float hue = rand_float(generator, 0.0f, 1.0f);
   const float saturation = rand_float(generator, 0.55f, 0.95f);
@@ -138,12 +124,16 @@ torch::Tensor make_cuda_tensor(std::vector<float>&& values, std::vector<int64_t>
   return cpu_tensor.to(torch::kCUDA, /*non_blocking=*/true).contiguous();
 }
 
-std::pair<float, float> require_range(const char* name, py::tuple value) {
-  TORCH_CHECK(value.size() == 2, name, " must contain exactly two values");
-  const float low = value[0].cast<float>();
-  const float high = value[1].cast<float>();
-  TORCH_CHECK(low <= high, name, " lower bound must be <= upper bound");
-  return {low, high};
+torch::Tensor make_cuda_int_tensor(std::vector<int32_t>&& values, std::vector<int64_t> shape) {
+  int64_t numel = 1;
+  for (const int64_t dim : shape) {
+    numel *= dim;
+  }
+  if (numel == 0) {
+    return torch::empty(shape, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+  }
+  auto cpu_tensor = torch::from_blob(values.data(), shape, torch::TensorOptions().dtype(torch::kInt32)).clone();
+  return cpu_tensor.to(torch::kCUDA, /*non_blocking=*/true).contiguous();
 }
 
 }  // namespace
@@ -152,15 +142,16 @@ void render_scene_cuda(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
-    torch::Tensor camera_origin,
-    torch::Tensor camera_orientation,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
+    torch::Tensor sphere_counts,
     torch::Tensor plane_points,
     torch::Tensor plane_normals,
+    torch::Tensor plane_counts,
     torch::Tensor box_centers,
     torch::Tensor box_half_sizes,
     torch::Tensor box_axes,
+    torch::Tensor box_counts,
     torch::Tensor light_dir,
     double fov_degrees,
     torch::Tensor background,
@@ -190,119 +181,127 @@ py::dict random_scene(
     int64_t seed,
     int ground_objects,
     int floating_objects,
-    int cameras,
+    int batch_size,
     float scatter_radius,
     float ground_y,
-    py::tuple camera_distance,
-    py::tuple camera_height,
     float fov_degrees) {
   TORCH_CHECK(c10::cuda::device_count() > 0, "CUDA is required to generate a native random scene");
   TORCH_CHECK(ground_objects >= 0 && floating_objects >= 0, "object counts must be non-negative");
   TORCH_CHECK(ground_objects + floating_objects > 0, "at least one non-plane object is required");
-  TORCH_CHECK(cameras > 0, "cameras must be positive");
+  TORCH_CHECK(batch_size > 0, "batch_size must be positive");
   TORCH_CHECK(scatter_radius > 0.0f, "scatter_radius must be positive");
   TORCH_CHECK(fov_degrees > 0.0f && fov_degrees < 180.0f, "fov_degrees must be in the open interval (0, 180)");
-  const auto camera_distance_range = require_range("camera_distance", camera_distance);
-  const float camera_distance_min = camera_distance_range.first;
-  const float camera_distance_max = camera_distance_range.second;
-  const auto camera_height_range = require_range("camera_height", camera_height);
-  const float camera_height_min = camera_height_range.first;
-  const float camera_height_max = camera_height_range.second;
-  TORCH_CHECK(camera_distance_min > 0.0f, "camera_distance values must be positive");
 
   at::Generator generator = at::detail::createCPUGenerator(static_cast<uint64_t>(seed));
   std::vector<float> sphere_centers;
   std::vector<float> sphere_radii;
   std::vector<float> sphere_colors;
+  std::vector<int32_t> sphere_counts;
   std::vector<float> box_centers;
   std::vector<float> box_half_sizes;
   std::vector<float> box_axes;
   std::vector<float> box_colors;
-  std::vector<Vec3> targets;
-
-  auto add_sphere = [&](Vec3 center, float radius) {
-    append_vec3(sphere_centers, center);
-    sphere_radii.push_back(radius);
-    append_vec3(sphere_colors, random_color(generator));
-    targets.push_back(center);
-  };
-  auto add_box = [&](Vec3 center, Vec3 half_size, Mat3 axes) {
-    append_vec3(box_centers, center);
-    append_vec3(box_half_sizes, half_size);
-    append_mat3(box_axes, axes);
-    append_vec3(box_colors, random_color(generator));
-    targets.push_back(center);
-  };
-
-  for (int i = 0; i < ground_objects; ++i) {
-    const auto ground_xz = random_ground_xz(generator, scatter_radius);
-    const float x = std::get<0>(ground_xz);
-    const float z = std::get<1>(ground_xz);
-    if (rand_float(generator, 0.0f, 1.0f) < 0.55f) {
-      const float radius = rand_float(generator, 0.18f, 0.65f);
-      add_sphere(Vec3{x, ground_y + radius, z}, radius);
-    } else {
-      const Vec3 half_size{
-          rand_float(generator, 0.18f, 0.6f),
-          rand_float(generator, 0.18f, 0.75f),
-          rand_float(generator, 0.18f, 0.6f),
-      };
-      add_box(Vec3{x, ground_y + half_size.y, z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
-    }
-  }
-
-  for (int i = 0; i < floating_objects; ++i) {
-    const auto ground_xz = random_ground_xz(generator, scatter_radius * 0.9f);
-    const float x = std::get<0>(ground_xz);
-    const float z = std::get<1>(ground_xz);
-    if (rand_float(generator, 0.0f, 1.0f) < 0.65f) {
-      const float radius = rand_float(generator, 0.15f, 0.5f);
-      add_sphere(Vec3{x, rand_float(generator, ground_y + 1.0f, ground_y + 3.2f), z}, radius);
-    } else {
-      const Vec3 half_size{
-          rand_float(generator, 0.14f, 0.45f),
-          rand_float(generator, 0.14f, 0.45f),
-          rand_float(generator, 0.14f, 0.45f),
-      };
-      add_box(Vec3{x, rand_float(generator, ground_y + 1.1f, ground_y + 3.4f), z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
-    }
-  }
-
-  const int64_t sphere_count = static_cast<int64_t>(sphere_radii.size());
-  const int64_t box_count = static_cast<int64_t>(box_centers.size() / 3);
+  std::vector<int32_t> box_counts;
+  const int max_objects = ground_objects + floating_objects;
+  const int64_t sphere_count = static_cast<int64_t>(max_objects);
+  const int64_t box_count = static_cast<int64_t>(max_objects);
   TORCH_CHECK(
       sphere_count <= kRandomSceneMaxSpheres && box_count <= kRandomSceneMaxBoxes,
       "random_scene generated more primitives than the renderer supports");
 
-  std::vector<float> camera_origins;
-  std::vector<float> camera_orientations;
-  for (int i = 0; i < cameras; ++i) {
-    const Vec3 target = targets[static_cast<size_t>(rand_int(generator, 0, static_cast<int>(targets.size()) - 1))];
-    const float distance = rand_float(generator, camera_distance_min, camera_distance_max);
-    const float angle = rand_float(generator, 0.0f, kTau);
-    const float height = rand_float(generator, camera_height_min, camera_height_max);
-    const Vec3 origin{
-        target.x + distance * std::cos(angle),
-        target.y + height,
-        target.z + distance * std::sin(angle),
+  for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+    int scene_spheres = 0;
+    int scene_boxes = 0;
+    auto add_sphere = [&](Vec3 center, float radius) {
+      append_vec3(sphere_centers, center);
+      sphere_radii.push_back(radius);
+      append_vec3(sphere_colors, random_color(generator));
+      ++scene_spheres;
     };
-    append_vec3(camera_origins, origin);
-    append_mat3(camera_orientations, look_at_orientation(origin, target));
+    auto add_box = [&](Vec3 center, Vec3 half_size, Mat3 axes) {
+      append_vec3(box_centers, center);
+      append_vec3(box_half_sizes, half_size);
+      append_mat3(box_axes, axes);
+      append_vec3(box_colors, random_color(generator));
+      ++scene_boxes;
+    };
+
+    for (int i = 0; i < ground_objects; ++i) {
+      const auto ground_xz = random_ground_xz(generator, scatter_radius);
+      const float x = std::get<0>(ground_xz);
+      const float z = -2.0f - std::fabs(std::get<1>(ground_xz));
+      if (rand_float(generator, 0.0f, 1.0f) < 0.55f) {
+        const float radius = rand_float(generator, 0.18f, 0.65f);
+        add_sphere(Vec3{x, ground_y + radius, z}, radius);
+      } else {
+        const Vec3 half_size{
+            rand_float(generator, 0.18f, 0.6f),
+            rand_float(generator, 0.18f, 0.75f),
+            rand_float(generator, 0.18f, 0.6f),
+        };
+        add_box(Vec3{x, ground_y + half_size.y, z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
+      }
+    }
+
+    for (int i = 0; i < floating_objects; ++i) {
+      const auto ground_xz = random_ground_xz(generator, scatter_radius * 0.9f);
+      const float x = std::get<0>(ground_xz);
+      const float z = -2.0f - std::fabs(std::get<1>(ground_xz));
+      if (rand_float(generator, 0.0f, 1.0f) < 0.65f) {
+        const float radius = rand_float(generator, 0.15f, 0.5f);
+        add_sphere(Vec3{x, rand_float(generator, ground_y + 1.0f, ground_y + 3.2f), z}, radius);
+      } else {
+        const Vec3 half_size{
+            rand_float(generator, 0.14f, 0.45f),
+            rand_float(generator, 0.14f, 0.45f),
+            rand_float(generator, 0.14f, 0.45f),
+        };
+        add_box(Vec3{x, rand_float(generator, ground_y + 1.1f, ground_y + 3.4f), z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
+      }
+    }
+
+    const int real_spheres = scene_spheres;
+    const int real_boxes = scene_boxes;
+    while (scene_spheres < max_objects) {
+      append_vec3(sphere_centers, Vec3{0.0f, 0.0f, -1.0f});
+      sphere_radii.push_back(1.0f);
+      append_vec3(sphere_colors, Vec3{0.0f, 0.0f, 0.0f});
+      ++scene_spheres;
+    }
+    while (scene_boxes < max_objects) {
+      append_vec3(box_centers, Vec3{0.0f, 0.0f, -1.0f});
+      append_vec3(box_half_sizes, Vec3{1.0f, 1.0f, 1.0f});
+      append_mat3(box_axes, yaw_axes(0.0f));
+      append_vec3(box_colors, Vec3{0.0f, 0.0f, 0.0f});
+      ++scene_boxes;
+    }
+    sphere_counts.push_back(static_cast<int32_t>(real_spheres));
+    box_counts.push_back(static_cast<int32_t>(real_boxes));
+  }
+
+  std::vector<float> plane_points;
+  std::vector<float> plane_normals;
+  std::vector<float> plane_colors;
+  for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+    append_vec3(plane_points, Vec3{0.0f, ground_y, 0.0f});
+    append_vec3(plane_normals, Vec3{0.0f, 1.0f, 0.0f});
+    append_vec3(plane_colors, Vec3{0.45f, 0.48f, 0.43f});
   }
 
   py::dict result;
-  result["camera_origins"] = make_cuda_tensor(std::move(camera_origins), {cameras, 3});
-  result["camera_orientations"] = make_cuda_tensor(std::move(camera_orientations), {cameras, 3, 3});
-  result["sphere_centers"] = make_cuda_tensor(std::move(sphere_centers), {sphere_count, 3});
-  result["sphere_radii"] = make_cuda_tensor(std::move(sphere_radii), {sphere_count});
-  result["sphere_colors"] = make_cuda_tensor(std::move(sphere_colors), {sphere_count, 3});
-  result["plane_points"] = make_cuda_tensor(std::vector<float>{0.0f, ground_y, 0.0f}, {1, 3});
-  result["plane_normals"] = make_cuda_tensor(std::vector<float>{0.0f, 1.0f, 0.0f}, {1, 3});
-  result["plane_colors"] = make_cuda_tensor(std::vector<float>{0.45f, 0.48f, 0.43f}, {1, 3});
-  result["box_centers"] = make_cuda_tensor(std::move(box_centers), {box_count, 3});
-  result["box_half_sizes"] = make_cuda_tensor(std::move(box_half_sizes), {box_count, 3});
-  result["box_axes"] = make_cuda_tensor(std::move(box_axes), {box_count, 3, 3});
-  result["box_colors"] = make_cuda_tensor(std::move(box_colors), {box_count, 3});
+  result["sphere_centers"] = make_cuda_tensor(std::move(sphere_centers), {batch_size, sphere_count, 3});
+  result["sphere_radii"] = make_cuda_tensor(std::move(sphere_radii), {batch_size, sphere_count});
+  result["sphere_colors"] = make_cuda_tensor(std::move(sphere_colors), {batch_size, sphere_count, 3});
+  result["sphere_counts"] = make_cuda_int_tensor(std::move(sphere_counts), {batch_size});
+  result["plane_points"] = make_cuda_tensor(std::move(plane_points), {batch_size, 1, 3});
+  result["plane_normals"] = make_cuda_tensor(std::move(plane_normals), {batch_size, 1, 3});
+  result["plane_colors"] = make_cuda_tensor(std::move(plane_colors), {batch_size, 1, 3});
+  result["plane_counts"] = make_cuda_int_tensor(std::vector<int32_t>(batch_size, 1), {batch_size});
+  result["box_centers"] = make_cuda_tensor(std::move(box_centers), {batch_size, box_count, 3});
+  result["box_half_sizes"] = make_cuda_tensor(std::move(box_half_sizes), {batch_size, box_count, 3});
+  result["box_axes"] = make_cuda_tensor(std::move(box_axes), {batch_size, box_count, 3, 3});
+  result["box_colors"] = make_cuda_tensor(std::move(box_colors), {batch_size, box_count, 3});
+  result["box_counts"] = make_cuda_int_tensor(std::move(box_counts), {batch_size});
   return result;
 }
 
@@ -310,31 +309,31 @@ void render_scene(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
-    py::dict camera,
     py::dict scene,
     py::dict options) {
   const py::dict spheres = require_dict(scene, "spheres");
   const py::dict planes = require_dict(scene, "planes");
   const py::dict boxes = require_dict(scene, "boxes");
 
-  const torch::Tensor camera_origin = require_tensor(camera, "origin");
-  const torch::Tensor camera_orientation = require_tensor(camera, "orientation");
-  const double fov_degrees = require_double(camera, "fov_degrees");
   const torch::Tensor light_dir = require_tensor(options, "light_dir");
   const torch::Tensor background = require_tensor(options, "background");
+  const double fov_degrees = require_double(options, "fov_degrees");
 
   const torch::Tensor sphere_centers = require_tensor(spheres, "centers");
   const torch::Tensor sphere_radii = require_tensor(spheres, "radii");
   const torch::Tensor sphere_colors = require_tensor(spheres, "colors");
+  const torch::Tensor sphere_counts = require_tensor(spheres, "counts");
 
   const torch::Tensor plane_points = require_tensor(planes, "points");
   const torch::Tensor plane_normals = require_tensor(planes, "normals");
   const torch::Tensor plane_colors = require_tensor(planes, "colors");
+  const torch::Tensor plane_counts = require_tensor(planes, "counts");
 
   const torch::Tensor box_centers = require_tensor(boxes, "centers");
   const torch::Tensor box_half_sizes = require_tensor(boxes, "half_sizes");
   const torch::Tensor box_axes = require_tensor(boxes, "axes");
   const torch::Tensor box_colors = require_tensor(boxes, "colors");
+  const torch::Tensor box_counts = require_tensor(boxes, "counts");
 
   TORCH_CHECK(image.is_cuda(), "image must be a CUDA tensor");
   TORCH_CHECK(instance_map.is_cuda() && semantic_map.is_cuda(), "segmentation maps must be CUDA tensors");
@@ -351,38 +350,34 @@ void render_scene(
           (semantic_map.dim() == 3 && semantic_map.size(0) == image.size(0) && semantic_map.size(1) == image.size(2) &&
            semantic_map.size(2) == image.size(3)),
       "semantic_map must be empty or B x H x W");
-  TORCH_CHECK(camera_origin.is_cuda() && camera_orientation.is_cuda(), "camera tensors must be CUDA tensors");
   TORCH_CHECK(sphere_centers.is_cuda() && sphere_radii.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(plane_points.is_cuda() && plane_normals.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(box_centers.is_cuda() && box_half_sizes.is_cuda() && box_axes.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(light_dir.is_cuda() && background.is_cuda() && sphere_colors.is_cuda() && plane_colors.is_cuda() && box_colors.is_cuda(), "scene tensors must be CUDA tensors");
-  TORCH_CHECK(camera_origin.dim() == 2 && camera_origin.size(1) == 3, "camera_origin must be B x 3");
-  TORCH_CHECK(
-      camera_orientation.dim() == 3 && camera_orientation.size(1) == 3 && camera_orientation.size(2) == 3,
-      "camera_orientation must be B x 3 x 3");
-  TORCH_CHECK(camera_origin.size(0) == image.size(0), "camera_origin batch size must match image batch size");
-  TORCH_CHECK(camera_orientation.size(0) == image.size(0), "camera_orientation batch size must match image batch size");
-  TORCH_CHECK(sphere_centers.dim() == 2 && sphere_centers.size(1) == 3, "sphere_centers must be N x 3");
-  TORCH_CHECK(sphere_radii.dim() == 1, "sphere_radii must be N");
-  TORCH_CHECK(plane_points.dim() == 2 && plane_points.size(1) == 3, "plane_points must be N x 3");
-  TORCH_CHECK(plane_normals.dim() == 2 && plane_normals.size(1) == 3, "plane_normals must be N x 3");
-  TORCH_CHECK(box_centers.dim() == 2 && box_centers.size(1) == 3, "box_centers must be N x 3");
-  TORCH_CHECK(box_half_sizes.dim() == 2 && box_half_sizes.size(1) == 3, "box_half_sizes must be N x 3");
-  TORCH_CHECK(box_axes.dim() == 3 && box_axes.size(1) == 3 && box_axes.size(2) == 3, "box_axes must be N x 3 x 3");
-  TORCH_CHECK(sphere_colors.dim() == 2 && sphere_colors.size(1) == 3, "sphere_colors must be N x 3");
-  TORCH_CHECK(plane_colors.dim() == 2 && plane_colors.size(1) == 3, "plane_colors must be N x 3");
-  TORCH_CHECK(box_colors.dim() == 2 && box_colors.size(1) == 3, "box_colors must be N x 3");
-  TORCH_CHECK(sphere_centers.size(0) == sphere_radii.size(0), "sphere_centers and sphere_radii must have matching lengths");
-  TORCH_CHECK(sphere_centers.size(0) == sphere_colors.size(0), "sphere_centers and sphere_colors must have matching lengths");
-  TORCH_CHECK(plane_points.size(0) == plane_normals.size(0), "plane_points and plane_normals must have matching lengths");
-  TORCH_CHECK(plane_points.size(0) == plane_colors.size(0), "plane_points and plane_colors must have matching lengths");
-  TORCH_CHECK(box_centers.size(0) == box_half_sizes.size(0), "box_centers and box_half_sizes must have matching lengths");
-  TORCH_CHECK(box_centers.size(0) == box_axes.size(0), "box_centers and box_axes must have matching lengths");
-  TORCH_CHECK(box_centers.size(0) == box_colors.size(0), "box_centers and box_colors must have matching lengths");
-  TORCH_CHECK(sphere_centers.size(0) > 0 || plane_points.size(0) > 0 || box_centers.size(0) > 0, "at least one object is required");
+  TORCH_CHECK(sphere_counts.is_cuda() && plane_counts.is_cuda() && box_counts.is_cuda(), "primitive count tensors must be CUDA tensors");
+  TORCH_CHECK(sphere_centers.dim() == 3 && sphere_centers.size(2) == 3, "sphere_centers must be B x N x 3");
+  TORCH_CHECK(sphere_radii.dim() == 2, "sphere_radii must be B x N");
+  TORCH_CHECK(plane_points.dim() == 3 && plane_points.size(2) == 3, "plane_points must be B x N x 3");
+  TORCH_CHECK(plane_normals.dim() == 3 && plane_normals.size(2) == 3, "plane_normals must be B x N x 3");
+  TORCH_CHECK(box_centers.dim() == 3 && box_centers.size(2) == 3, "box_centers must be B x N x 3");
+  TORCH_CHECK(box_half_sizes.dim() == 3 && box_half_sizes.size(2) == 3, "box_half_sizes must be B x N x 3");
+  TORCH_CHECK(box_axes.dim() == 4 && box_axes.size(2) == 3 && box_axes.size(3) == 3, "box_axes must be B x N x 3 x 3");
+  TORCH_CHECK(sphere_colors.dim() == 3 && sphere_colors.size(2) == 3, "sphere_colors must be B x N x 3");
+  TORCH_CHECK(plane_colors.dim() == 3 && plane_colors.size(2) == 3, "plane_colors must be B x N x 3");
+  TORCH_CHECK(box_colors.dim() == 3 && box_colors.size(2) == 3, "box_colors must be B x N x 3");
+  TORCH_CHECK(sphere_counts.dim() == 1 && plane_counts.dim() == 1 && box_counts.dim() == 1, "primitive counts must be B");
+  TORCH_CHECK(sphere_centers.size(0) == image.size(0), "scene batch size must match image batch size");
+  TORCH_CHECK(plane_points.size(0) == image.size(0) && box_centers.size(0) == image.size(0), "scene batch size must match image batch size");
+  TORCH_CHECK(sphere_counts.size(0) == image.size(0) && plane_counts.size(0) == image.size(0) && box_counts.size(0) == image.size(0), "primitive count batch size must match image batch size");
+  TORCH_CHECK(sphere_centers.size(1) == sphere_radii.size(1), "sphere_centers and sphere_radii must have matching lengths");
+  TORCH_CHECK(sphere_centers.size(1) == sphere_colors.size(1), "sphere_centers and sphere_colors must have matching lengths");
+  TORCH_CHECK(plane_points.size(1) == plane_normals.size(1), "plane_points and plane_normals must have matching lengths");
+  TORCH_CHECK(plane_points.size(1) == plane_colors.size(1), "plane_points and plane_colors must have matching lengths");
+  TORCH_CHECK(box_centers.size(1) == box_half_sizes.size(1), "box_centers and box_half_sizes must have matching lengths");
+  TORCH_CHECK(box_centers.size(1) == box_axes.size(1), "box_centers and box_axes must have matching lengths");
+  TORCH_CHECK(box_centers.size(1) == box_colors.size(1), "box_centers and box_colors must have matching lengths");
+  TORCH_CHECK(sphere_centers.size(1) > 0 || plane_points.size(1) > 0 || box_centers.size(1) > 0, "at least one object slot is required");
   TORCH_CHECK(light_dir.numel() == 3 && background.numel() == 3, "light/background vectors must be vec3");
-  TORCH_CHECK(camera_origin.dtype() == torch::kFloat32, "camera_origin must be float32");
-  TORCH_CHECK(camera_orientation.dtype() == torch::kFloat32, "camera_orientation must be float32");
   TORCH_CHECK(sphere_centers.dtype() == torch::kFloat32, "sphere_centers must be float32");
   TORCH_CHECK(sphere_radii.dtype() == torch::kFloat32, "sphere_radii must be float32");
   TORCH_CHECK(plane_points.dtype() == torch::kFloat32, "plane_points must be float32");
@@ -395,27 +390,29 @@ void render_scene(
   TORCH_CHECK(sphere_colors.dtype() == torch::kFloat32, "sphere_colors must be float32");
   TORCH_CHECK(plane_colors.dtype() == torch::kFloat32, "plane_colors must be float32");
   TORCH_CHECK(box_colors.dtype() == torch::kFloat32, "box_colors must be float32");
+  TORCH_CHECK(sphere_counts.dtype() == torch::kInt32 && plane_counts.dtype() == torch::kInt32 && box_counts.dtype() == torch::kInt32, "primitive counts must be int32");
   TORCH_CHECK(image.is_contiguous(), "image must be contiguous");
   TORCH_CHECK(instance_map.is_contiguous() && semantic_map.is_contiguous(), "segmentation maps must be contiguous");
-  TORCH_CHECK(camera_origin.is_contiguous() && camera_orientation.is_contiguous(), "camera tensors must be contiguous");
   TORCH_CHECK(sphere_centers.is_contiguous() && sphere_radii.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(plane_points.is_contiguous() && plane_normals.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(box_centers.is_contiguous() && box_half_sizes.is_contiguous() && box_axes.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(light_dir.is_contiguous() && background.is_contiguous() && sphere_colors.is_contiguous() && plane_colors.is_contiguous() && box_colors.is_contiguous(), "scene tensors must be contiguous");
+  TORCH_CHECK(sphere_counts.is_contiguous() && plane_counts.is_contiguous() && box_counts.is_contiguous(), "primitive count tensors must be contiguous");
 
   render_scene_cuda(
       image,
       instance_map,
       semantic_map,
-      camera_origin,
-      camera_orientation,
       sphere_centers,
       sphere_radii,
+      sphere_counts,
       plane_points,
       plane_normals,
+      plane_counts,
       box_centers,
       box_half_sizes,
       box_axes,
+      box_counts,
       light_dir,
       fov_degrees,
       background,
@@ -431,12 +428,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("seed"),
       py::arg("ground_objects"),
       py::arg("floating_objects"),
-      py::arg("cameras"),
+      py::arg("batch_size"),
       py::arg("scatter_radius"),
       py::arg("ground_y"),
-      py::arg("camera_distance"),
-      py::arg("camera_height"),
       py::arg("fov_degrees"),
-      "Generate random scene tensors directly from the native extension");
+      "Generate random camera-space scene tensors directly from the native extension");
   m.def("render_scene", &render_scene, "Render Lambert-shaded geometric objects (CUDA)");
 }
