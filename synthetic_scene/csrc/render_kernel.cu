@@ -1026,7 +1026,49 @@ __global__ void compute_receiver_light_bounds_kernel(
   store_light_bounds6(receiver_light_bounds + out_idx, bounds);
 }
 
-__global__ void build_primary_cluster_masks_kernel(
+__device__ __forceinline__ int clamp_int_device(int value, int lo, int hi) {
+  return max(lo, min(value, hi));
+}
+
+__device__ __forceinline__ bool pixel_bounds_to_tile_range(
+    float min_x,
+    float min_y,
+    float max_x,
+    float max_y,
+    int width,
+    int height,
+    int tiles_x,
+    int tiles_y,
+    int* out_tile_x0,
+    int* out_tile_x1,
+    int* out_tile_y0,
+    int* out_tile_y1) {
+  if (max_x < 0.0f || max_y < 0.0f || min_x > static_cast<float>(width - 1) || min_y > static_cast<float>(height - 1)) {
+    return false;
+  }
+
+  const float clamped_min_x = fmaxf(min_x, 0.0f);
+  const float clamped_max_x = fminf(max_x, static_cast<float>(width - 1));
+  const float clamped_min_y = fmaxf(min_y, 0.0f);
+  const float clamped_max_y = fminf(max_y, static_cast<float>(height - 1));
+
+  const int tile_x0 = clamp_int_device(static_cast<int>(floorf(clamped_min_x / static_cast<float>(kTileWidth))), 0, tiles_x - 1);
+  const int tile_x1 = clamp_int_device(static_cast<int>(floorf(clamped_max_x / static_cast<float>(kTileWidth))), 0, tiles_x - 1);
+  const int tile_y0 = clamp_int_device(static_cast<int>(floorf(clamped_min_y / static_cast<float>(kTileHeight))), 0, tiles_y - 1);
+  const int tile_y1 = clamp_int_device(static_cast<int>(floorf(clamped_max_y / static_cast<float>(kTileHeight))), 0, tiles_y - 1);
+
+  if (tile_x0 > tile_x1 || tile_y0 > tile_y1) {
+    return false;
+  }
+
+  *out_tile_x0 = tile_x0;
+  *out_tile_x1 = tile_x1;
+  *out_tile_y0 = tile_y0;
+  *out_tile_y1 = tile_y1;
+  return true;
+}
+
+__global__ void build_primary_cluster_masks_object_driven_kernel(
     int* primary_cluster_masks,
     const float* depth_edges,
     int width,
@@ -1036,32 +1078,24 @@ __global__ void build_primary_cluster_masks_kernel(
     SceneView scene,
     RenderOptionsView options) {
   __shared__ int shared_valid;
-  __shared__ int shared_kind;
-  __shared__ int shared_index;
-  __shared__ Aabb shared_bounds;
-  __shared__ float shared_near_depth;
-  __shared__ float shared_far_depth;
-  __shared__ float shared_min_x;
-  __shared__ float shared_min_y;
-  __shared__ float shared_max_x;
-  __shared__ float shared_max_y;
+  __shared__ int shared_tile_x0;
+  __shared__ int shared_tile_x1;
+  __shared__ int shared_tile_y0;
+  __shared__ int shared_tile_y1;
+  __shared__ int shared_bin0;
+  __shared__ int shared_bin1;
 
-  const int tile_linear = blockIdx.x * blockDim.x + threadIdx.x;
-  const int primitive_slot = blockIdx.y;
-  const int batch_idx = blockIdx.z;
-  const int total_tiles = tiles_x * tiles_y;
+  const int primitive_slot = blockIdx.x;
+  const int batch_idx = blockIdx.y;
 
   if (threadIdx.x == 0) {
     shared_valid = 0;
-    shared_kind = 0;
-    shared_index = -1;
-    shared_bounds = empty_aabb();
-    shared_near_depth = kCameraNear;
-    shared_far_depth = kCameraNear;
-    shared_min_x = kFloatMax;
-    shared_min_y = kFloatMax;
-    shared_max_x = -kFloatMax;
-    shared_max_y = -kFloatMax;
+    shared_tile_x0 = 0;
+    shared_tile_x1 = -1;
+    shared_tile_y0 = 0;
+    shared_tile_y1 = -1;
+    shared_bin0 = 0;
+    shared_bin1 = -1;
 
     Vec3 center = make_vec3(0.0f, 0.0f, 0.0f);
     Vec3 half_size = make_vec3(0.0f, 0.0f, 0.0f);
@@ -1071,8 +1105,7 @@ __global__ void build_primary_cluster_masks_kernel(
     if (load_primitive_bounds_for_slot(scene, batch_idx, primitive_slot, &kind, &index, &bounds, &center, &half_size)) {
       float near_depth = kCameraNear;
       float far_depth = kCameraNear;
-      const bool valid_depth_range = aabb_forward_depth_range(bounds, &near_depth, &far_depth);
-      if (valid_depth_range) {
+      if (aabb_forward_depth_range(bounds, &near_depth, &far_depth)) {
         const float aspect = static_cast<float>(width) / static_cast<float>(height);
         const float fov_radians = options.fov_degrees * 0.017453292519943295f;
         const float image_plane_scale = tanf(0.5f * fov_radians);
@@ -1109,60 +1142,66 @@ __global__ void build_primary_cluster_masks_kernel(
               &max_y);
         }
 
-        if (projected) {
+        int tile_x0 = 0;
+        int tile_x1 = -1;
+        int tile_y0 = 0;
+        int tile_y1 = -1;
+        if (projected && pixel_bounds_to_tile_range(
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                width,
+                height,
+                tiles_x,
+                tiles_y,
+                &tile_x0,
+                &tile_x1,
+                &tile_y0,
+                &tile_y1)) {
+          const float* batch_edges = depth_edges + batch_idx * (kDepthBins + 1);
+          const int bin0 = depth_to_bin_from_edges(near_depth, batch_edges);
+          const int bin1 = depth_to_bin_from_edges(far_depth, batch_edges);
           shared_valid = 1;
-          shared_kind = kind;
-          shared_index = index;
-          shared_bounds = bounds;
-          shared_near_depth = near_depth;
-          shared_far_depth = far_depth;
-          shared_min_x = min_x;
-          shared_min_y = min_y;
-          shared_max_x = max_x;
-          shared_max_y = max_y;
+          shared_tile_x0 = tile_x0;
+          shared_tile_x1 = tile_x1;
+          shared_tile_y0 = tile_y0;
+          shared_tile_y1 = tile_y1;
+          shared_bin0 = min(bin0, bin1);
+          shared_bin1 = max(bin0, bin1);
         }
       }
     }
   }
   __syncthreads();
 
-  if (!shared_valid || tile_linear >= total_tiles) {
+  if (!shared_valid) {
     return;
   }
 
-  const int tile_x = tile_linear % tiles_x;
-  const int tile_y = tile_linear / tiles_x;
-  const float block_min_x = static_cast<float>(tile_x * kTileWidth);
-  const float block_min_y = static_cast<float>(tile_y * kTileHeight);
-  const float block_max_x = static_cast<float>(min(width - 1, (tile_x + 1) * kTileWidth - 1));
-  const float block_max_y = static_cast<float>(min(height - 1, (tile_y + 1) * kTileHeight - 1));
+  const int tile_count_x = shared_tile_x1 - shared_tile_x0 + 1;
+  const int tile_count_y = shared_tile_y1 - shared_tile_y0 + 1;
+  const int bin_count = shared_bin1 - shared_bin0 + 1;
+  const int mark_count = tile_count_x * tile_count_y * bin_count;
 
-  if (!pixel_bounds_overlap(
-          shared_min_x,
-          shared_min_y,
-          shared_max_x,
-          shared_max_y,
-          block_min_x,
-          block_min_y,
-          block_max_x,
-          block_max_y)) {
-    return;
-  }
+  for (int mark_idx = threadIdx.x; mark_idx < mark_count; mark_idx += blockDim.x) {
+    const int bin_offset = mark_idx % bin_count;
+    const int tile_offset = mark_idx / bin_count;
+    const int local_tile_x = tile_offset % tile_count_x;
+    const int local_tile_y = tile_offset / tile_count_x;
+    const int tile_x = shared_tile_x0 + local_tile_x;
+    const int tile_y = shared_tile_y0 + local_tile_y;
+    const int bin = shared_bin0 + bin_offset;
 
-  const float* batch_edges = depth_edges + batch_idx * (kDepthBins + 1);
-  #pragma unroll
-  for (int bin = 0; bin < kDepthBins; ++bin) {
-    if (depth_ranges_overlap(shared_near_depth, shared_far_depth, batch_edges[bin], batch_edges[bin + 1])) {
-      mark_primitive_in_cluster_mask(
-          primary_cluster_masks,
-          batch_idx,
-          tile_y,
-          tile_x,
-          bin,
-          tiles_x,
-          tiles_y,
-          primitive_slot);
-    }
+    mark_primitive_in_cluster_mask(
+        primary_cluster_masks,
+        batch_idx,
+        tile_y,
+        tile_x,
+        bin,
+        tiles_x,
+        tiles_y,
+        primitive_slot);
   }
 }
 
@@ -1700,8 +1739,8 @@ void render_scene_cuda(
   const int cluster_threads = 128;
 
   if (primitive_slot_count > 0) {
-    const dim3 primary_build_grid((total_tiles + cluster_threads - 1) / cluster_threads, primitive_slot_count, batch_size);
-    build_primary_cluster_masks_kernel<<<primary_build_grid, cluster_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    const dim3 primary_build_grid(primitive_slot_count, batch_size);
+    build_primary_cluster_masks_object_driven_kernel<<<primary_build_grid, cluster_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         primary_cluster_masks.data_ptr<int>(),
         depth_edges.data_ptr<float>(),
         width,
