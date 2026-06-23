@@ -7,8 +7,7 @@ namespace {
 constexpr int kMaxSpheres = 64;
 constexpr int kMaxBoxes = 64;
 constexpr int kMaxFinitePrimitives = kMaxSpheres + kMaxBoxes;
-constexpr int kMaxBvhNodes = 2 * kMaxFinitePrimitives - 1;
-constexpr int kBvhLeafSize = 4;
+constexpr int kDepthBins = 8;
 constexpr float kRayTMin = 1.0e-4f;
 constexpr float kParallelEpsilon = 1.0e-6f;
 constexpr float kFloatMax = 3.402823466e+38f;
@@ -89,25 +88,9 @@ struct LightBounds {
   float w_max;
 };
 
-struct BvhPrimitive {
-  Aabb bounds;
-  Vec3 centroid;
+struct PrimitiveRef {
   int kind;
   int index;
-};
-
-struct BvhNode {
-  Aabb bounds;
-  int left;
-  int right;
-  int start;
-  int count;
-};
-
-struct BvhBuildTask {
-  int start;
-  int count;
-  int node_idx;
 };
 
 struct HitRecord {
@@ -268,6 +251,48 @@ __device__ __forceinline__ LightBounds compute_block_receiver_light_bounds(
   return bounds;
 }
 
+
+__device__ __forceinline__ float depth_bin_edge(int edge, float far_depth) {
+  const float near_depth = kCameraNear;
+  const float safe_far_depth = fmaxf(far_depth, near_depth + 1.0e-3f);
+  const float a = static_cast<float>(edge) / static_cast<float>(kDepthBins);
+  return near_depth * powf(safe_far_depth / near_depth, a);
+}
+
+__device__ __forceinline__ int depth_to_bin_from_edges(float forward_depth, const float* edges) {
+  const float depth = fmaxf(forward_depth, kCameraNear);
+  #pragma unroll
+  for (int bin = 0; bin < kDepthBins - 1; ++bin) {
+    if (depth <= edges[bin + 1]) {
+      return bin;
+    }
+  }
+  return kDepthBins - 1;
+}
+
+__device__ __forceinline__ bool aabb_forward_depth_range(Aabb bounds, float* out_near_depth, float* out_far_depth) {
+  // Camera convention in this renderer: visible objects are usually at negative Z, and
+  // forward camera depth is -Z. The nearest point in forward depth is therefore -max.z.
+  float near_depth = -bounds.max.z;
+  float far_depth = -bounds.min.z;
+  if (far_depth < kCameraNear) {
+    return false;
+  }
+  near_depth = fmaxf(near_depth, kCameraNear);
+  far_depth = fmaxf(far_depth, near_depth);
+  *out_near_depth = near_depth;
+  *out_far_depth = far_depth;
+  return true;
+}
+
+__device__ __forceinline__ bool depth_ranges_overlap(
+    float a_near,
+    float a_far,
+    float b_near,
+    float b_far) {
+  return a_near <= b_far && a_far >= b_near;
+}
+
 __device__ __forceinline__ float smooth_height(float x, float z, float phase_x, float phase_z) {
   const float forward_depth = fmaxf(-z, 0.0f);
   const float far_rise = 0.055f * forward_depth + 0.0011f * forward_depth * forward_depth;
@@ -320,123 +345,6 @@ __device__ __forceinline__ Aabb box_aabb(Vec3 center, Vec3 half_size, const floa
       fabsf(axis_x.y) * half_size.x + fabsf(axis_y.y) * half_size.y + fabsf(axis_z.y) * half_size.z,
       fabsf(axis_x.z) * half_size.x + fabsf(axis_y.z) * half_size.y + fabsf(axis_z.z) * half_size.z);
   return Aabb{sub(center, extent), add(center, extent)};
-}
-
-__device__ __forceinline__ Vec3 aabb_centroid(Aabb bounds) {
-  return mul(add(bounds.min, bounds.max), 0.5f);
-}
-
-__device__ __forceinline__ float centroid_axis(Vec3 centroid, int axis) {
-  if (axis == 0) {
-    return centroid.x;
-  }
-  if (axis == 1) {
-    return centroid.y;
-  }
-  return centroid.z;
-}
-
-__device__ void build_bvh_nodes(
-    BvhPrimitive* primitives,
-    BvhNode* nodes,
-    int primitive_count,
-    int* node_count) {
-  *node_count = 0;
-  if (primitive_count <= 0) {
-    return;
-  }
-
-  BvhBuildTask stack[kMaxBvhNodes];
-  int stack_size = 0;
-  int next_node = 1;
-  nodes[0] = BvhNode{empty_aabb(), -1, -1, 0, primitive_count};
-  stack[stack_size++] = BvhBuildTask{0, primitive_count, 0};
-
-  while (stack_size > 0) {
-    const BvhBuildTask task = stack[--stack_size];
-    Aabb node_bounds = empty_aabb();
-    Aabb centroid_bounds = empty_aabb();
-    for (int item = 0; item < task.count; ++item) {
-      const BvhPrimitive primitive = primitives[task.start + item];
-      node_bounds = extend_aabb(node_bounds, primitive.bounds);
-      const Aabb centroid_bounds_item = Aabb{primitive.centroid, primitive.centroid};
-      centroid_bounds = extend_aabb(centroid_bounds, centroid_bounds_item);
-    }
-
-    BvhNode node = BvhNode{node_bounds, -1, -1, task.start, task.count};
-    if (task.count > kBvhLeafSize && next_node + 1 < kMaxBvhNodes) {
-      const Vec3 extent = sub(centroid_bounds.max, centroid_bounds.min);
-      int axis = 0;
-      if (extent.y > extent.x && extent.y >= extent.z) {
-        axis = 1;
-      } else if (extent.z > extent.x && extent.z > extent.y) {
-        axis = 2;
-      }
-
-      for (int i = 1; i < task.count; ++i) {
-        const BvhPrimitive key = primitives[task.start + i];
-        const float key_value = centroid_axis(key.centroid, axis);
-        int j = i - 1;
-        while (j >= 0 && centroid_axis(primitives[task.start + j].centroid, axis) > key_value) {
-          primitives[task.start + j + 1] = primitives[task.start + j];
-          --j;
-        }
-        primitives[task.start + j + 1] = key;
-      }
-
-      const int left_count = task.count / 2;
-      const int right_count = task.count - left_count;
-      if (left_count > 0 && right_count > 0) {
-        const int left_node = next_node++;
-        const int right_node = next_node++;
-        node.left = left_node;
-        node.right = right_node;
-        node.count = 0;
-        nodes[left_node] = BvhNode{empty_aabb(), -1, -1, task.start, left_count};
-        nodes[right_node] = BvhNode{empty_aabb(), -1, -1, task.start + left_count, right_count};
-        stack[stack_size++] = BvhBuildTask{task.start + left_count, right_count, right_node};
-        stack[stack_size++] = BvhBuildTask{task.start, left_count, left_node};
-      }
-    }
-    nodes[task.node_idx] = node;
-  }
-
-  *node_count = next_node;
-}
-
-__device__ __forceinline__ bool intersect_aabb(Vec3 ray_origin, Vec3 ray_dir, Aabb bounds, float max_t) {
-  float t_min = kRayTMin;
-  float t_max = max_t;
-
-  const float origin[3] = {ray_origin.x, ray_origin.y, ray_origin.z};
-  const float dir[3] = {ray_dir.x, ray_dir.y, ray_dir.z};
-  const float bounds_min[3] = {bounds.min.x, bounds.min.y, bounds.min.z};
-  const float bounds_max[3] = {bounds.max.x, bounds.max.y, bounds.max.z};
-
-  #pragma unroll
-  for (int axis_idx = 0; axis_idx < 3; ++axis_idx) {
-    if (fabsf(dir[axis_idx]) < kParallelEpsilon) {
-      if (origin[axis_idx] < bounds_min[axis_idx] || origin[axis_idx] > bounds_max[axis_idx]) {
-        return false;
-      }
-      continue;
-    }
-
-    const float inv_dir = 1.0f / dir[axis_idx];
-    float t1 = (bounds_min[axis_idx] - origin[axis_idx]) * inv_dir;
-    float t2 = (bounds_max[axis_idx] - origin[axis_idx]) * inv_dir;
-    if (t1 > t2) {
-      const float tmp = t1;
-      t1 = t2;
-      t2 = tmp;
-    }
-    t_min = fmaxf(t_min, t1);
-    t_max = fminf(t_max, t2);
-    if (t_min > t_max) {
-      return false;
-    }
-  }
-  return true;
 }
 
 __device__ __forceinline__ bool ray_aabb_exit_t(Vec3 ray_origin, Vec3 ray_dir, Aabb bounds, float* out_t_exit) {
@@ -791,83 +699,56 @@ __global__ void voxel_space_terrain_kernel(
   }
 }
 
-__device__ __forceinline__ bool is_shadowed(
+__device__ __forceinline__ bool is_shadowed_ref_list(
     Vec3 ray_origin,
     Vec3 light_dir,
     const SceneView& scene,
-    const BvhPrimitive* primitives,
-    const BvhNode* nodes,
-    int node_count,
+    const PrimitiveRef* primitives,
+    int primitive_count,
     float max_t,
     int batch_idx,
     int skip_kind,
     int skip_idx) {
-  if (node_count > 0) {
-    int stack[kMaxBvhNodes];
-    int stack_size = 0;
-    stack[stack_size++] = 0;
+  const int count = min(primitive_count, kMaxFinitePrimitives);
+  for (int item = 0; item < count; ++item) {
+    const PrimitiveRef primitive = primitives[item];
+    if (primitive.kind == skip_kind && primitive.index == skip_idx) {
+      continue;
+    }
 
-    while (stack_size > 0) {
-      const int node_idx = stack[--stack_size];
-      const BvhNode node = nodes[node_idx];
-      if (!intersect_aabb(ray_origin, light_dir, node.bounds, max_t)) {
-        continue;
+    float t = 0.0f;
+    if (primitive.kind == 1) {
+      const int sphere_offset = (batch_idx * scene.spheres.count + primitive.index);
+      const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
+      const float sphere_radius = scene.spheres.radii[sphere_offset];
+      if (intersect_sphere(ray_origin, light_dir, sphere_center, sphere_radius, &t) && t < max_t) {
+        return true;
       }
-
-      if (node.count > 0) {
-        for (int item = 0; item < node.count; ++item) {
-          const BvhPrimitive primitive = primitives[node.start + item];
-          if (primitive.kind == skip_kind && primitive.index == skip_idx) {
-            continue;
-          }
-
-          float t = 0.0f;
-          if (primitive.kind == 1) {
-            const int sphere_offset = (batch_idx * scene.spheres.count + primitive.index);
-            const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
-            const float sphere_radius = scene.spheres.radii[sphere_offset];
-            if (intersect_sphere(ray_origin, light_dir, sphere_center, sphere_radius, &t) && t < max_t) {
-              return true;
-            }
-          } else {
-            const int box_offset = (batch_idx * scene.boxes.count + primitive.index);
-            const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
-            const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
-            Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
-            if (intersect_box(
-                    ray_origin, light_dir, box_center, box_half_size, scene.boxes.axes + box_offset * 9, &t, &normal) &&
-                t < max_t) {
-              return true;
-            }
-          }
-        }
-      } else {
-        if (node.left >= 0 && stack_size < kMaxBvhNodes) {
-          stack[stack_size++] = node.left;
-        }
-        if (node.right >= 0 && stack_size < kMaxBvhNodes) {
-          stack[stack_size++] = node.right;
-        }
+    } else {
+      const int box_offset = (batch_idx * scene.boxes.count + primitive.index);
+      const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
+      const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
+      Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
+      if (intersect_box(ray_origin, light_dir, box_center, box_half_size, scene.boxes.axes + box_offset * 9, &t, &normal) &&
+          t < max_t) {
+        return true;
       }
     }
   }
 
   // Terrain casting shadows is intentionally disabled in this rasterized-terrain path.
-  // Keeping the old heightfield DDA here can dominate runtime because shadow rays used kFloatMax.
-
   return false;
 }
 
-__device__ __forceinline__ Vec3 apply_lighting(
+__device__ __forceinline__ Vec3 apply_lighting_ref_list(
     Vec3 base_color,
     Vec3 hit,
     Vec3 normal,
     Vec3 ray_dir,
     Vec3 light_dir,
     const SceneView& scene,
-    const BvhPrimitive* primitives,
-    const BvhNode* nodes,
-    int node_count,
+    const PrimitiveRef* primitives,
+    int primitive_count,
     const RenderOptionsView& options,
     Aabb shadow_scene_bounds,
     int shadow_scene_bounds_valid,
@@ -889,13 +770,12 @@ __device__ __forceinline__ Vec3 apply_lighting(
       shadow_bounds_hit = ray_aabb_exit_t(shadow_origin, light_dir, shadow_scene_bounds, &shadow_max_t);
     }
     if (shadow_bounds_hit &&
-        is_shadowed(
+        is_shadowed_ref_list(
             shadow_origin,
             light_dir,
             scene,
             primitives,
-            nodes,
-            node_count,
+            primitive_count,
             shadow_max_t,
             batch_idx,
             skip_kind,
@@ -907,63 +787,46 @@ __device__ __forceinline__ Vec3 apply_lighting(
   return mul(base_color, ambient + direct);
 }
 
-__device__ void intersect_finite_bvh(
+__device__ void intersect_finite_ref_list_depth_range(
     Vec3 ray_origin,
     Vec3 ray_dir,
     const SceneView& scene,
-    const BvhPrimitive* primitives,
-    const BvhNode* nodes,
-    int node_count,
+    const PrimitiveRef* primitives,
+    int primitive_count,
+    float min_t,
+    float max_t,
     int batch_idx,
     HitRecord* hit) {
-  if (node_count <= 0) {
+  const int count = min(primitive_count, kMaxFinitePrimitives);
+  const float clipped_max_t = fminf(max_t, hit->t);
+  if (clipped_max_t <= min_t) {
     return;
   }
 
-  int stack[kMaxBvhNodes];
-  int stack_size = 0;
-  stack[stack_size++] = 0;
-
-  while (stack_size > 0) {
-    const int node_idx = stack[--stack_size];
-    const BvhNode node = nodes[node_idx];
-    if (!intersect_aabb(ray_origin, ray_dir, node.bounds, hit->t)) {
-      continue;
-    }
-
-    if (node.count > 0) {
-      for (int item = 0; item < node.count; ++item) {
-        const BvhPrimitive primitive = primitives[node.start + item];
-        float t = 0.0f;
-        if (primitive.kind == 1) {
-          const int sphere_offset = (batch_idx * scene.spheres.count + primitive.index);
-          const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
-          const float sphere_radius = scene.spheres.radii[sphere_offset];
-          if (intersect_sphere(ray_origin, ray_dir, sphere_center, sphere_radius, &t) && t < hit->t) {
-            hit->t = t;
-            hit->sphere = primitive.index;
-            hit->box = -1;
-          }
-        } else {
-          const int box_offset = (batch_idx * scene.boxes.count + primitive.index);
-          const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
-          const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
-          Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
-          if (intersect_box(ray_origin, ray_dir, box_center, box_half_size, scene.boxes.axes + box_offset * 9, &t, &normal) &&
-              t < hit->t) {
-            hit->t = t;
-            hit->sphere = -1;
-            hit->box = primitive.index;
-            hit->box_normal = normal;
-          }
-        }
+  for (int item = 0; item < count; ++item) {
+    const PrimitiveRef primitive = primitives[item];
+    float t = 0.0f;
+    if (primitive.kind == 1) {
+      const int sphere_offset = (batch_idx * scene.spheres.count + primitive.index);
+      const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
+      const float sphere_radius = scene.spheres.radii[sphere_offset];
+      if (intersect_sphere(ray_origin, ray_dir, sphere_center, sphere_radius, &t) &&
+          t >= min_t && t < clipped_max_t && t < hit->t) {
+        hit->t = t;
+        hit->sphere = primitive.index;
+        hit->box = -1;
       }
     } else {
-      if (node.left >= 0 && stack_size < kMaxBvhNodes) {
-        stack[stack_size++] = node.left;
-      }
-      if (node.right >= 0 && stack_size < kMaxBvhNodes) {
-        stack[stack_size++] = node.right;
+      const int box_offset = (batch_idx * scene.boxes.count + primitive.index);
+      const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
+      const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
+      Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
+      if (intersect_box(ray_origin, ray_dir, box_center, box_half_size, scene.boxes.axes + box_offset * 9, &t, &normal) &&
+          t >= min_t && t < clipped_max_t && t < hit->t) {
+        hit->t = t;
+        hit->sphere = -1;
+        hit->box = primitive.index;
+        hit->box_normal = normal;
       }
     }
   }
@@ -978,18 +841,15 @@ __global__ void render_scene_kernel(
     int height,
     SceneView scene,
     RenderOptionsView options) {
-  __shared__ BvhPrimitive bvh_primitives[kMaxFinitePrimitives];
-  __shared__ BvhNode bvh_nodes[kMaxBvhNodes];
-  __shared__ BvhPrimitive shadow_bvh_primitives[kMaxFinitePrimitives];
-  __shared__ BvhNode shadow_bvh_nodes[kMaxBvhNodes];
-  __shared__ int finite_primitive_count;
-  __shared__ int bvh_node_count;
-  __shared__ int shadow_primitive_count;
-  __shared__ int shadow_bvh_node_count;
+  __shared__ PrimitiveRef primary_cell_primitives[kDepthBins][kMaxFinitePrimitives];
+  __shared__ PrimitiveRef shadow_cell_primitives[kDepthBins][kMaxFinitePrimitives];
+  __shared__ int primary_cell_counts[kDepthBins];
+  __shared__ int shadow_cell_counts[kDepthBins];
   __shared__ LightBasis shadow_light_basis;
-  __shared__ LightBounds block_shadow_receiver_bounds;
+  __shared__ LightBounds shadow_receiver_bounds[kDepthBins];
   __shared__ Aabb shadow_scene_bounds;
   __shared__ int shadow_scene_bounds_valid;
+  __shared__ float block_depth_edges[kDepthBins + 1];
 
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1009,12 +869,12 @@ __global__ void render_scene_kernel(
   const int thread_linear = threadIdx.y * blockDim.x + threadIdx.x;
   const int threads_per_block = blockDim.x * blockDim.y;
 
-  if (thread_linear == 0) {
-    finite_primitive_count = 0;
-    bvh_node_count = 0;
-    shadow_primitive_count = 0;
-    shadow_bvh_node_count = 0;
+  for (int bin = thread_linear; bin < kDepthBins; bin += threads_per_block) {
+    primary_cell_counts[bin] = 0;
+    shadow_cell_counts[bin] = 0;
+  }
 
+  if (thread_linear == 0) {
     const Vec3 block_light_dir = normalize(load_vec3(options.light_dir));
     shadow_light_basis = make_light_basis(block_light_dir);
 
@@ -1046,23 +906,31 @@ __global__ void render_scene_kernel(
       receiver_far_depth = fmaxf(receiver_far_depth, scene.terrain.depth_limits[batch_idx]);
     }
     receiver_far_depth = fmaxf(receiver_far_depth + 0.05f, kCameraNear + 0.05f);
+    for (int edge = 0; edge <= kDepthBins; ++edge) {
+      block_depth_edges[edge] = depth_bin_edge(edge, receiver_far_depth);
+    }
 
     const float block_min_edge_x = static_cast<float>(blockIdx.x * blockDim.x);
     const float block_min_edge_y = static_cast<float>(blockIdx.y * blockDim.y);
     const float block_max_edge_x = static_cast<float>(min(width, static_cast<int>((blockIdx.x + 1) * blockDim.x)));
     const float block_max_edge_y = static_cast<float>(min(height, static_cast<int>((blockIdx.y + 1) * blockDim.y)));
-    block_shadow_receiver_bounds = compute_block_receiver_light_bounds(
-        block_min_edge_x,
-        block_min_edge_y,
-        block_max_edge_x,
-        block_max_edge_y,
-        aspect,
-        image_plane_scale,
-        width,
-        height,
-        kCameraNear,
-        receiver_far_depth,
-        shadow_light_basis);
+
+    for (int bin = 0; bin < kDepthBins; ++bin) {
+      const float bin_near_depth = block_depth_edges[bin];
+      const float bin_far_depth = block_depth_edges[bin + 1];
+      shadow_receiver_bounds[bin] = compute_block_receiver_light_bounds(
+          block_min_edge_x,
+          block_min_edge_y,
+          block_max_edge_x,
+          block_max_edge_y,
+          aspect,
+          image_plane_scale,
+          width,
+          height,
+          bin_near_depth,
+          bin_far_depth,
+          shadow_light_basis);
+    }
 
     shadow_scene_bounds_valid = finite_scene_primitive_count > 0 ? 1 : 0;
     shadow_scene_bounds = shadow_scene_bounds_valid ? expand_aabb(finite_scene_bounds, 1.0e-2f) : empty_aabb();
@@ -1074,23 +942,39 @@ __global__ void render_scene_kernel(
     const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
     const float sphere_radius = scene.spheres.radii[sphere_offset];
     const Aabb bounds = sphere_aabb(sphere_center, sphere_radius);
-    if (aabb_can_shadow_block(bounds, block_shadow_receiver_bounds, shadow_light_basis)) {
-      const int shadow_list_idx = atomicAdd(&shadow_primitive_count, 1);
-      shadow_bvh_primitives[shadow_list_idx] = BvhPrimitive{bounds, aabb_centroid(bounds), 1, sphere_idx};
-    }
-    if (sphere_overlaps_block(
-            sphere_center,
-            sphere_radius,
-            aspect,
-            image_plane_scale,
-            width,
-            height,
-            block_min_x,
-            block_min_y,
-            block_max_x,
-            block_max_y)) {
-      const int list_idx = atomicAdd(&finite_primitive_count, 1);
-      bvh_primitives[list_idx] = BvhPrimitive{bounds, aabb_centroid(bounds), 1, sphere_idx};
+
+    float primitive_near_depth = kCameraNear;
+    float primitive_far_depth = kCameraNear;
+    const bool valid_depth_range = aabb_forward_depth_range(bounds, &primitive_near_depth, &primitive_far_depth);
+    const bool primary_overlap = valid_depth_range && sphere_overlaps_block(
+        sphere_center,
+        sphere_radius,
+        aspect,
+        image_plane_scale,
+        width,
+        height,
+        block_min_x,
+        block_min_y,
+        block_max_x,
+        block_max_y);
+
+    #pragma unroll
+    for (int bin = 0; bin < kDepthBins; ++bin) {
+      const float bin_near_depth = block_depth_edges[bin];
+      const float bin_far_depth = block_depth_edges[bin + 1];
+      if (primary_overlap && depth_ranges_overlap(primitive_near_depth, primitive_far_depth, bin_near_depth, bin_far_depth)) {
+        const int list_idx = atomicAdd(&primary_cell_counts[bin], 1);
+        if (list_idx < kMaxFinitePrimitives) {
+          primary_cell_primitives[bin][list_idx] = PrimitiveRef{1, sphere_idx};
+        }
+      }
+
+      if (aabb_can_shadow_block(bounds, shadow_receiver_bounds[bin], shadow_light_basis)) {
+        const int list_idx = atomicAdd(&shadow_cell_counts[bin], 1);
+        if (list_idx < kMaxFinitePrimitives) {
+          shadow_cell_primitives[bin][list_idx] = PrimitiveRef{1, sphere_idx};
+        }
+      }
     }
   }
 
@@ -1099,32 +983,41 @@ __global__ void render_scene_kernel(
     const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
     const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
     const Aabb bounds = box_aabb(box_center, box_half_size, scene.boxes.axes + box_offset * 9);
-    if (aabb_can_shadow_block(bounds, block_shadow_receiver_bounds, shadow_light_basis)) {
-      const int shadow_list_idx = atomicAdd(&shadow_primitive_count, 1);
-      shadow_bvh_primitives[shadow_list_idx] = BvhPrimitive{bounds, aabb_centroid(bounds), 3, box_idx};
-    }
-    if (box_overlaps_block(
-            box_center,
-            box_half_size,
-            scene.boxes.axes + box_offset * 9,
-            aspect,
-            image_plane_scale,
-            width,
-            height,
-            block_min_x,
-            block_min_y,
-            block_max_x,
-            block_max_y)) {
-      const int list_idx = atomicAdd(&finite_primitive_count, 1);
-      bvh_primitives[list_idx] = BvhPrimitive{bounds, aabb_centroid(bounds), 3, box_idx};
-    }
-  }
 
-  __syncthreads();
+    float primitive_near_depth = kCameraNear;
+    float primitive_far_depth = kCameraNear;
+    const bool valid_depth_range = aabb_forward_depth_range(bounds, &primitive_near_depth, &primitive_far_depth);
+    const bool primary_overlap = valid_depth_range && box_overlaps_block(
+        box_center,
+        box_half_size,
+        scene.boxes.axes + box_offset * 9,
+        aspect,
+        image_plane_scale,
+        width,
+        height,
+        block_min_x,
+        block_min_y,
+        block_max_x,
+        block_max_y);
 
-  if (thread_linear == 0) {
-    build_bvh_nodes(bvh_primitives, bvh_nodes, finite_primitive_count, &bvh_node_count);
-    build_bvh_nodes(shadow_bvh_primitives, shadow_bvh_nodes, shadow_primitive_count, &shadow_bvh_node_count);
+    #pragma unroll
+    for (int bin = 0; bin < kDepthBins; ++bin) {
+      const float bin_near_depth = block_depth_edges[bin];
+      const float bin_far_depth = block_depth_edges[bin + 1];
+      if (primary_overlap && depth_ranges_overlap(primitive_near_depth, primitive_far_depth, bin_near_depth, bin_far_depth)) {
+        const int list_idx = atomicAdd(&primary_cell_counts[bin], 1);
+        if (list_idx < kMaxFinitePrimitives) {
+          primary_cell_primitives[bin][list_idx] = PrimitiveRef{3, box_idx};
+        }
+      }
+
+      if (aabb_can_shadow_block(bounds, shadow_receiver_bounds[bin], shadow_light_basis)) {
+        const int list_idx = atomicAdd(&shadow_cell_counts[bin], 1);
+        if (list_idx < kMaxFinitePrimitives) {
+          shadow_cell_primitives[bin][list_idx] = PrimitiveRef{3, box_idx};
+        }
+      }
+    }
   }
 
   __syncthreads();
@@ -1142,11 +1035,46 @@ __global__ void render_scene_kernel(
 
   const Vec3 ray_origin = make_vec3(0.0f, 0.0f, 0.0f);
   const Vec3 ray_dir = normalize(make_vec3(px, py, -1.0f));
+  const float ray_forward_per_t = fmaxf(-ray_dir.z, 1.0e-8f);
 
   Vec3 color = background;
-  HitRecord finite_hit{kFloatMax, -1, -1, -1, make_vec3(0.0f, 0.0f, 0.0f), make_vec3(0.0f, 1.0f, 0.0f)};
-  intersect_finite_bvh(ray_origin, ray_dir, scene, bvh_primitives, bvh_nodes, bvh_node_count, batch_idx, &finite_hit);
-  float closest_t = finite_hit.t;
+  const int map_offset = (batch_idx * height + y) * width + x;
+  float terrain_t = kFloatMax;
+  if (terrain_count > 0 && terrain_depth != nullptr) {
+    terrain_t = terrain_depth[map_offset];
+  }
+
+  HitRecord finite_hit{terrain_t, -1, -1, -1, make_vec3(0.0f, 0.0f, 0.0f), make_vec3(0.0f, 1.0f, 0.0f)};
+  for (int bin = 0; bin < kDepthBins; ++bin) {
+    const float bin_near_depth = block_depth_edges[bin];
+    const float bin_far_depth = block_depth_edges[bin + 1];
+    const float bin_min_t = bin_near_depth / ray_forward_per_t;
+    const float bin_max_t = bin_far_depth / ray_forward_per_t;
+    if (bin_min_t >= finite_hit.t) {
+      break;
+    }
+
+    const int previous_sphere = finite_hit.sphere;
+    const int previous_box = finite_hit.box;
+    intersect_finite_ref_list_depth_range(
+        ray_origin,
+        ray_dir,
+        scene,
+        primary_cell_primitives[bin],
+        primary_cell_counts[bin],
+        bin_min_t,
+        bin_max_t,
+        batch_idx,
+        &finite_hit);
+
+    if (finite_hit.sphere != previous_sphere || finite_hit.box != previous_box) {
+      // Depth bins are processed front-to-back. If the first exact finite hit lies in this bin,
+      // later bins cannot contain a closer finite hit on this same primary ray.
+      break;
+    }
+  }
+
+  float closest_t = (finite_hit.sphere >= 0 || finite_hit.box >= 0) ? finite_hit.t : kFloatMax;
   int closest_sphere = finite_hit.sphere;
   int closest_box = finite_hit.box;
   int closest_terrain = -1;
@@ -1155,9 +1083,7 @@ __global__ void render_scene_kernel(
   Vec3 closest_box_normal = finite_hit.box_normal;
   Vec3 closest_terrain_normal = finite_hit.terrain_normal;
 
-  const int map_offset = (batch_idx * height + y) * width + x;
   if (terrain_count > 0 && terrain_depth != nullptr) {
-    const float terrain_t = terrain_depth[map_offset];
     if (terrain_t < closest_t) {
       closest_t = terrain_t;
       closest_sphere = -1;
@@ -1176,16 +1102,16 @@ __global__ void render_scene_kernel(
     const Vec3 sphere_color = load_vec3(scene.spheres.colors + sphere_offset * 3);
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(sub(hit, sphere_center));
-    color = apply_lighting(
+    const int receiver_bin = depth_to_bin_from_edges(fmaxf(-hit.z, kCameraNear), block_depth_edges);
+    color = apply_lighting_ref_list(
         sphere_color,
         hit,
         normal,
         ray_dir,
         light_dir,
         scene,
-        shadow_bvh_primitives,
-        shadow_bvh_nodes,
-        shadow_bvh_node_count,
+        shadow_cell_primitives[receiver_bin],
+        shadow_cell_counts[receiver_bin],
         options,
         shadow_scene_bounds,
         shadow_scene_bounds_valid,
@@ -1199,16 +1125,16 @@ __global__ void render_scene_kernel(
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(closest_box_normal);
     const Vec3 box_color = load_vec3(scene.boxes.colors + box_offset * 3);
-    color = apply_lighting(
+    const int receiver_bin = depth_to_bin_from_edges(fmaxf(-hit.z, kCameraNear), block_depth_edges);
+    color = apply_lighting_ref_list(
         box_color,
         hit,
         normal,
         ray_dir,
         light_dir,
         scene,
-        shadow_bvh_primitives,
-        shadow_bvh_nodes,
-        shadow_bvh_node_count,
+        shadow_cell_primitives[receiver_bin],
+        shadow_cell_counts[receiver_bin],
         options,
         shadow_scene_bounds,
         shadow_scene_bounds_valid,
@@ -1220,16 +1146,16 @@ __global__ void render_scene_kernel(
     semantic_id = 2;
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 terrain_color = load_vec3(scene.terrain.colors + batch_idx * 3);
-    color = apply_lighting(
+    const int receiver_bin = depth_to_bin_from_edges(fmaxf(-hit.z, kCameraNear), block_depth_edges);
+    color = apply_lighting_ref_list(
         terrain_color,
         hit,
         closest_terrain_normal,
         ray_dir,
         light_dir,
         scene,
-        shadow_bvh_primitives,
-        shadow_bvh_nodes,
-        shadow_bvh_node_count,
+        shadow_cell_primitives[receiver_bin],
+        shadow_cell_counts[receiver_bin],
         options,
         shadow_scene_bounds,
         shadow_scene_bounds_valid,
