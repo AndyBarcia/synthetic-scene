@@ -1,5 +1,7 @@
 #include <torch/extension.h>
 
+#include "random_objects.h"
+
 #include <ATen/CPUGeneratorImpl.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <algorithm>
@@ -8,6 +10,13 @@
 #include <vector>
 
 namespace py = pybind11;
+using synthetic_scene::Mat3;
+using synthetic_scene::RandomPrimitiveWriter;
+using synthetic_scene::Vec3;
+using synthetic_scene::add_random_house;
+using synthetic_scene::add_random_tree;
+using synthetic_scene::append_mat3;
+using synthetic_scene::append_vec3;
 
 namespace {
 
@@ -16,16 +25,6 @@ constexpr int kRandomSceneMaxBoxes = 64;
 constexpr int kRandomSceneMaxPrisms = 64;
 constexpr int kRandomSceneMaxCylinders = 64;
 constexpr float kTau = 6.28318530717958647692f;
-
-struct Vec3 {
-  float x;
-  float y;
-  float z;
-};
-
-struct Mat3 {
-  Vec3 rows[3];
-};
 
 float rand_float(at::Generator& generator, float low, float high) {
   if (low == high) {
@@ -36,59 +35,10 @@ float rand_float(at::Generator& generator, float low, float high) {
       .item<float>();
 }
 
-int rand_int(at::Generator& generator, int low, int high) {
-  if (low == high) {
-    return low;
-  }
-  return torch::randint(
-             low,
-             high + 1,
-             {},
-             c10::optional<at::Generator>(generator),
-             torch::TensorOptions().dtype(torch::kInt64))
-      .item<int64_t>();
-}
-
 Vec3 normalize3(Vec3 vector) {
   const float length = std::sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z);
   TORCH_CHECK(length > 1.0e-8f, "expected a non-zero vector");
   return Vec3{vector.x / length, vector.y / length, vector.z / length};
-}
-
-Vec3 cross3(Vec3 a, Vec3 b) {
-  return Vec3{
-      a.y * b.z - a.z * b.y,
-      a.z * b.x - a.x * b.z,
-      a.x * b.y - a.y * b.x,
-  };
-}
-
-Vec3 random_color(at::Generator& generator) {
-  const float hue = rand_float(generator, 0.0f, 1.0f);
-  const float saturation = rand_float(generator, 0.55f, 0.95f);
-  const float value = rand_float(generator, 0.55f, 1.0f);
-  int sector = static_cast<int>(hue * 6.0f);
-  const float frac = hue * 6.0f - static_cast<float>(sector);
-  const float p = value * (1.0f - saturation);
-  const float q = value * (1.0f - frac * saturation);
-  const float t = value * (1.0f - (1.0f - frac) * saturation);
-  sector %= 6;
-  if (sector == 0) {
-    return Vec3{value, t, p};
-  }
-  if (sector == 1) {
-    return Vec3{q, value, p};
-  }
-  if (sector == 2) {
-    return Vec3{p, value, t};
-  }
-  if (sector == 3) {
-    return Vec3{p, q, value};
-  }
-  if (sector == 4) {
-    return Vec3{t, p, value};
-  }
-  return Vec3{value, p, q};
 }
 
 Vec3 random_frustum_point(
@@ -114,34 +64,6 @@ Mat3 yaw_axes(float yaw) {
   const float cos_yaw = std::cos(yaw);
   const float sin_yaw = std::sin(yaw);
   return Mat3{{Vec3{cos_yaw, 0.0f, -sin_yaw}, Vec3{0.0f, 1.0f, 0.0f}, Vec3{sin_yaw, 0.0f, cos_yaw}}};
-}
-
-Mat3 axes_from_height_axis(Vec3 height_axis) {
-  const Vec3 axis_y = normalize3(height_axis);
-  const Vec3 helper = std::fabs(axis_y.y) < 0.999f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
-  const Vec3 axis_x = normalize3(cross3(helper, axis_y));
-  const Vec3 axis_z = cross3(axis_y, axis_x);
-  return Mat3{{axis_x, axis_y, axis_z}};
-}
-
-Mat3 random_axes(at::Generator& generator) {
-  return axes_from_height_axis(Vec3{
-      rand_float(generator, -1.0f, 1.0f),
-      rand_float(generator, -1.0f, 1.0f),
-      rand_float(generator, -1.0f, 1.0f),
-  });
-}
-
-void append_vec3(std::vector<float>& values, Vec3 vector) {
-  values.push_back(vector.x);
-  values.push_back(vector.y);
-  values.push_back(vector.z);
-}
-
-void append_mat3(std::vector<float>& values, Mat3 matrix) {
-  for (const Vec3& row : matrix.rows) {
-    append_vec3(values, row);
-  }
 }
 
 float smooth_height(float x, float z, float phase_x, float phase_z) {
@@ -259,8 +181,6 @@ bool require_bool(py::dict values, const char* key) {
 
 py::dict random_scene(
     int64_t seed,
-    int ground_objects,
-    int floating_objects,
     int batch_size,
     float scatter_radius,
     float ground_y,
@@ -268,10 +188,12 @@ py::dict random_scene(
     float dz,
     float dz_growth,
     float fov_degrees,
-    float aspect_ratio) {
+    float aspect_ratio,
+    int house_count,
+    int tree_count) {
   TORCH_CHECK(c10::cuda::device_count() > 0, "CUDA is required to generate a native random scene");
-  TORCH_CHECK(ground_objects >= 0 && floating_objects >= 0, "object counts must be non-negative");
-  TORCH_CHECK(ground_objects + floating_objects > 0, "at least one non-plane object is required");
+  TORCH_CHECK(house_count >= 0 && tree_count >= 0, "composite object counts must be non-negative");
+  TORCH_CHECK(house_count + tree_count > 0, "at least one composite object is required");
   TORCH_CHECK(batch_size > 0, "batch_size must be positive");
   TORCH_CHECK(scatter_radius > 0.0f, "scatter_radius must be positive");
   TORCH_CHECK(depth_limit > 0.0f, "depth_limit must be positive");
@@ -285,22 +207,30 @@ py::dict random_scene(
   std::vector<float> sphere_radii;
   std::vector<float> sphere_colors;
   std::vector<int32_t> sphere_counts;
+  std::vector<int32_t> sphere_class_ids;
+  std::vector<int32_t> sphere_instance_ids;
   std::vector<float> box_centers;
   std::vector<float> box_half_sizes;
   std::vector<float> box_axes;
   std::vector<float> box_colors;
   std::vector<int32_t> box_counts;
+  std::vector<int32_t> box_class_ids;
+  std::vector<int32_t> box_instance_ids;
   std::vector<float> prism_centers;
   std::vector<float> prism_half_sizes;
   std::vector<float> prism_axes;
   std::vector<float> prism_colors;
   std::vector<int32_t> prism_counts;
+  std::vector<int32_t> prism_class_ids;
+  std::vector<int32_t> prism_instance_ids;
   std::vector<float> cylinder_centers;
   std::vector<float> cylinder_radii;
   std::vector<float> cylinder_half_heights;
   std::vector<float> cylinder_axes;
   std::vector<float> cylinder_colors;
   std::vector<int32_t> cylinder_counts;
+  std::vector<int32_t> cylinder_class_ids;
+  std::vector<int32_t> cylinder_instance_ids;
   std::vector<float> terrain_base_heights;
   std::vector<float> terrain_depth_limits;
   std::vector<float> terrain_phase_xs;
@@ -309,11 +239,10 @@ py::dict random_scene(
   std::vector<float> terrain_dz_growth;
   std::vector<float> terrain_colors;
   std::vector<int32_t> terrain_counts;
-  const int max_objects = ground_objects + floating_objects;
-  const int64_t sphere_count = static_cast<int64_t>(max_objects);
-  const int64_t box_count = static_cast<int64_t>(max_objects);
-  const int64_t prism_count = static_cast<int64_t>(max_objects);
-  const int64_t cylinder_count = static_cast<int64_t>(max_objects);
+  const int64_t sphere_count = static_cast<int64_t>(tree_count);
+  const int64_t box_count = static_cast<int64_t>(house_count);
+  const int64_t prism_count = static_cast<int64_t>(house_count);
+  const int64_t cylinder_count = static_cast<int64_t>(tree_count);
   TORCH_CHECK(
       sphere_count <= kRandomSceneMaxSpheres && box_count <= kRandomSceneMaxBoxes && prism_count <= kRandomSceneMaxPrisms &&
           cylinder_count <= kRandomSceneMaxCylinders,
@@ -337,36 +266,40 @@ py::dict random_scene(
     int scene_boxes = 0;
     int scene_prisms = 0;
     int scene_cylinders = 0;
-    auto add_sphere = [&](Vec3 center, float radius) {
-      append_vec3(sphere_centers, center);
-      sphere_radii.push_back(radius);
-      append_vec3(sphere_colors, random_color(generator));
-      ++scene_spheres;
+    int next_instance_id = 1;
+    RandomPrimitiveWriter writer{
+        sphere_centers,
+        sphere_radii,
+        sphere_colors,
+        sphere_class_ids,
+        sphere_instance_ids,
+        scene_spheres,
+        box_centers,
+        box_half_sizes,
+        box_axes,
+        box_colors,
+        box_class_ids,
+        box_instance_ids,
+        scene_boxes,
+        prism_centers,
+        prism_half_sizes,
+        prism_axes,
+        prism_colors,
+        prism_class_ids,
+        prism_instance_ids,
+        scene_prisms,
+        cylinder_centers,
+        cylinder_radii,
+        cylinder_half_heights,
+        cylinder_axes,
+        cylinder_colors,
+        cylinder_class_ids,
+        cylinder_instance_ids,
+        scene_cylinders,
     };
-    auto add_box = [&](Vec3 center, Vec3 half_size, Mat3 axes) {
-      append_vec3(box_centers, center);
-      append_vec3(box_half_sizes, half_size);
-      append_mat3(box_axes, axes);
-      append_vec3(box_colors, random_color(generator));
-      ++scene_boxes;
-    };
-    auto add_prism = [&](Vec3 center, Vec3 half_size, Mat3 axes) {
-      append_vec3(prism_centers, center);
-      append_vec3(prism_half_sizes, half_size);
-      append_mat3(prism_axes, axes);
-      append_vec3(prism_colors, random_color(generator));
-      ++scene_prisms;
-    };
-    auto add_cylinder = [&](Vec3 center, float radius, float half_height, Mat3 axes) {
-      append_vec3(cylinder_centers, center);
-      cylinder_radii.push_back(radius);
-      cylinder_half_heights.push_back(half_height);
-      append_mat3(cylinder_axes, axes);
-      append_vec3(cylinder_colors, random_color(generator));
-      ++scene_cylinders;
-    };
+    auto object_rand_float = [&](float low, float high) { return rand_float(generator, low, high); };
 
-    for (int i = 0; i < ground_objects; ++i) {
+    for (int i = 0; i < house_count; ++i) {
       const Vec3 frustum_point = random_frustum_point(
           generator,
           fov_degrees,
@@ -375,105 +308,66 @@ py::dict random_scene(
           2.0f + scatter_radius,
           -0.82f,
           -0.18f);
-      const float x = frustum_point.x;
-      const float z = frustum_point.z;
-      const float terrain_y = terrain_base_height + smooth_height(x, z, phase_x, phase_z);
-      const float primitive_pick = rand_float(generator, 0.0f, 1.0f);
-      if (primitive_pick < 0.36f) {
-        const float radius = rand_float(generator, 0.18f, 0.65f);
-        add_sphere(Vec3{x, terrain_y + radius, z}, radius);
-      } else if (primitive_pick < 0.62f) {
-        const Vec3 half_size{
-            rand_float(generator, 0.18f, 0.6f),
-            rand_float(generator, 0.18f, 0.75f),
-            rand_float(generator, 0.18f, 0.6f),
-        };
-        add_box(Vec3{x, terrain_y + half_size.y, z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
-      } else if (primitive_pick < 0.82f) {
-        const Vec3 half_size{
-            rand_float(generator, 0.20f, 0.65f),
-            rand_float(generator, 0.22f, 0.75f),
-            rand_float(generator, 0.18f, 0.6f),
-        };
-        add_prism(Vec3{x, terrain_y + half_size.y, z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
-      } else {
-        const float radius = rand_float(generator, 0.16f, 0.45f);
-        const float half_height = rand_float(generator, 0.25f, 0.8f);
-        add_cylinder(
-            Vec3{x, terrain_y + half_height, z},
-            radius,
-            half_height,
-            yaw_axes(rand_float(generator, 0.0f, kTau)));
-      }
+      const float terrain_y = terrain_base_height + smooth_height(frustum_point.x, frustum_point.z, phase_x, phase_z);
+      add_random_house(
+          writer,
+          Vec3{frustum_point.x, terrain_y, frustum_point.z},
+          yaw_axes(rand_float(generator, -3.14159265f, 3.14159265f)),
+          next_instance_id++,
+          object_rand_float);
     }
 
-    for (int i = 0; i < floating_objects; ++i) {
+    for (int i = 0; i < tree_count; ++i) {
       const Vec3 frustum_point = random_frustum_point(
           generator,
           fov_degrees,
           aspect_ratio,
-          1.8f,
-          2.0f + scatter_radius * 0.9f,
-          0.15f,
-          0.85f);
-      const float x = frustum_point.x;
-      const float y = frustum_point.y;
-      const float z = frustum_point.z;
-      const float primitive_pick = rand_float(generator, 0.0f, 1.0f);
-      if (primitive_pick < 0.40f) {
-        const float radius = rand_float(generator, 0.15f, 0.5f);
-        add_sphere(Vec3{x, y, z}, radius);
-      } else if (primitive_pick < 0.62f) {
-        const Vec3 half_size{
-            rand_float(generator, 0.14f, 0.45f),
-            rand_float(generator, 0.14f, 0.45f),
-            rand_float(generator, 0.14f, 0.45f),
-        };
-        add_box(Vec3{x, y, z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
-      } else if (primitive_pick < 0.80f) {
-        const Vec3 half_size{
-            rand_float(generator, 0.14f, 0.5f),
-            rand_float(generator, 0.14f, 0.5f),
-            rand_float(generator, 0.14f, 0.5f),
-        };
-        add_prism(Vec3{x, y, z}, half_size, random_axes(generator));
-      } else {
-        const float radius = rand_float(generator, 0.12f, 0.36f);
-        const float half_height = rand_float(generator, 0.22f, 0.7f);
-        add_cylinder(Vec3{x, y, z}, radius, half_height, random_axes(generator));
-      }
+          2.0f,
+          2.0f + scatter_radius,
+          -0.82f,
+          -0.18f);
+      const float terrain_y = terrain_base_height + smooth_height(frustum_point.x, frustum_point.z, phase_x, phase_z);
+      add_random_tree(writer, Vec3{frustum_point.x, terrain_y, frustum_point.z}, yaw_axes(0.0f), next_instance_id++, object_rand_float);
     }
 
     const int real_spheres = scene_spheres;
     const int real_boxes = scene_boxes;
     const int real_prisms = scene_prisms;
     const int real_cylinders = scene_cylinders;
-    while (scene_spheres < max_objects) {
+    while (scene_spheres < sphere_count) {
       append_vec3(sphere_centers, Vec3{0.0f, 0.0f, -1.0f});
       sphere_radii.push_back(1.0f);
       append_vec3(sphere_colors, Vec3{0.0f, 0.0f, 0.0f});
+      sphere_class_ids.push_back(0);
+      sphere_instance_ids.push_back(0);
       ++scene_spheres;
     }
-    while (scene_boxes < max_objects) {
+    while (scene_boxes < box_count) {
       append_vec3(box_centers, Vec3{0.0f, 0.0f, -1.0f});
       append_vec3(box_half_sizes, Vec3{1.0f, 1.0f, 1.0f});
       append_mat3(box_axes, yaw_axes(0.0f));
       append_vec3(box_colors, Vec3{0.0f, 0.0f, 0.0f});
+      box_class_ids.push_back(0);
+      box_instance_ids.push_back(0);
       ++scene_boxes;
     }
-    while (scene_prisms < max_objects) {
+    while (scene_prisms < prism_count) {
       append_vec3(prism_centers, Vec3{0.0f, 0.0f, -1.0f});
       append_vec3(prism_half_sizes, Vec3{1.0f, 1.0f, 1.0f});
       append_mat3(prism_axes, yaw_axes(0.0f));
       append_vec3(prism_colors, Vec3{0.0f, 0.0f, 0.0f});
+      prism_class_ids.push_back(0);
+      prism_instance_ids.push_back(0);
       ++scene_prisms;
     }
-    while (scene_cylinders < max_objects) {
+    while (scene_cylinders < cylinder_count) {
       append_vec3(cylinder_centers, Vec3{0.0f, 0.0f, -1.0f});
       cylinder_radii.push_back(1.0f);
       cylinder_half_heights.push_back(1.0f);
       append_mat3(cylinder_axes, yaw_axes(0.0f));
       append_vec3(cylinder_colors, Vec3{0.0f, 0.0f, 0.0f});
+      cylinder_class_ids.push_back(0);
+      cylinder_instance_ids.push_back(0);
       ++scene_cylinders;
     }
     sphere_counts.push_back(static_cast<int32_t>(real_spheres));
@@ -490,6 +384,8 @@ py::dict random_scene(
   result["sphere_radii"] = make_cuda_tensor(std::move(sphere_radii), {batch_size, sphere_count});
   result["sphere_colors"] = make_cuda_tensor(std::move(sphere_colors), {batch_size, sphere_count, 3});
   result["sphere_counts"] = make_cuda_int_tensor(std::move(sphere_counts), {batch_size});
+  result["sphere_class_ids"] = make_cuda_int_tensor(std::move(sphere_class_ids), {batch_size, sphere_count});
+  result["sphere_instance_ids"] = make_cuda_int_tensor(std::move(sphere_instance_ids), {batch_size, sphere_count});
   result["plane_points"] = make_cuda_tensor(std::move(plane_points), {batch_size, 0, 3});
   result["plane_normals"] = make_cuda_tensor(std::move(plane_normals), {batch_size, 0, 3});
   result["plane_colors"] = make_cuda_tensor(std::move(plane_colors), {batch_size, 0, 3});
@@ -507,17 +403,23 @@ py::dict random_scene(
   result["box_axes"] = make_cuda_tensor(std::move(box_axes), {batch_size, box_count, 3, 3});
   result["box_colors"] = make_cuda_tensor(std::move(box_colors), {batch_size, box_count, 3});
   result["box_counts"] = make_cuda_int_tensor(std::move(box_counts), {batch_size});
+  result["box_class_ids"] = make_cuda_int_tensor(std::move(box_class_ids), {batch_size, box_count});
+  result["box_instance_ids"] = make_cuda_int_tensor(std::move(box_instance_ids), {batch_size, box_count});
   result["prism_centers"] = make_cuda_tensor(std::move(prism_centers), {batch_size, prism_count, 3});
   result["prism_half_sizes"] = make_cuda_tensor(std::move(prism_half_sizes), {batch_size, prism_count, 3});
   result["prism_axes"] = make_cuda_tensor(std::move(prism_axes), {batch_size, prism_count, 3, 3});
   result["prism_colors"] = make_cuda_tensor(std::move(prism_colors), {batch_size, prism_count, 3});
   result["prism_counts"] = make_cuda_int_tensor(std::move(prism_counts), {batch_size});
+  result["prism_class_ids"] = make_cuda_int_tensor(std::move(prism_class_ids), {batch_size, prism_count});
+  result["prism_instance_ids"] = make_cuda_int_tensor(std::move(prism_instance_ids), {batch_size, prism_count});
   result["cylinder_centers"] = make_cuda_tensor(std::move(cylinder_centers), {batch_size, cylinder_count, 3});
   result["cylinder_radii"] = make_cuda_tensor(std::move(cylinder_radii), {batch_size, cylinder_count});
   result["cylinder_half_heights"] = make_cuda_tensor(std::move(cylinder_half_heights), {batch_size, cylinder_count});
   result["cylinder_axes"] = make_cuda_tensor(std::move(cylinder_axes), {batch_size, cylinder_count, 3, 3});
   result["cylinder_colors"] = make_cuda_tensor(std::move(cylinder_colors), {batch_size, cylinder_count, 3});
   result["cylinder_counts"] = make_cuda_int_tensor(std::move(cylinder_counts), {batch_size});
+  result["cylinder_class_ids"] = make_cuda_int_tensor(std::move(cylinder_class_ids), {batch_size, cylinder_count});
+  result["cylinder_instance_ids"] = make_cuda_int_tensor(std::move(cylinder_instance_ids), {batch_size, cylinder_count});
   return result;
 }
 
@@ -835,8 +737,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "random_scene",
       &random_scene,
       py::arg("seed"),
-      py::arg("ground_objects"),
-      py::arg("floating_objects"),
       py::arg("batch_size"),
       py::arg("scatter_radius"),
       py::arg("ground_y"),
@@ -845,6 +745,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("dz_growth"),
       py::arg("fov_degrees"),
       py::arg("aspect_ratio"),
+      py::arg("house_count"),
+      py::arg("tree_count"),
       "Generate random camera-space scene tensors directly from the native extension");
   m.def("render_scene", &render_scene, "Render Lambert-shaded geometric objects (CUDA)");
 }

@@ -205,16 +205,14 @@ result = render_scene(
 )
 ```
 
-Random scenes always include a generated procedural terrain, include both
-grounded and floating primitives, and generate spheres, boxes, prisms, and
-cylinders by sampling screen-space coordinates within the camera frustum plus a
-camera distance. `house_count` and `tree_count` add randomized composite houses
-and trees with per-object instance IDs and semantic classes `10` and `11`; they
-are placed with the same camera-frustum sampling style as grounded primitives
-and grounded against the generated terrain height.
-The wrapper reserves primitive slots for requested composites before calling the
-native random primitive generator so the CUDA renderer still receives ordinary
-primitive tensors.
+Random scenes always include a generated procedural terrain and random
+composite objects. `house_count` and `tree_count` create randomized houses and
+trees with per-object instance IDs and semantic classes `10` and `11`; they are
+placed with camera-frustum sampling and grounded against the generated terrain
+height.
+The native random scene generator expands composite templates into ordinary
+primitive tensors, so rendering still receives the same sphere, box, prism, and
+cylinder arrays.
 
 ## Benchmark
 

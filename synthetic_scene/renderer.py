@@ -369,29 +369,6 @@ def _optional_field(value: object | None) -> object:
     return () if value is None else value
 
 
-def _copy_active_rows(base: torch.Tensor, base_counts: torch.Tensor, extra: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size = base.shape[0]
-    extra_count = extra.shape[1]
-    total_counts = base_counts + extra_count
-    max_count = int(total_counts.max().item()) if batch_size else 0
-    output = torch.empty((batch_size, max_count, *base.shape[2:]), dtype=base.dtype, device=base.device)
-    for batch_idx in range(batch_size):
-        base_count = int(base_counts[batch_idx].item())
-        total_count = int(total_counts[batch_idx].item())
-        if base_count:
-            output[batch_idx, :base_count] = base[batch_idx, :base_count]
-        if extra_count:
-            output[batch_idx, base_count:total_count] = extra[batch_idx]
-        if total_count < max_count:
-            output[batch_idx, total_count:] = 0
-    return output.contiguous(), total_counts.contiguous()
-
-
-def _copy_active_scalars(base: torch.Tensor, base_counts: torch.Tensor, extra: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    output, counts = _copy_active_rows(base.unsqueeze(-1), base_counts, extra.unsqueeze(-1))
-    return output.squeeze(-1).contiguous(), counts
-
-
 def _empty_scene() -> Scene:
     return Scene(
         spheres=Spheres(centers=(), radii=(), colors=()),
@@ -599,141 +576,10 @@ def flatten_composite_objects(
     )
 
 
-def _random_composite_extras(
-    *,
-    seed: int,
-    batch_size: int,
-    house_count: int,
-    tree_count: int,
-    scatter_radius: float,
-    fov_degrees: float,
-    aspect_ratio: float,
-    terrain_base_heights: torch.Tensor,
-    terrain_phase_xs: torch.Tensor,
-    terrain_phase_zs: torch.Tensor,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    from .composites import HOUSE_CLASS_ID, TREE_CLASS_ID, HouseConfig, TreeConfig, house_scene, tree_scene
-
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(int(seed) + 104729)
-    def rand_float(low: float, high: float) -> float:
-        return float((torch.rand((), generator=generator) * (high - low) + low).item())
-
-    def smooth_height(x: float, z: float, phase_x: float, phase_z: float) -> float:
-        broad = 1.85 * torch.sin(torch.tensor(0.115 * x + 0.62 * phase_x)).item() * torch.cos(torch.tensor(0.052 * z + 0.73 * phase_z)).item()
-        ridge = 1.15 * torch.sin(torch.tensor(0.075 * x - 0.043 * z + 1.7 * phase_x)).item()
-        far_rise = max(0.0, (-z - 5.0) * 0.105)
-        return broad + ridge + far_rise
-
-    def random_frustum_ground_point(batch_idx: int) -> tuple[float, float, float]:
-        fov_radians = fov_degrees * 0.017453292519943295
-        image_plane_scale = torch.tan(torch.tensor(0.5 * fov_radians)).item()
-        ndc_x = rand_float(-1.0, 1.0)
-        ndc_y = rand_float(-0.82, -0.18)
-        px = ndc_x * aspect_ratio * image_plane_scale
-        py = ndc_y * image_plane_scale
-        ray = torch.tensor((px, py, -1.0), dtype=torch.float32)
-        ray = ray / ray.norm()
-        distance = rand_float(2.0, 2.0 + scatter_radius)
-        x = float((ray[0] * distance).item())
-        z = float((ray[2] * distance).item())
-        base_height = float(terrain_base_heights[batch_idx, 0].detach().cpu().item())
-        phase_x = float(terrain_phase_xs[batch_idx, 0].detach().cpu().item())
-        phase_z = float(terrain_phase_zs[batch_idx, 0].detach().cpu().item())
-        y = base_height + smooth_height(x, z, phase_x, phase_z)
-        return x, y, z
-
-    house_boxes = []
-    house_prisms = []
-    tree_spheres = []
-    tree_cylinders = []
-    for batch_idx in range(batch_size):
-        batch_boxes = []
-        batch_prisms = []
-        batch_spheres = []
-        batch_cylinders = []
-        next_instance_id = 100000 + batch_idx * 10000
-        for house_idx in range(house_count):
-            width = rand_float(0.75, 1.65)
-            depth = rand_float(0.65, 1.35)
-            body_height = rand_float(0.55, 1.15)
-            roof_height = rand_float(0.28, 0.60)
-            config = HouseConfig(width=width, depth=depth, body_height=body_height, roof_height=roof_height)
-            local_scene = house_scene(config)
-            x, terrain_y, z = random_frustum_ground_point(batch_idx)
-            yaw = rand_float(-3.14159265, 3.14159265)
-            cos_yaw = torch.cos(torch.tensor(yaw)).item()
-            sin_yaw = torch.sin(torch.tensor(yaw)).item()
-            rotation = torch.tensor(((cos_yaw, 0.0, sin_yaw), (0.0, 1.0, 0.0), (-sin_yaw, 0.0, cos_yaw)), dtype=torch.float32)
-            position = torch.tensor((x, terrain_y, z), dtype=torch.float32)
-            instance_id = next_instance_id + house_idx + 1
-            box_centers = _transform_centers(local_scene.boxes.centers, rotation, position)
-            box_axes = _transform_axes(local_scene.boxes.axes, rotation)
-            prism_centers = _transform_centers(local_scene.prisms.centers, rotation, position)
-            prism_axes = _transform_axes(local_scene.prisms.axes, rotation)
-            batch_boxes.append((box_centers[0], torch.as_tensor(local_scene.boxes.half_sizes, dtype=torch.float32)[0], box_axes[0], torch.as_tensor(local_scene.boxes.colors, dtype=torch.float32)[0], HOUSE_CLASS_ID, instance_id))
-            batch_prisms.append((prism_centers[0], torch.as_tensor(local_scene.prisms.half_sizes, dtype=torch.float32)[0], prism_axes[0], torch.as_tensor(local_scene.prisms.colors, dtype=torch.float32)[0], HOUSE_CLASS_ID, instance_id))
-        for tree_idx in range(tree_count):
-            trunk_height = rand_float(0.65, 1.45)
-            trunk_radius = rand_float(0.06, 0.16)
-            crown_radius = rand_float(0.28, 0.62)
-            config = TreeConfig(trunk_height=trunk_height, trunk_radius=trunk_radius, crown_radius=crown_radius)
-            local_scene = tree_scene(config)
-            x, terrain_y, z = random_frustum_ground_point(batch_idx)
-            position = torch.tensor((x, terrain_y, z), dtype=torch.float32)
-            instance_id = next_instance_id + house_count + tree_idx + 1
-            sphere_centers = _transform_centers(local_scene.spheres.centers, torch.eye(3), position)
-            cylinder_centers = _transform_centers(local_scene.cylinders.centers, torch.eye(3), position)
-            batch_spheres.append((sphere_centers[0], torch.as_tensor(local_scene.spheres.radii, dtype=torch.float32)[0], torch.as_tensor(local_scene.spheres.colors, dtype=torch.float32)[0], TREE_CLASS_ID, instance_id))
-            batch_cylinders.append((cylinder_centers[0], torch.as_tensor(local_scene.cylinders.radii, dtype=torch.float32)[0], torch.as_tensor(local_scene.cylinders.half_heights, dtype=torch.float32)[0], torch.as_tensor(local_scene.cylinders.axes, dtype=torch.float32)[0], torch.as_tensor(local_scene.cylinders.colors, dtype=torch.float32)[0], TREE_CLASS_ID, instance_id))
-        house_boxes.append(batch_boxes)
-        house_prisms.append(batch_prisms)
-        tree_spheres.append(batch_spheres)
-        tree_cylinders.append(batch_cylinders)
-
-    def stack(items: list[list[tuple]], index: int, shape: tuple[int, ...], dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        count = len(items[0]) if items else 0
-        tensor = torch.empty((batch_size, count, *shape), dtype=dtype)
-        for batch_idx, batch_items in enumerate(items):
-            for item_idx, item in enumerate(batch_items):
-                tensor[batch_idx, item_idx] = torch.as_tensor(item[index], dtype=dtype)
-        return tensor.to(device=device).contiguous()
-
-    return {
-        "sphere_centers": stack(tree_spheres, 0, (3,)),
-        "sphere_radii": stack(tree_spheres, 1, ()),
-        "sphere_colors": stack(tree_spheres, 2, (3,)),
-        "sphere_class_ids": stack(tree_spheres, 3, (), torch.int32),
-        "sphere_instance_ids": stack(tree_spheres, 4, (), torch.int32),
-        "box_centers": stack(house_boxes, 0, (3,)),
-        "box_half_sizes": stack(house_boxes, 1, (3,)),
-        "box_axes": stack(house_boxes, 2, (3, 3)),
-        "box_colors": stack(house_boxes, 3, (3,)),
-        "box_class_ids": stack(house_boxes, 4, (), torch.int32),
-        "box_instance_ids": stack(house_boxes, 5, (), torch.int32),
-        "prism_centers": stack(house_prisms, 0, (3,)),
-        "prism_half_sizes": stack(house_prisms, 1, (3,)),
-        "prism_axes": stack(house_prisms, 2, (3, 3)),
-        "prism_colors": stack(house_prisms, 3, (3,)),
-        "prism_class_ids": stack(house_prisms, 4, (), torch.int32),
-        "prism_instance_ids": stack(house_prisms, 5, (), torch.int32),
-        "cylinder_centers": stack(tree_cylinders, 0, (3,)),
-        "cylinder_radii": stack(tree_cylinders, 1, ()),
-        "cylinder_half_heights": stack(tree_cylinders, 2, ()),
-        "cylinder_axes": stack(tree_cylinders, 3, (3, 3)),
-        "cylinder_colors": stack(tree_cylinders, 4, (3,)),
-        "cylinder_class_ids": stack(tree_cylinders, 5, (), torch.int32),
-        "cylinder_instance_ids": stack(tree_cylinders, 6, (), torch.int32),
-    }
-
-
 def random_scene(
     seed: int,
     *,
-    ground_objects: int = 0,
-    floating_objects: int = 0,
-    house_count: int = 50,
+    house_count: int = 10,
     tree_count: int = 50,
     batch_size: int = 4,
     scatter_radius: float = 50.0,
@@ -747,157 +593,89 @@ def random_scene(
     """Generate deterministic random camera-space scenes from a seed."""
     if house_count < 0 or tree_count < 0:
         raise ValueError("house_count and tree_count must be non-negative")
-    reserved_ground_objects = max(0, int(ground_objects) - int(house_count) - int(tree_count))
-    use_dummy_native_object = reserved_ground_objects + int(floating_objects) == 0
-    native = _cuda_renderer.random_scene(
-        int(seed),
-        1 if use_dummy_native_object else int(reserved_ground_objects),
-        int(floating_objects),
-        int(batch_size),
-        float(scatter_radius),
-        float(ground_y),
-        float(depth_limit),
-        float(terrain_dz),
-        float(terrain_dz_growth),
-        float(fov_degrees),
-        float(aspect_ratio),
-    )
-    if use_dummy_native_object:
-        zero_counts = torch.zeros((int(batch_size),), dtype=torch.int32, device=native["sphere_counts"].device)
-        native["sphere_counts"] = zero_counts
-        native["box_counts"] = zero_counts
-        native["prism_counts"] = zero_counts
-        native["cylinder_counts"] = zero_counts
+    if house_count + tree_count <= 0:
+        raise ValueError("at least one composite object is required")
+    try:
+        native = _cuda_renderer.random_scene(
+            int(seed),
+            int(batch_size),
+            float(scatter_radius),
+            float(ground_y),
+            float(depth_limit),
+            float(terrain_dz),
+            float(terrain_dz_growth),
+            float(fov_degrees),
+            float(aspect_ratio),
+            int(house_count),
+            int(tree_count),
+        )
+    except TypeError as error:
+        if "ground_objects" not in str(error) or "floating_objects" not in str(error):
+            raise
+        native = _cuda_renderer.random_scene(
+            int(seed),
+            0,
+            0,
+            int(batch_size),
+            float(scatter_radius),
+            float(ground_y),
+            float(depth_limit),
+            float(terrain_dz),
+            float(terrain_dz_growth),
+            float(fov_degrees),
+            float(aspect_ratio),
+            int(house_count),
+            int(tree_count),
+        )
 
     scene = Scene(
-            spheres=Spheres(
-                centers=native["sphere_centers"],
-                radii=native["sphere_radii"],
-                colors=native["sphere_colors"],
-                counts=native["sphere_counts"],
-            ),
-            terrain=Terrain(
-                base_heights=native["terrain_base_heights"],
-                depth_limits=native["terrain_depth_limits"],
-                phase_xs=native["terrain_phase_xs"],
-                phase_zs=native["terrain_phase_zs"],
-                dz=native["terrain_dz"],
-                dz_growth=native["terrain_dz_growth"],
-                colors=native["terrain_colors"],
-                counts=native["terrain_counts"],
-            ),
-            boxes=OrientedBoxes(
-                centers=native["box_centers"],
-                half_sizes=native["box_half_sizes"],
-                axes=native["box_axes"],
-                colors=native["box_colors"],
-                counts=native["box_counts"],
-            ),
-            prisms=Prisms(
-                centers=native["prism_centers"],
-                half_sizes=native["prism_half_sizes"],
-                axes=native["prism_axes"],
-                colors=native["prism_colors"],
-                counts=native["prism_counts"],
-            ),
-            cylinders=Cylinders(
-                centers=native["cylinder_centers"],
-                radii=native["cylinder_radii"],
-                half_heights=native["cylinder_half_heights"],
-                axes=native["cylinder_axes"],
-                colors=native["cylinder_colors"],
-                counts=native["cylinder_counts"],
-            ),
-        )
-    if house_count or tree_count:
-        extras = _random_composite_extras(
-            seed=seed,
-            batch_size=batch_size,
-            house_count=house_count,
-            tree_count=tree_count,
-            scatter_radius=scatter_radius,
-            fov_degrees=fov_degrees,
-            aspect_ratio=aspect_ratio,
-            terrain_base_heights=scene.terrain.base_heights,
-            terrain_phase_xs=scene.terrain.phase_xs,
-            terrain_phase_zs=scene.terrain.phase_zs,
-            device=native["sphere_centers"].device,
-        )
-        sphere_centers, sphere_counts = _copy_active_rows(scene.spheres.centers, scene.spheres.counts, extras["sphere_centers"])
-        sphere_radii, _ = _copy_active_scalars(scene.spheres.radii, scene.spheres.counts, extras["sphere_radii"])
-        sphere_colors, _ = _copy_active_rows(scene.spheres.colors, scene.spheres.counts, extras["sphere_colors"])
-        sphere_class_ids = _copy_active_scalars(
-            _metadata(None, batch_size=batch_size, count=scene.spheres.centers.shape[1], default_start=1, default_value=1, device=native["sphere_centers"].device),
-            scene.spheres.counts,
-            extras["sphere_class_ids"],
-        )[0]
-        sphere_instance_ids = _copy_active_scalars(
-            _metadata(None, batch_size=batch_size, count=scene.spheres.centers.shape[1], default_start=1, default_value=None, device=native["sphere_centers"].device),
-            scene.spheres.counts,
-            extras["sphere_instance_ids"],
-        )[0]
-
-        box_centers, box_counts = _copy_active_rows(scene.boxes.centers, scene.boxes.counts, extras["box_centers"])
-        box_half_sizes, _ = _copy_active_rows(scene.boxes.half_sizes, scene.boxes.counts, extras["box_half_sizes"])
-        box_axes, _ = _copy_active_rows(scene.boxes.axes, scene.boxes.counts, extras["box_axes"])
-        box_colors, _ = _copy_active_rows(scene.boxes.colors, scene.boxes.counts, extras["box_colors"])
-        box_class_ids = _copy_active_scalars(
-            _metadata(None, batch_size=batch_size, count=scene.boxes.centers.shape[1], default_start=1, default_value=3, device=native["sphere_centers"].device),
-            scene.boxes.counts,
-            extras["box_class_ids"],
-        )[0]
-        box_instance_ids = _copy_active_scalars(
-            _metadata(None, batch_size=batch_size, count=scene.boxes.centers.shape[1], default_start=scene.spheres.centers.shape[1] + 2, default_value=None, device=native["sphere_centers"].device),
-            scene.boxes.counts,
-            extras["box_instance_ids"],
-        )[0]
-
-        prism_centers, prism_counts = _copy_active_rows(scene.prisms.centers, scene.prisms.counts, extras["prism_centers"])
-        prism_half_sizes, _ = _copy_active_rows(scene.prisms.half_sizes, scene.prisms.counts, extras["prism_half_sizes"])
-        prism_axes, _ = _copy_active_rows(scene.prisms.axes, scene.prisms.counts, extras["prism_axes"])
-        prism_colors, _ = _copy_active_rows(scene.prisms.colors, scene.prisms.counts, extras["prism_colors"])
-        prism_class_ids = _copy_active_scalars(
-            _metadata(None, batch_size=batch_size, count=scene.prisms.centers.shape[1], default_start=1, default_value=5, device=native["sphere_centers"].device),
-            scene.prisms.counts,
-            extras["prism_class_ids"],
-        )[0]
-        prism_instance_ids = _copy_active_scalars(
-            _metadata(None, batch_size=batch_size, count=scene.prisms.centers.shape[1], default_start=scene.spheres.centers.shape[1] + scene.boxes.centers.shape[1] + 2, default_value=None, device=native["sphere_centers"].device),
-            scene.prisms.counts,
-            extras["prism_instance_ids"],
-        )[0]
-
-        cylinder_centers, cylinder_counts = _copy_active_rows(scene.cylinders.centers, scene.cylinders.counts, extras["cylinder_centers"])
-        cylinder_radii, _ = _copy_active_scalars(scene.cylinders.radii, scene.cylinders.counts, extras["cylinder_radii"])
-        cylinder_half_heights, _ = _copy_active_scalars(scene.cylinders.half_heights, scene.cylinders.counts, extras["cylinder_half_heights"])
-        cylinder_axes, _ = _copy_active_rows(scene.cylinders.axes, scene.cylinders.counts, extras["cylinder_axes"])
-        cylinder_colors, _ = _copy_active_rows(scene.cylinders.colors, scene.cylinders.counts, extras["cylinder_colors"])
-        cylinder_class_ids = _copy_active_scalars(
-            _metadata(None, batch_size=batch_size, count=scene.cylinders.centers.shape[1], default_start=1, default_value=4, device=native["sphere_centers"].device),
-            scene.cylinders.counts,
-            extras["cylinder_class_ids"],
-        )[0]
-        cylinder_instance_ids = _copy_active_scalars(
-            _metadata(None, batch_size=batch_size, count=scene.cylinders.centers.shape[1], default_start=scene.spheres.centers.shape[1] + scene.boxes.centers.shape[1] + scene.prisms.centers.shape[1] + 2, default_value=None, device=native["sphere_centers"].device),
-            scene.cylinders.counts,
-            extras["cylinder_instance_ids"],
-        )[0]
-        sphere_radii = torch.where(sphere_radii <= 0, torch.ones_like(sphere_radii), sphere_radii)
-        box_half_sizes = torch.where(box_half_sizes <= 0, torch.ones_like(box_half_sizes), box_half_sizes)
-        prism_half_sizes = torch.where(prism_half_sizes <= 0, torch.ones_like(prism_half_sizes), prism_half_sizes)
-        cylinder_radii = torch.where(cylinder_radii <= 0, torch.ones_like(cylinder_radii), cylinder_radii)
-        cylinder_half_heights = torch.where(cylinder_half_heights <= 0, torch.ones_like(cylinder_half_heights), cylinder_half_heights)
-        identity_axes = torch.eye(3, dtype=cylinder_axes.dtype, device=cylinder_axes.device).reshape(1, 1, 3, 3)
-        box_axes = torch.where((box_axes.norm(dim=3, keepdim=True) <= 1.0e-8), identity_axes.expand_as(box_axes), box_axes)
-        prism_axes = torch.where((prism_axes.norm(dim=3, keepdim=True) <= 1.0e-8), identity_axes.expand_as(prism_axes), prism_axes)
-        cylinder_axes = torch.where((cylinder_axes.norm(dim=3, keepdim=True) <= 1.0e-8), identity_axes.expand_as(cylinder_axes), cylinder_axes)
-        scene = Scene(
-            spheres=Spheres(centers=sphere_centers, radii=sphere_radii, colors=sphere_colors, counts=sphere_counts, class_ids=sphere_class_ids, instance_ids=sphere_instance_ids),
-            terrain=scene.terrain,
-            boxes=OrientedBoxes(centers=box_centers, half_sizes=box_half_sizes, axes=box_axes, colors=box_colors, counts=box_counts, class_ids=box_class_ids, instance_ids=box_instance_ids),
-            prisms=Prisms(centers=prism_centers, half_sizes=prism_half_sizes, axes=prism_axes, colors=prism_colors, counts=prism_counts, class_ids=prism_class_ids, instance_ids=prism_instance_ids),
-            cylinders=Cylinders(centers=cylinder_centers, radii=cylinder_radii, half_heights=cylinder_half_heights, axes=cylinder_axes, colors=cylinder_colors, counts=cylinder_counts, class_ids=cylinder_class_ids, instance_ids=cylinder_instance_ids),
-        )
+        spheres=Spheres(
+            centers=native["sphere_centers"],
+            radii=native["sphere_radii"],
+            colors=native["sphere_colors"],
+            counts=native["sphere_counts"],
+            class_ids=native["sphere_class_ids"],
+            instance_ids=native["sphere_instance_ids"],
+        ),
+        terrain=Terrain(
+            base_heights=native["terrain_base_heights"],
+            depth_limits=native["terrain_depth_limits"],
+            phase_xs=native["terrain_phase_xs"],
+            phase_zs=native["terrain_phase_zs"],
+            dz=native["terrain_dz"],
+            dz_growth=native["terrain_dz_growth"],
+            colors=native["terrain_colors"],
+            counts=native["terrain_counts"],
+        ),
+        boxes=OrientedBoxes(
+            centers=native["box_centers"],
+            half_sizes=native["box_half_sizes"],
+            axes=native["box_axes"],
+            colors=native["box_colors"],
+            counts=native["box_counts"],
+            class_ids=native["box_class_ids"],
+            instance_ids=native["box_instance_ids"],
+        ),
+        prisms=Prisms(
+            centers=native["prism_centers"],
+            half_sizes=native["prism_half_sizes"],
+            axes=native["prism_axes"],
+            colors=native["prism_colors"],
+            counts=native["prism_counts"],
+            class_ids=native["prism_class_ids"],
+            instance_ids=native["prism_instance_ids"],
+        ),
+        cylinders=Cylinders(
+            centers=native["cylinder_centers"],
+            radii=native["cylinder_radii"],
+            half_heights=native["cylinder_half_heights"],
+            axes=native["cylinder_axes"],
+            colors=native["cylinder_colors"],
+            counts=native["cylinder_counts"],
+            class_ids=native["cylinder_class_ids"],
+            instance_ids=native["cylinder_instance_ids"],
+        ),
+    )
     return RandomScene(
         scene=scene,
     )

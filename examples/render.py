@@ -5,7 +5,7 @@ import torch
 from synthetic_scene import colorize_label_map, random_scene, render_scene, save_image
 
 
-RANDOM_SCENE_SEED = 42
+RANDOM_SCENE_SEED = 44
 
 
 def main() -> None:
