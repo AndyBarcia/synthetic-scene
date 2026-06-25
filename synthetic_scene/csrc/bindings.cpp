@@ -13,7 +13,10 @@ namespace py = pybind11;
 using synthetic_scene::Mat3;
 using synthetic_scene::RandomPrimitiveWriter;
 using synthetic_scene::Vec3;
+using synthetic_scene::add_random_car;
+using synthetic_scene::add_random_cloud;
 using synthetic_scene::add_random_house;
+using synthetic_scene::add_random_person;
 using synthetic_scene::add_random_tree;
 using synthetic_scene::append_mat3;
 using synthetic_scene::append_vec3;
@@ -193,10 +196,15 @@ py::dict random_scene(
     float fov_degrees,
     float aspect_ratio,
     int house_count,
-    int tree_count) {
+    int tree_count,
+    int cloud_count,
+    int car_count,
+    int person_count) {
   TORCH_CHECK(c10::cuda::device_count() > 0, "CUDA is required to generate a native random scene");
-  TORCH_CHECK(house_count >= 0 && tree_count >= 0, "composite object counts must be non-negative");
-  TORCH_CHECK(house_count + tree_count > 0, "at least one composite object is required");
+  TORCH_CHECK(
+      house_count >= 0 && tree_count >= 0 && cloud_count >= 0 && car_count >= 0 && person_count >= 0,
+      "composite object counts must be non-negative");
+  TORCH_CHECK(house_count + tree_count + cloud_count + car_count + person_count > 0, "at least one composite object is required");
   TORCH_CHECK(batch_size > 0, "batch_size must be positive");
   TORCH_CHECK(scatter_radius > 0.0f, "scatter_radius must be positive");
   TORCH_CHECK(depth_limit > 0.0f, "depth_limit must be positive");
@@ -242,10 +250,10 @@ py::dict random_scene(
   std::vector<float> terrain_dz_growth;
   std::vector<float> terrain_colors;
   std::vector<int32_t> terrain_counts;
-  const int64_t sphere_count = static_cast<int64_t>(tree_count);
-  const int64_t box_count = static_cast<int64_t>(house_count);
+  const int64_t sphere_count = static_cast<int64_t>(tree_count + cloud_count * 3 + person_count);
+  const int64_t box_count = static_cast<int64_t>(house_count + car_count + person_count * 5);
   const int64_t prism_count = static_cast<int64_t>(house_count);
-  const int64_t cylinder_count = static_cast<int64_t>(tree_count);
+  const int64_t cylinder_count = static_cast<int64_t>(tree_count + car_count * 4);
   TORCH_CHECK(
       sphere_count <= kRandomSceneMaxSpheres && box_count <= kRandomSceneMaxBoxes && prism_count <= kRandomSceneMaxPrisms &&
           cylinder_count <= kRandomSceneMaxCylinders,
@@ -331,6 +339,59 @@ py::dict random_scene(
           -0.18f);
       const float terrain_y = terrain_base_height + smooth_height(frustum_point.x, frustum_point.z, phase_x, phase_z);
       add_random_tree(writer, Vec3{frustum_point.x, terrain_y, frustum_point.z}, yaw_axes(0.0f), next_instance_id++, object_rand_float);
+    }
+
+    for (int i = 0; i < cloud_count; ++i) {
+      const Vec3 frustum_point = random_frustum_point(
+          generator,
+          fov_degrees,
+          aspect_ratio,
+          5.0f,
+          5.0f + scatter_radius,
+          0.24f,
+          0.88f);
+      add_random_cloud(
+          writer,
+          Vec3{frustum_point.x, frustum_point.y + 1.8f, frustum_point.z},
+          yaw_axes(rand_float(generator, -3.14159265f, 3.14159265f)),
+          next_instance_id++,
+          object_rand_float);
+    }
+
+    for (int i = 0; i < car_count; ++i) {
+      const Vec3 frustum_point = random_frustum_point(
+          generator,
+          fov_degrees,
+          aspect_ratio,
+          2.0f,
+          2.0f + scatter_radius,
+          -0.82f,
+          -0.18f);
+      const float terrain_y = terrain_base_height + smooth_height(frustum_point.x, frustum_point.z, phase_x, phase_z);
+      add_random_car(
+          writer,
+          Vec3{frustum_point.x, terrain_y, frustum_point.z},
+          yaw_axes(rand_float(generator, -3.14159265f, 3.14159265f)),
+          next_instance_id++,
+          object_rand_float);
+    }
+
+    for (int i = 0; i < person_count; ++i) {
+      const Vec3 frustum_point = random_frustum_point(
+          generator,
+          fov_degrees,
+          aspect_ratio,
+          2.0f,
+          2.0f + scatter_radius,
+          -0.82f,
+          -0.18f);
+      const float terrain_y = terrain_base_height + smooth_height(frustum_point.x, frustum_point.z, phase_x, phase_z);
+      add_random_person(
+          writer,
+          Vec3{frustum_point.x, terrain_y, frustum_point.z},
+          yaw_axes(rand_float(generator, -3.14159265f, 3.14159265f)),
+          next_instance_id++,
+          object_rand_float);
     }
 
     const int real_spheres = scene_spheres;
@@ -750,6 +811,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("aspect_ratio"),
       py::arg("house_count"),
       py::arg("tree_count"),
+      py::arg("cloud_count"),
+      py::arg("car_count"),
+      py::arg("person_count"),
       "Generate random camera-space scene tensors directly from the native extension");
   m.def("render_scene", &render_scene, "Render Lambert-shaded geometric objects (CUDA)");
 }

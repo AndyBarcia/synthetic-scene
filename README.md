@@ -138,7 +138,21 @@ positioned, rotated, and flattened into raw primitives before rendering. Terrain
 cannot be part of a composite object; pass it through `base_scene` if needed.
 
 ```python
-from synthetic_scene import HouseConfig, Scene, Spheres, Terrain, TreeConfig, flatten_composite_objects, make_house, make_tree
+from synthetic_scene import (
+    CarConfig,
+    HouseConfig,
+    PersonConfig,
+    Scene,
+    Spheres,
+    Terrain,
+    TreeConfig,
+    flatten_composite_objects,
+    make_car,
+    make_cloud,
+    make_house,
+    make_person,
+    make_tree,
+)
 
 base_scene = Scene(
     spheres=Spheres(centers=(), radii=(), colors=()),
@@ -175,6 +189,9 @@ scene = flatten_composite_objects([
         config=TreeConfig(trunk_height=1.25, trunk_radius=0.12, crown_radius=0.52),
         position=(1.8, -1.0, -4.2),
     ),
+    make_cloud(instance_id=3001, position=(0.5, 1.2, -5.0)),
+    make_car(instance_id=4001, config=CarConfig(body_color=(0.8, 0.1, 0.08)), position=(-0.2, -1.0, -2.9)),
+    make_person(instance_id=5001, config=PersonConfig(height=1.15), position=(1.1, -1.0, -3.0)),
 ], base_scene=base_scene)
 ```
 
@@ -192,6 +209,9 @@ generated = random_scene(
     batch_size=8,
     house_count=3,
     tree_count=8,
+    cloud_count=2,
+    car_count=2,
+    person_count=4,
     aspect_ratio=width / height,
     depth_limit=7.0,
     terrain_dz=0.05,
@@ -206,10 +226,11 @@ result = render_scene(
 ```
 
 Random scenes always include a generated procedural terrain and random
-composite objects. `house_count` and `tree_count` create randomized houses and
-trees with per-object instance IDs and semantic classes `10` and `11`; they are
-placed with camera-frustum sampling and grounded against the generated terrain
-height.
+composite objects. `house_count`, `tree_count`, `cloud_count`, `car_count`, and
+`person_count` create randomized houses, trees, clouds, cars, and people with
+per-object instance IDs and semantic classes `10` through `14`. Ground objects
+are placed with camera-frustum sampling and grounded against the generated
+terrain height; clouds are sampled in the upper frustum.
 The native random scene generator expands composite templates into ordinary
 primitive tensors, so rendering still receives the same sphere, box, prism, and
 cylinder arrays.

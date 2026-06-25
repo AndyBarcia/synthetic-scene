@@ -580,7 +580,10 @@ def random_scene(
     seed: int,
     *,
     house_count: int = 10,
-    tree_count: int = 50,
+    tree_count: int = 10,
+    cloud_count: int = 5,
+    car_count: int = 5,
+    person_count: int = 5,
     batch_size: int = 4,
     scatter_radius: float = 50.0,
     ground_y: float = -1.0,
@@ -591,42 +594,26 @@ def random_scene(
     aspect_ratio: float = 1.5,
 ) -> RandomScene:
     """Generate deterministic random camera-space scenes from a seed."""
-    if house_count < 0 or tree_count < 0:
-        raise ValueError("house_count and tree_count must be non-negative")
-    if house_count + tree_count <= 0:
+    if min(house_count, tree_count, cloud_count, car_count, person_count) < 0:
+        raise ValueError("composite object counts must be non-negative")
+    if house_count + tree_count + cloud_count + car_count + person_count <= 0:
         raise ValueError("at least one composite object is required")
-    try:
-        native = _cuda_renderer.random_scene(
-            int(seed),
-            int(batch_size),
-            float(scatter_radius),
-            float(ground_y),
-            float(depth_limit),
-            float(terrain_dz),
-            float(terrain_dz_growth),
-            float(fov_degrees),
-            float(aspect_ratio),
-            int(house_count),
-            int(tree_count),
-        )
-    except TypeError as error:
-        if "ground_objects" not in str(error) or "floating_objects" not in str(error):
-            raise
-        native = _cuda_renderer.random_scene(
-            int(seed),
-            0,
-            0,
-            int(batch_size),
-            float(scatter_radius),
-            float(ground_y),
-            float(depth_limit),
-            float(terrain_dz),
-            float(terrain_dz_growth),
-            float(fov_degrees),
-            float(aspect_ratio),
-            int(house_count),
-            int(tree_count),
-        )
+    native = _cuda_renderer.random_scene(
+        int(seed),
+        int(batch_size),
+        float(scatter_radius),
+        float(ground_y),
+        float(depth_limit),
+        float(terrain_dz),
+        float(terrain_dz_growth),
+        float(fov_degrees),
+        float(aspect_ratio),
+        int(house_count),
+        int(tree_count),
+        int(cloud_count),
+        int(car_count),
+        int(person_count),
+    )
 
     scene = Scene(
         spheres=Spheres(
