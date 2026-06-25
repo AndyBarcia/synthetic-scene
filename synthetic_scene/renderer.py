@@ -54,10 +54,21 @@ class OrientedBoxes:
 
 
 @dataclass(frozen=True)
+class Cylinders:
+    centers: Vec3List = ()
+    radii: Sequence[float] | torch.Tensor = ()
+    half_heights: Sequence[float] | torch.Tensor = ()
+    axes: Union[Sequence[Sequence[Vec3]], torch.Tensor] = ()
+    colors: Vec3List = ()
+    counts: Sequence[int] | torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
 class Scene:
     spheres: Spheres = field(default_factory=Spheres)
     terrain: Terrain = field(default_factory=Terrain)
     boxes: OrientedBoxes = field(default_factory=OrientedBoxes)
+    cylinders: Cylinders = field(default_factory=Cylinders)
 
 
 @dataclass(frozen=True)
@@ -80,10 +91,11 @@ def _compact_visible_instances(
     sphere_counts: torch.Tensor,
     terrain_counts: torch.Tensor,
     box_counts: torch.Tensor,
+    cylinder_counts: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return per-image visible classes and maps with compact 1-based IDs."""
     batch_size = instance_map.shape[0]
-    max_gt = int((sphere_counts + terrain_counts + box_counts).max().item())
+    max_gt = int((sphere_counts + terrain_counts + box_counts + cylinder_counts).max().item())
     visible_count = torch.empty((batch_size,), dtype=torch.int32, device=instance_map.device)
     visible_classes = torch.zeros((batch_size, max_gt), dtype=torch.int32, device=instance_map.device)
     compact_map = torch.empty_like(instance_map)
@@ -92,6 +104,7 @@ def _compact_visible_instances(
         sphere_count = int(sphere_counts[batch_idx].item())
         terrain_count = int(terrain_counts[batch_idx].item())
         box_count = int(box_counts[batch_idx].item())
+        cylinder_count = int(cylinder_counts[batch_idx].item())
         class_lookup = torch.zeros((max_gt + 1,), dtype=torch.int32, device=instance_map.device)
         if sphere_count:
             class_lookup[1 : sphere_count + 1] = 1
@@ -101,6 +114,9 @@ def _compact_visible_instances(
         if box_count:
             box_start = sphere_count + terrain_count + 1
             class_lookup[box_start : box_start + box_count] = 3
+        if cylinder_count:
+            cylinder_start = sphere_count + terrain_count + box_count + 1
+            class_lookup[cylinder_start : cylinder_start + cylinder_count] = 4
 
         labels = torch.unique(instance_map[batch_idx])
         labels = labels[labels > 0]
@@ -254,6 +270,14 @@ def random_scene(
                 colors=native["box_colors"],
                 counts=native["box_counts"],
             ),
+            cylinders=Cylinders(
+                centers=native["cylinder_centers"],
+                radii=native["cylinder_radii"],
+                half_heights=native["cylinder_half_heights"],
+                axes=native["cylinder_axes"],
+                colors=native["cylinder_colors"],
+                counts=native["cylinder_counts"],
+            ),
         ),
     )
 
@@ -318,6 +342,11 @@ def render_scene(
     box_half_sizes = _vec3_batch(scene_data.boxes.half_sizes, device=device)
     box_axes = _mat3_batch(scene_data.boxes.axes, device=device)
     box_colors = _vec3_batch(scene_data.boxes.colors, device=device)
+    cylinder_centers = _vec3_batch(scene_data.cylinders.centers, device=device)
+    cylinder_radii = _scalar_batch(scene_data.cylinders.radii, device=device)
+    cylinder_half_heights = _scalar_batch(scene_data.cylinders.half_heights, device=device)
+    cylinder_axes = _mat3_batch(scene_data.cylinders.axes, device=device)
+    cylinder_colors = _vec3_batch(scene_data.cylinders.colors, device=device)
     batch_size = _broadcast_batch(
         centers,
         radii,
@@ -333,6 +362,11 @@ def render_scene(
         box_half_sizes,
         box_axes,
         box_colors,
+        cylinder_centers,
+        cylinder_radii,
+        cylinder_half_heights,
+        cylinder_axes,
+        cylinder_colors,
     )
     centers = _expand_batch(centers, batch_size)
     radii = _expand_batch(radii, batch_size)
@@ -348,9 +382,15 @@ def render_scene(
     box_half_sizes = _expand_batch(box_half_sizes, batch_size)
     box_axes = _expand_batch(box_axes, batch_size)
     box_colors = _expand_batch(box_colors, batch_size)
+    cylinder_centers = _expand_batch(cylinder_centers, batch_size)
+    cylinder_radii = _expand_batch(cylinder_radii, batch_size)
+    cylinder_half_heights = _expand_batch(cylinder_half_heights, batch_size)
+    cylinder_axes = _expand_batch(cylinder_axes, batch_size)
+    cylinder_colors = _expand_batch(cylinder_colors, batch_size)
     sphere_count = centers.shape[1]
     terrain_count = 1 if terrain_depth_limits.shape[1] > 0 else 0
     box_count = box_centers.shape[1]
+    cylinder_count = cylinder_centers.shape[1]
     sphere_counts = _counts(scene_data.spheres.counts, batch_size=batch_size, count=sphere_count, device=device)
     points = torch.empty((batch_size, 0, 3), dtype=torch.float32, device=device)
     normals = torch.empty((batch_size, 0, 3), dtype=torch.float32, device=device)
@@ -358,7 +398,8 @@ def render_scene(
     plane_counts = torch.zeros((batch_size,), dtype=torch.int32, device=device)
     terrain_counts = _counts(scene_data.terrain.counts, batch_size=batch_size, count=terrain_count, device=device)
     box_counts = _counts(scene_data.boxes.counts, batch_size=batch_size, count=box_count, device=device)
-    if bool(((sphere_counts + plane_counts + terrain_counts + box_counts) <= 0).any().item()):
+    cylinder_counts = _counts(scene_data.cylinders.counts, batch_size=batch_size, count=cylinder_count, device=device)
+    if bool(((sphere_counts + plane_counts + terrain_counts + box_counts + cylinder_counts) <= 0).any().item()):
         raise ValueError("at least one object is required")
     if radii.shape[1] != sphere_count or colors.shape[1] != sphere_count:
         raise ValueError("sphere_centers, sphere_radii, and sphere_colors must have matching lengths")
@@ -374,6 +415,13 @@ def render_scene(
         raise ValueError("terrain base_heights, depth_limits, phase_xs, phase_zs, dz, dz_growth, and colors must each contain one entry")
     if box_half_sizes.shape[1] != box_count or box_axes.shape[1] != box_count or box_colors.shape[1] != box_count:
         raise ValueError("box_centers, box_half_sizes, box_axes, and box_colors must have matching lengths")
+    if (
+        cylinder_radii.shape[1] != cylinder_count
+        or cylinder_half_heights.shape[1] != cylinder_count
+        or cylinder_axes.shape[1] != cylinder_count
+        or cylinder_colors.shape[1] != cylinder_count
+    ):
+        raise ValueError("cylinder_centers, cylinder_radii, cylinder_half_heights, cylinder_axes, and cylinder_colors must have matching lengths")
     if bool((radii <= 0).any().item()):
         raise ValueError("sphere_radii must all be positive")
     if bool((terrain_depth_limits <= 0).any().item()):
@@ -386,6 +434,12 @@ def render_scene(
         raise ValueError("box_half_sizes must all be positive")
     if bool((box_axes.norm(dim=3) <= 1.0e-8).any().item()):
         raise ValueError("box_axes must contain non-zero axis vectors")
+    if bool((cylinder_radii <= 0).any().item()):
+        raise ValueError("cylinder_radii must all be positive")
+    if bool((cylinder_half_heights <= 0).any().item()):
+        raise ValueError("cylinder_half_heights must all be positive")
+    if bool((cylinder_axes.norm(dim=3) <= 1.0e-8).any().item()):
+        raise ValueError("cylinder_axes must contain non-zero axis vectors")
 
     image = torch.empty((batch_size, 3, height, width), dtype=torch.float32, device=device)
     instance_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
@@ -424,6 +478,14 @@ def render_scene(
                 "colors": box_colors,
                 "counts": box_counts,
             },
+            "cylinders": {
+                "centers": cylinder_centers,
+                "radii": cylinder_radii,
+                "half_heights": cylinder_half_heights,
+                "axes": cylinder_axes,
+                "colors": cylinder_colors,
+                "counts": cylinder_counts,
+            },
         },
         {
             "light_dir": _vec3(options_data.light_dir, device=device),
@@ -440,6 +502,7 @@ def render_scene(
             sphere_counts=sphere_counts,
             terrain_counts=terrain_counts,
             box_counts=box_counts,
+            cylinder_counts=cylinder_counts,
         )
         return RenderResult(
             image=image,

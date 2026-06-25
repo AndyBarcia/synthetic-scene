@@ -6,7 +6,7 @@ Tiny CUDA/PyTorch synthetic scene renderer.
 
 The renderer draws Lambert-shaded geometric objects entirely in CUDA and can
 return batched RGB plus panoptic-friendly segmentation tensors. It supports up
-to 64 spheres, 64 oriented boxes, and one procedural terrain per scene. Batched
+to 64 spheres, 64 oriented boxes, 64 oriented cylinders, and one procedural terrain per scene. Batched
 renders draw different camera-space scenes.
 
 ## Build
@@ -28,7 +28,7 @@ procedural terrain, and grounded objects are placed on that terrain.
 You can render a scene directly from Python:
 
 ```python
-from synthetic_scene import OrientedBoxes, RenderOptions, Scene, Spheres, Terrain, render_scene
+from synthetic_scene import Cylinders, OrientedBoxes, RenderOptions, Scene, Spheres, Terrain, render_scene
 
 image = render_scene(
     width=768,
@@ -60,6 +60,19 @@ image = render_scene(
                 ),
             ],
             colors=[(0.45, 0.9, 0.48)],
+        ),
+        cylinders=Cylinders(
+            centers=[(0.95, 0.05, -2.55)],
+            radii=[0.22],
+            half_heights=[0.70],
+            axes=[
+                (
+                    (0.0, 1.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                ),
+            ],
+            colors=[(0.95, 0.48, 0.22)],
         ),
     ),
 )
@@ -94,12 +107,13 @@ sequential ID for each visible object in that image. `visible_count` is a
 `visible_classes` is a `B x MAX_GT int32` tensor where columns
 `0:visible_count[b]` contain the class labels corresponding to instance IDs
 `1:visible_count[b]` in `instance_map[b]`. `MAX_GT` is the total number of
-objects in the scene. Class labels are `1 = sphere`, `2 = terrain`, `3 = box`;
+objects in the scene. Class labels are `1 = sphere`, `2 = terrain`, `3 = box`,
+`4 = cylinder`;
 unused class slots and background pixels are `0`.
 
 `semantic_map` is also returned as a `B x H x W int32` compatibility tensor with
 primitive class labels per pixel: `0 = background`, `1 = sphere`,
-`2 = terrain`, `3 = box`.
+`2 = terrain`, `3 = box`, `4 = cylinder`.
 Raw label maps are saved as 16-bit PNGs so the numeric IDs are preserved. The
 visualization helper maps each consecutive integer label to a deterministic
 random RGB color, keeping background label `0` black.
@@ -130,7 +144,7 @@ result = render_scene(
 ```
 
 Random scenes always include a generated procedural terrain, include both
-grounded and floating primitives, and generate objects by sampling screen-space
+grounded and floating primitives, and generate spheres, boxes, and cylinders by sampling screen-space
 coordinates within the camera frustum plus a camera distance. Grounded
 primitives are placed by sampling the terrain height at their X/Z location.
 

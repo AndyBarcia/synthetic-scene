@@ -1,4 +1,4 @@
-from synthetic_scene import OrientedBoxes, Scene, Spheres
+from synthetic_scene import Cylinders, OrientedBoxes, Scene, Spheres
 
 
 def default_scene() -> Scene:
@@ -40,6 +40,36 @@ def default_scene() -> Scene:
             colors=[
                 (0.42, 0.9, 0.48),
                 (0.78, 0.48, 0.95),
+            ],
+        ),
+        cylinders=Cylinders(
+            centers=[
+                (0.0, 0.0, -3.45),
+                (0.0, 0.55, -2.85),
+            ],
+            radii=[
+                0.24,
+                0.18,
+            ],
+            half_heights=[
+                0.75,
+                0.62,
+            ],
+            axes=[
+                (
+                    (1.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                ),
+                (
+                    (0.0, 1.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                ),
+            ],
+            colors=[
+                (0.95, 0.48, 0.22),
+                (0.20, 0.82, 0.90),
             ],
         ),
     )

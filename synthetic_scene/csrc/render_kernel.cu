@@ -6,7 +6,8 @@ namespace {
 
 constexpr int kMaxSpheres = 64;
 constexpr int kMaxBoxes = 64;
-constexpr int kMaxFinitePrimitives = kMaxSpheres + kMaxBoxes;
+constexpr int kMaxCylinders = 64;
+constexpr int kMaxFinitePrimitives = kMaxSpheres + kMaxBoxes + kMaxCylinders;
 constexpr int kDepthBins = 8;
 constexpr int kTileWidth = 16;
 constexpr int kTileHeight = 16;
@@ -64,11 +65,22 @@ struct BoxView {
   int count;
 };
 
+struct CylinderView {
+  const float* centers;
+  const float* radii;
+  const float* half_heights;
+  const float* axes;
+  const float* colors;
+  const int* counts;
+  int count;
+};
+
 struct SceneView {
   SphereView spheres;
   PlaneView planes;
   TerrainView terrain;
   BoxView boxes;
+  CylinderView cylinders;
 };
 
 struct Aabb {
@@ -95,8 +107,10 @@ struct HitRecord {
   float t;
   int sphere;
   int box;
+  int cylinder;
   int terrain;
   Vec3 box_normal;
+  Vec3 cylinder_normal;
   Vec3 terrain_normal;
 };
 
@@ -345,6 +359,17 @@ __device__ __forceinline__ Aabb box_aabb(Vec3 center, Vec3 half_size, const floa
   return Aabb{sub(center, extent), add(center, extent)};
 }
 
+__device__ __forceinline__ Aabb cylinder_aabb(Vec3 center, float radius, float half_height, const float* axes) {
+  const Vec3 axis_x = normalize(load_vec3(axes + 0));
+  const Vec3 axis_y = normalize(load_vec3(axes + 3));
+  const Vec3 axis_z = normalize(load_vec3(axes + 6));
+  const Vec3 extent = make_vec3(
+      fabsf(axis_x.x) * radius + fabsf(axis_y.x) * half_height + fabsf(axis_z.x) * radius,
+      fabsf(axis_x.y) * radius + fabsf(axis_y.y) * half_height + fabsf(axis_z.y) * radius,
+      fabsf(axis_x.z) * radius + fabsf(axis_y.z) * half_height + fabsf(axis_z.z) * radius);
+  return Aabb{sub(center, extent), add(center, extent)};
+}
+
 __device__ __forceinline__ bool ray_aabb_exit_t(Vec3 ray_origin, Vec3 ray_dir, Aabb bounds, float* out_t_exit) {
   float t_min = -kFloatMax;
   float t_max = kFloatMax;
@@ -497,6 +522,77 @@ __device__ __forceinline__ bool intersect_box(
 
   *out_t = t;
   *out_normal = normal;
+  return true;
+}
+
+__device__ __forceinline__ bool intersect_cylinder(
+    Vec3 ray_origin,
+    Vec3 ray_dir,
+    Vec3 center,
+    float radius,
+    float half_height,
+    const float* axes,
+    float* out_t,
+    Vec3* out_normal) {
+  const Vec3 axis_x = normalize(load_vec3(axes + 0));
+  const Vec3 axis_y = normalize(load_vec3(axes + 3));
+  const Vec3 axis_z = normalize(load_vec3(axes + 6));
+  const Vec3 local_origin_delta = sub(ray_origin, center);
+  const float ox = dot(local_origin_delta, axis_x);
+  const float oy = dot(local_origin_delta, axis_y);
+  const float oz = dot(local_origin_delta, axis_z);
+  const float dx = dot(ray_dir, axis_x);
+  const float dy = dot(ray_dir, axis_y);
+  const float dz = dot(ray_dir, axis_z);
+  const float radius2 = radius * radius;
+
+  float best_t = kFloatMax;
+  Vec3 best_normal = make_vec3(0.0f, 0.0f, 0.0f);
+
+  const float a = dx * dx + dz * dz;
+  const float b = 2.0f * (ox * dx + oz * dz);
+  const float c = ox * ox + oz * oz - radius2;
+  if (fabsf(a) >= kParallelEpsilon) {
+    const float discriminant = b * b - 4.0f * a * c;
+    if (discriminant >= 0.0f) {
+      const float sqrt_disc = sqrtf(discriminant);
+      const float inv_2a = 0.5f / a;
+      const float candidates[2] = {
+          (-b - sqrt_disc) * inv_2a,
+          (-b + sqrt_disc) * inv_2a,
+      };
+      #pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const float t = candidates[i];
+        const float y = oy + t * dy;
+        if (t > kRayTMin && t < best_t && y >= -half_height && y <= half_height) {
+          best_t = t;
+          best_normal = normalize(add(mul(axis_x, ox + t * dx), mul(axis_z, oz + t * dz)));
+        }
+      }
+    }
+  }
+
+  if (fabsf(dy) >= kParallelEpsilon) {
+    const float cap_y[2] = {-half_height, half_height};
+    const Vec3 cap_normal[2] = {mul(axis_y, -1.0f), axis_y};
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const float t = (cap_y[i] - oy) / dy;
+      const float x = ox + t * dx;
+      const float z = oz + t * dz;
+      if (t > kRayTMin && t < best_t && x * x + z * z <= radius2) {
+        best_t = t;
+        best_normal = cap_normal[i];
+      }
+    }
+  }
+
+  if (best_t == kFloatMax) {
+    return false;
+  }
+  *out_t = best_t;
+  *out_normal = best_normal;
   return true;
 }
 
@@ -828,6 +924,7 @@ __device__ __forceinline__ bool primitive_slot_to_kind_index(
     int* out_kind,
     int* out_index) {
   const int sphere_slot_count = scene.spheres.count;
+  const int box_slot_count = scene.boxes.count;
   if (primitive_slot < sphere_slot_count) {
     if (primitive_slot >= scene.spheres.counts[batch_idx]) {
       return false;
@@ -838,11 +935,21 @@ __device__ __forceinline__ bool primitive_slot_to_kind_index(
   }
 
   const int box_idx = primitive_slot - sphere_slot_count;
-  if (box_idx < 0 || box_idx >= scene.boxes.counts[batch_idx]) {
+  if (box_idx < box_slot_count) {
+    if (box_idx < 0 || box_idx >= scene.boxes.counts[batch_idx]) {
+      return false;
+    }
+    *out_kind = 3;
+    *out_index = box_idx;
+    return true;
+  }
+
+  const int cylinder_idx = primitive_slot - sphere_slot_count - box_slot_count;
+  if (cylinder_idx < 0 || cylinder_idx >= scene.cylinders.counts[batch_idx]) {
     return false;
   }
-  *out_kind = 3;
-  *out_index = box_idx;
+  *out_kind = 4;
+  *out_index = cylinder_idx;
   return true;
 }
 
@@ -856,6 +963,7 @@ __device__ __forceinline__ bool load_primitive_bounds_for_slot(
     Vec3* out_center,
     Vec3* out_half_size) {
   const int sphere_slot_count = scene.spheres.count;
+  const int box_slot_count = scene.boxes.count;
   if (primitive_slot < sphere_slot_count) {
     const int sphere_idx = primitive_slot;
     if (sphere_idx >= scene.spheres.counts[batch_idx]) {
@@ -873,17 +981,34 @@ __device__ __forceinline__ bool load_primitive_bounds_for_slot(
   }
 
   const int box_idx = primitive_slot - sphere_slot_count;
-  if (box_idx < 0 || box_idx >= scene.boxes.counts[batch_idx]) {
+  if (box_idx < box_slot_count) {
+    if (box_idx < 0 || box_idx >= scene.boxes.counts[batch_idx]) {
+      return false;
+    }
+    const int box_offset = batch_idx * scene.boxes.count + box_idx;
+    const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
+    const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
+    *out_kind = 3;
+    *out_index = box_idx;
+    *out_bounds = box_aabb(box_center, box_half_size, scene.boxes.axes + box_offset * 9);
+    *out_center = box_center;
+    *out_half_size = box_half_size;
+    return true;
+  }
+
+  const int cylinder_idx = primitive_slot - sphere_slot_count - box_slot_count;
+  if (cylinder_idx < 0 || cylinder_idx >= scene.cylinders.counts[batch_idx]) {
     return false;
   }
-  const int box_offset = batch_idx * scene.boxes.count + box_idx;
-  const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
-  const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
-  *out_kind = 3;
-  *out_index = box_idx;
-  *out_bounds = box_aabb(box_center, box_half_size, scene.boxes.axes + box_offset * 9);
-  *out_center = box_center;
-  *out_half_size = box_half_size;
+  const int cylinder_offset = batch_idx * scene.cylinders.count + cylinder_idx;
+  const Vec3 cylinder_center = load_vec3(scene.cylinders.centers + cylinder_offset * 3);
+  const float cylinder_radius = scene.cylinders.radii[cylinder_offset];
+  const float cylinder_half_height = scene.cylinders.half_heights[cylinder_offset];
+  *out_kind = 4;
+  *out_index = cylinder_idx;
+  *out_bounds = cylinder_aabb(cylinder_center, cylinder_radius, cylinder_half_height, scene.cylinders.axes + cylinder_offset * 9);
+  *out_center = cylinder_center;
+  *out_half_size = make_vec3(cylinder_radius, cylinder_half_height, cylinder_radius);
   return true;
 }
 
@@ -930,6 +1055,7 @@ __global__ void compute_cluster_metadata_kernel(
 
   const int sphere_count = scene.spheres.counts[batch_idx];
   const int box_count = scene.boxes.counts[batch_idx];
+  const int cylinder_count = scene.cylinders.counts[batch_idx];
   const int terrain_count = scene.terrain.counts[batch_idx];
 
   Aabb finite_scene_bounds = empty_aabb();
@@ -951,6 +1077,21 @@ __global__ void compute_cluster_metadata_kernel(
     const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
     const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
     const Aabb bounds = box_aabb(box_center, box_half_size, scene.boxes.axes + box_offset * 9);
+    finite_scene_bounds = extend_aabb(finite_scene_bounds, bounds);
+    receiver_far_depth = fmaxf(receiver_far_depth, -bounds.min.z);
+    ++finite_scene_primitive_count;
+  }
+
+  for (int cylinder_idx = 0; cylinder_idx < cylinder_count; ++cylinder_idx) {
+    const int cylinder_offset = batch_idx * scene.cylinders.count + cylinder_idx;
+    const Vec3 cylinder_center = load_vec3(scene.cylinders.centers + cylinder_offset * 3);
+    const float cylinder_radius = scene.cylinders.radii[cylinder_offset];
+    const float cylinder_half_height = scene.cylinders.half_heights[cylinder_offset];
+    const Aabb bounds = cylinder_aabb(
+        cylinder_center,
+        cylinder_radius,
+        cylinder_half_height,
+        scene.cylinders.axes + cylinder_offset * 9);
     finite_scene_bounds = extend_aabb(finite_scene_bounds, bounds);
     receiver_far_depth = fmaxf(receiver_far_depth, -bounds.min.z);
     ++finite_scene_primitive_count;
@@ -1126,12 +1267,26 @@ __global__ void build_primary_cluster_masks_object_driven_kernel(
               &min_y,
               &max_x,
               &max_y);
-        } else {
+        } else if (kind == 3) {
           const int box_offset = batch_idx * scene.boxes.count + index;
           projected = box_pixel_bounds(
               center,
               half_size,
               scene.boxes.axes + box_offset * 9,
+              aspect,
+              image_plane_scale,
+              width,
+              height,
+              &min_x,
+              &min_y,
+              &max_x,
+              &max_y);
+        } else {
+          const int cylinder_offset = batch_idx * scene.cylinders.count + index;
+          projected = box_pixel_bounds(
+              center,
+              half_size,
+              scene.cylinders.axes + cylinder_offset * 9,
               aspect,
               image_plane_scale,
               width,
@@ -1302,12 +1457,30 @@ __device__ __forceinline__ bool is_shadowed_mask(
         if (intersect_sphere(ray_origin, light_dir, sphere_center, sphere_radius, &t) && t < max_t) {
           return true;
         }
-      } else {
+      } else if (kind == 3) {
         const int box_offset = batch_idx * scene.boxes.count + index;
         const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
         const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
         Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
         if (intersect_box(ray_origin, light_dir, box_center, box_half_size, scene.boxes.axes + box_offset * 9, &t, &normal) &&
+            t < max_t) {
+          return true;
+        }
+      } else {
+        const int cylinder_offset = batch_idx * scene.cylinders.count + index;
+        const Vec3 cylinder_center = load_vec3(scene.cylinders.centers + cylinder_offset * 3);
+        const float cylinder_radius = scene.cylinders.radii[cylinder_offset];
+        const float cylinder_half_height = scene.cylinders.half_heights[cylinder_offset];
+        Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
+        if (intersect_cylinder(
+                ray_origin,
+                light_dir,
+                cylinder_center,
+                cylinder_radius,
+                cylinder_half_height,
+                scene.cylinders.axes + cylinder_offset * 9,
+                &t,
+                &normal) &&
             t < max_t) {
           return true;
         }
@@ -1402,8 +1575,9 @@ __device__ void intersect_finite_mask_depth_range(
           hit->t = t;
           hit->sphere = index;
           hit->box = -1;
+          hit->cylinder = -1;
         }
-      } else {
+      } else if (kind == 3) {
         const int box_offset = batch_idx * scene.boxes.count + index;
         const Vec3 box_center = load_vec3(scene.boxes.centers + box_offset * 3);
         const Vec3 box_half_size = load_vec3(scene.boxes.half_sizes + box_offset * 3);
@@ -1413,7 +1587,30 @@ __device__ void intersect_finite_mask_depth_range(
           hit->t = t;
           hit->sphere = -1;
           hit->box = index;
+          hit->cylinder = -1;
           hit->box_normal = normal;
+        }
+      } else {
+        const int cylinder_offset = batch_idx * scene.cylinders.count + index;
+        const Vec3 cylinder_center = load_vec3(scene.cylinders.centers + cylinder_offset * 3);
+        const float cylinder_radius = scene.cylinders.radii[cylinder_offset];
+        const float cylinder_half_height = scene.cylinders.half_heights[cylinder_offset];
+        Vec3 normal = make_vec3(0.0f, 0.0f, 0.0f);
+        if (intersect_cylinder(
+                ray_origin,
+                ray_dir,
+                cylinder_center,
+                cylinder_radius,
+                cylinder_half_height,
+                scene.cylinders.axes + cylinder_offset * 9,
+                &t,
+                &normal) &&
+            t >= min_t && t < clipped_max_t && t < hit->t) {
+          hit->t = t;
+          hit->sphere = -1;
+          hit->box = -1;
+          hit->cylinder = index;
+          hit->cylinder_normal = normal;
         }
       }
     }
@@ -1444,6 +1641,7 @@ __global__ void render_scene_kernel(
   const int sphere_count = scene.spheres.counts[batch_idx];
   const int plane_count = 0;
   const int terrain_count = scene.terrain.counts[batch_idx];
+  const int box_count = scene.boxes.counts[batch_idx];
 
   const float aspect = static_cast<float>(width) / static_cast<float>(height);
   const float fov_radians = options.fov_degrees * 0.017453292519943295f;
@@ -1472,7 +1670,15 @@ __global__ void render_scene_kernel(
     terrain_t = terrain_depth[map_offset];
   }
 
-  HitRecord finite_hit{terrain_t, -1, -1, -1, make_vec3(0.0f, 0.0f, 0.0f), make_vec3(0.0f, 1.0f, 0.0f)};
+  HitRecord finite_hit{
+      terrain_t,
+      -1,
+      -1,
+      -1,
+      -1,
+      make_vec3(0.0f, 0.0f, 0.0f),
+      make_vec3(0.0f, 0.0f, 0.0f),
+      make_vec3(0.0f, 1.0f, 0.0f)};
   for (int bin = 0; bin < kDepthBins; ++bin) {
     const float bin_near_depth = batch_depth_edges[bin];
     const float bin_far_depth = batch_depth_edges[bin + 1];
@@ -1484,6 +1690,7 @@ __global__ void render_scene_kernel(
 
     const int previous_sphere = finite_hit.sphere;
     const int previous_box = finite_hit.box;
+    const int previous_cylinder = finite_hit.cylinder;
     const int cluster_idx = cluster_linear_index(batch_idx, tile_y, tile_x, bin, tiles_x, tiles_y);
     const int* primary_mask = primary_cluster_masks + cluster_idx * kPrimitiveMaskWords;
     intersect_finite_mask_depth_range(
@@ -1496,20 +1703,22 @@ __global__ void render_scene_kernel(
         batch_idx,
         &finite_hit);
 
-    if (finite_hit.sphere != previous_sphere || finite_hit.box != previous_box) {
+    if (finite_hit.sphere != previous_sphere || finite_hit.box != previous_box || finite_hit.cylinder != previous_cylinder) {
       // Depth bins are processed front-to-back. If the first exact finite hit lies in this bin,
       // later bins cannot contain a closer finite hit on this same primary ray.
       break;
     }
   }
 
-  float closest_t = (finite_hit.sphere >= 0 || finite_hit.box >= 0) ? finite_hit.t : kFloatMax;
+  float closest_t = (finite_hit.sphere >= 0 || finite_hit.box >= 0 || finite_hit.cylinder >= 0) ? finite_hit.t : kFloatMax;
   int closest_sphere = finite_hit.sphere;
   int closest_box = finite_hit.box;
+  int closest_cylinder = finite_hit.cylinder;
   int closest_terrain = -1;
   int instance_id = 0;
   int semantic_id = 0;
   Vec3 closest_box_normal = finite_hit.box_normal;
+  Vec3 closest_cylinder_normal = finite_hit.cylinder_normal;
   Vec3 closest_terrain_normal = finite_hit.terrain_normal;
 
   if (terrain_count > 0 && terrain_depth != nullptr) {
@@ -1517,6 +1726,7 @@ __global__ void render_scene_kernel(
       closest_t = terrain_t;
       closest_sphere = -1;
       closest_box = -1;
+      closest_cylinder = -1;
       closest_terrain = 0;
       const Vec3 terrain_hit = add(ray_origin, mul(ray_dir, closest_t));
       closest_terrain_normal = terrain_normal_at_hit(scene.terrain, batch_idx, terrain_hit);
@@ -1575,6 +1785,30 @@ __global__ void render_scene_kernel(
         batch_idx,
         3,
         closest_box);
+  } else if (closest_cylinder >= 0) {
+    const int cylinder_offset = batch_idx * scene.cylinders.count + closest_cylinder;
+    instance_id = sphere_count + plane_count + terrain_count + box_count + closest_cylinder + 1;
+    semantic_id = 4;
+    const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
+    const Vec3 normal = normalize(closest_cylinder_normal);
+    const Vec3 cylinder_color = load_vec3(scene.cylinders.colors + cylinder_offset * 3);
+    const int receiver_bin = depth_to_bin_from_edges(fmaxf(-hit.z, kCameraNear), batch_depth_edges);
+    const int shadow_cluster_idx = cluster_linear_index(batch_idx, tile_y, tile_x, receiver_bin, tiles_x, tiles_y);
+    const int* shadow_mask = shadow_cluster_masks == nullptr ? nullptr : shadow_cluster_masks + shadow_cluster_idx * kPrimitiveMaskWords;
+    color = apply_lighting_mask(
+        cylinder_color,
+        hit,
+        normal,
+        ray_dir,
+        light_dir,
+        scene,
+        shadow_mask,
+        options,
+        shadow_scene_bounds,
+        shadow_scene_bounds_is_valid,
+        batch_idx,
+        4,
+        closest_cylinder);
   } else if (closest_terrain >= 0) {
     instance_id = sphere_count + plane_count + 1;
     semantic_id = 2;
@@ -1595,7 +1829,7 @@ __global__ void render_scene_kernel(
         shadow_scene_bounds,
         shadow_scene_bounds_is_valid,
         batch_idx,
-        4,
+        5,
         0);
   }
 
@@ -1635,6 +1869,11 @@ void render_scene_cuda(
     torch::Tensor box_half_sizes,
     torch::Tensor box_axes,
     torch::Tensor box_counts,
+    torch::Tensor cylinder_centers,
+    torch::Tensor cylinder_radii,
+    torch::Tensor cylinder_half_heights,
+    torch::Tensor cylinder_axes,
+    torch::Tensor cylinder_counts,
     torch::Tensor light_dir,
     double fov_degrees,
     torch::Tensor background,
@@ -1642,6 +1881,7 @@ void render_scene_cuda(
     torch::Tensor plane_colors,
     torch::Tensor terrain_colors,
     torch::Tensor box_colors,
+    torch::Tensor cylinder_colors,
     double ambient,
     bool shadows,
     double shadow_strength) {
@@ -1651,8 +1891,10 @@ void render_scene_cuda(
   const int sphere_count = static_cast<int>(sphere_centers.size(1));
   const int plane_count = static_cast<int>(plane_points.size(1));
   const int box_count = static_cast<int>(box_centers.size(1));
+  const int cylinder_count = static_cast<int>(cylinder_centers.size(1));
   TORCH_CHECK(sphere_count <= kMaxSpheres, "render_scene supports at most ", kMaxSpheres, " spheres");
   TORCH_CHECK(box_count <= kMaxBoxes, "render_scene supports at most ", kMaxBoxes, " boxes");
+  TORCH_CHECK(cylinder_count <= kMaxCylinders, "render_scene supports at most ", kMaxCylinders, " cylinders");
 
   const dim3 block(kTileWidth, kTileHeight);
   const int tiles_x = (width + block.x - 1) / block.x;
@@ -1688,6 +1930,15 @@ void render_scene_cuda(
           box_colors.data_ptr<float>(),
           box_counts.data_ptr<int>(),
           box_count,
+      },
+      CylinderView{
+          cylinder_centers.data_ptr<float>(),
+          cylinder_radii.data_ptr<float>(),
+          cylinder_half_heights.data_ptr<float>(),
+          cylinder_axes.data_ptr<float>(),
+          cylinder_colors.data_ptr<float>(),
+          cylinder_counts.data_ptr<int>(),
+          cylinder_count,
       },
   };
   const RenderOptionsView options{
@@ -1733,7 +1984,7 @@ void render_scene_cuda(
   torch::Tensor receiver_light_bounds;
   int* shadow_cluster_masks_ptr = nullptr;
 
-  const int primitive_slot_count = sphere_count + box_count;
+  const int primitive_slot_count = sphere_count + box_count + cylinder_count;
   const int total_tiles = tiles_x * tiles_y;
   const int total_clusters = total_tiles * kDepthBins;
   const int cluster_threads = 128;
