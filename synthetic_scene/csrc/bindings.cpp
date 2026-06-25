@@ -187,6 +187,8 @@ void render_scene_cuda(
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
     torch::Tensor sphere_counts,
+    torch::Tensor sphere_class_ids,
+    torch::Tensor sphere_instance_ids,
     torch::Tensor plane_points,
     torch::Tensor plane_normals,
     torch::Tensor plane_counts,
@@ -197,19 +199,27 @@ void render_scene_cuda(
     torch::Tensor terrain_dz,
     torch::Tensor terrain_dz_growth,
     torch::Tensor terrain_counts,
+    torch::Tensor terrain_class_ids,
+    torch::Tensor terrain_instance_ids,
     torch::Tensor box_centers,
     torch::Tensor box_half_sizes,
     torch::Tensor box_axes,
     torch::Tensor box_counts,
+    torch::Tensor box_class_ids,
+    torch::Tensor box_instance_ids,
     torch::Tensor prism_centers,
     torch::Tensor prism_half_sizes,
     torch::Tensor prism_axes,
     torch::Tensor prism_counts,
+    torch::Tensor prism_class_ids,
+    torch::Tensor prism_instance_ids,
     torch::Tensor cylinder_centers,
     torch::Tensor cylinder_radii,
     torch::Tensor cylinder_half_heights,
     torch::Tensor cylinder_axes,
     torch::Tensor cylinder_counts,
+    torch::Tensor cylinder_class_ids,
+    torch::Tensor cylinder_instance_ids,
     torch::Tensor light_dir,
     double fov_degrees,
     torch::Tensor background,
@@ -535,6 +545,8 @@ void render_scene(
   const torch::Tensor sphere_radii = require_tensor(spheres, "radii");
   const torch::Tensor sphere_colors = require_tensor(spheres, "colors");
   const torch::Tensor sphere_counts = require_tensor(spheres, "counts");
+  const torch::Tensor sphere_class_ids = require_tensor(spheres, "class_ids");
+  const torch::Tensor sphere_instance_ids = require_tensor(spheres, "instance_ids");
 
   const torch::Tensor plane_points = require_tensor(planes, "points");
   const torch::Tensor plane_normals = require_tensor(planes, "normals");
@@ -549,23 +561,31 @@ void render_scene(
   const torch::Tensor terrain_dz_growth = require_tensor(terrain, "dz_growth");
   const torch::Tensor terrain_colors = require_tensor(terrain, "colors");
   const torch::Tensor terrain_counts = require_tensor(terrain, "counts");
+  const torch::Tensor terrain_class_ids = require_tensor(terrain, "class_ids");
+  const torch::Tensor terrain_instance_ids = require_tensor(terrain, "instance_ids");
 
   const torch::Tensor box_centers = require_tensor(boxes, "centers");
   const torch::Tensor box_half_sizes = require_tensor(boxes, "half_sizes");
   const torch::Tensor box_axes = require_tensor(boxes, "axes");
   const torch::Tensor box_colors = require_tensor(boxes, "colors");
   const torch::Tensor box_counts = require_tensor(boxes, "counts");
+  const torch::Tensor box_class_ids = require_tensor(boxes, "class_ids");
+  const torch::Tensor box_instance_ids = require_tensor(boxes, "instance_ids");
   const torch::Tensor prism_centers = require_tensor(prisms, "centers");
   const torch::Tensor prism_half_sizes = require_tensor(prisms, "half_sizes");
   const torch::Tensor prism_axes = require_tensor(prisms, "axes");
   const torch::Tensor prism_colors = require_tensor(prisms, "colors");
   const torch::Tensor prism_counts = require_tensor(prisms, "counts");
+  const torch::Tensor prism_class_ids = require_tensor(prisms, "class_ids");
+  const torch::Tensor prism_instance_ids = require_tensor(prisms, "instance_ids");
   const torch::Tensor cylinder_centers = require_tensor(cylinders, "centers");
   const torch::Tensor cylinder_radii = require_tensor(cylinders, "radii");
   const torch::Tensor cylinder_half_heights = require_tensor(cylinders, "half_heights");
   const torch::Tensor cylinder_axes = require_tensor(cylinders, "axes");
   const torch::Tensor cylinder_colors = require_tensor(cylinders, "colors");
   const torch::Tensor cylinder_counts = require_tensor(cylinders, "counts");
+  const torch::Tensor cylinder_class_ids = require_tensor(cylinders, "class_ids");
+  const torch::Tensor cylinder_instance_ids = require_tensor(cylinders, "instance_ids");
 
   TORCH_CHECK(image.is_cuda(), "image must be a CUDA tensor");
   TORCH_CHECK(instance_map.is_cuda() && semantic_map.is_cuda(), "segmentation maps must be CUDA tensors");
@@ -599,16 +619,22 @@ void render_scene(
       sphere_counts.is_cuda() && plane_counts.is_cuda() && terrain_counts.is_cuda() && box_counts.is_cuda() &&
           prism_counts.is_cuda() && cylinder_counts.is_cuda(),
       "primitive count tensors must be CUDA tensors");
+  TORCH_CHECK(
+      sphere_class_ids.is_cuda() && sphere_instance_ids.is_cuda() && terrain_class_ids.is_cuda() &&
+          terrain_instance_ids.is_cuda() && box_class_ids.is_cuda() && box_instance_ids.is_cuda() &&
+          prism_class_ids.is_cuda() && prism_instance_ids.is_cuda() && cylinder_class_ids.is_cuda() &&
+          cylinder_instance_ids.is_cuda(),
+      "primitive metadata tensors must be CUDA tensors");
   TORCH_CHECK(sphere_centers.dim() == 3 && sphere_centers.size(2) == 3, "sphere_centers must be B x N x 3");
   TORCH_CHECK(sphere_radii.dim() == 2, "sphere_radii must be B x N");
   TORCH_CHECK(plane_points.dim() == 3 && plane_points.size(2) == 3, "plane_points must be B x N x 3");
   TORCH_CHECK(plane_normals.dim() == 3 && plane_normals.size(2) == 3, "plane_normals must be B x N x 3");
-  TORCH_CHECK(terrain_base_heights.dim() == 2 && terrain_base_heights.size(1) == 1, "terrain_base_heights must be B x 1");
-  TORCH_CHECK(terrain_depth_limits.dim() == 2 && terrain_depth_limits.size(1) == 1, "terrain_depth_limits must be B x 1");
-  TORCH_CHECK(terrain_phase_xs.dim() == 2 && terrain_phase_xs.size(1) == 1, "terrain_phase_xs must be B x 1");
-  TORCH_CHECK(terrain_phase_zs.dim() == 2 && terrain_phase_zs.size(1) == 1, "terrain_phase_zs must be B x 1");
-  TORCH_CHECK(terrain_dz.dim() == 2 && terrain_dz.size(1) == 1, "terrain_dz must be B x 1");
-  TORCH_CHECK(terrain_dz_growth.dim() == 2 && terrain_dz_growth.size(1) == 1, "terrain_dz_growth must be B x 1");
+  TORCH_CHECK(terrain_base_heights.dim() == 2, "terrain_base_heights must be B x N");
+  TORCH_CHECK(terrain_depth_limits.dim() == 2, "terrain_depth_limits must be B x N");
+  TORCH_CHECK(terrain_phase_xs.dim() == 2, "terrain_phase_xs must be B x N");
+  TORCH_CHECK(terrain_phase_zs.dim() == 2, "terrain_phase_zs must be B x N");
+  TORCH_CHECK(terrain_dz.dim() == 2, "terrain_dz must be B x N");
+  TORCH_CHECK(terrain_dz_growth.dim() == 2, "terrain_dz_growth must be B x N");
   TORCH_CHECK(box_centers.dim() == 3 && box_centers.size(2) == 3, "box_centers must be B x N x 3");
   TORCH_CHECK(box_half_sizes.dim() == 3 && box_half_sizes.size(2) == 3, "box_half_sizes must be B x N x 3");
   TORCH_CHECK(box_axes.dim() == 4 && box_axes.size(2) == 3 && box_axes.size(3) == 3, "box_axes must be B x N x 3 x 3");
@@ -619,9 +645,14 @@ void render_scene(
   TORCH_CHECK(cylinder_radii.dim() == 2, "cylinder_radii must be B x N");
   TORCH_CHECK(cylinder_half_heights.dim() == 2, "cylinder_half_heights must be B x N");
   TORCH_CHECK(cylinder_axes.dim() == 4 && cylinder_axes.size(2) == 3 && cylinder_axes.size(3) == 3, "cylinder_axes must be B x N x 3 x 3");
+  TORCH_CHECK(sphere_class_ids.dim() == 2 && sphere_instance_ids.dim() == 2, "sphere metadata must be B x N");
+  TORCH_CHECK(terrain_class_ids.dim() == 2 && terrain_instance_ids.dim() == 2, "terrain metadata must be B x N");
+  TORCH_CHECK(box_class_ids.dim() == 2 && box_instance_ids.dim() == 2, "box metadata must be B x N");
+  TORCH_CHECK(prism_class_ids.dim() == 2 && prism_instance_ids.dim() == 2, "prism metadata must be B x N");
+  TORCH_CHECK(cylinder_class_ids.dim() == 2 && cylinder_instance_ids.dim() == 2, "cylinder metadata must be B x N");
   TORCH_CHECK(sphere_colors.dim() == 3 && sphere_colors.size(2) == 3, "sphere_colors must be B x N x 3");
   TORCH_CHECK(plane_colors.dim() == 3 && plane_colors.size(2) == 3, "plane_colors must be B x N x 3");
-  TORCH_CHECK(terrain_colors.dim() == 3 && terrain_colors.size(1) == 1 && terrain_colors.size(2) == 3, "terrain_colors must be B x 1 x 3");
+  TORCH_CHECK(terrain_colors.dim() == 3 && terrain_colors.size(2) == 3, "terrain_colors must be B x N x 3");
   TORCH_CHECK(box_colors.dim() == 3 && box_colors.size(2) == 3, "box_colors must be B x N x 3");
   TORCH_CHECK(prism_colors.dim() == 3 && prism_colors.size(2) == 3, "prism_colors must be B x N x 3");
   TORCH_CHECK(cylinder_colors.dim() == 3 && cylinder_colors.size(2) == 3, "cylinder_colors must be B x N x 3");
@@ -644,6 +675,11 @@ void render_scene(
   TORCH_CHECK(sphere_centers.size(1) == sphere_colors.size(1), "sphere_centers and sphere_colors must have matching lengths");
   TORCH_CHECK(plane_points.size(1) == plane_normals.size(1), "plane_points and plane_normals must have matching lengths");
   TORCH_CHECK(plane_points.size(1) == plane_colors.size(1), "plane_points and plane_colors must have matching lengths");
+  TORCH_CHECK(terrain_base_heights.sizes() == terrain_depth_limits.sizes(), "terrain fields must have matching lengths");
+  TORCH_CHECK(terrain_phase_xs.sizes() == terrain_depth_limits.sizes(), "terrain fields must have matching lengths");
+  TORCH_CHECK(terrain_phase_zs.sizes() == terrain_depth_limits.sizes(), "terrain fields must have matching lengths");
+  TORCH_CHECK(terrain_dz.sizes() == terrain_depth_limits.sizes(), "terrain fields must have matching lengths");
+  TORCH_CHECK(terrain_dz_growth.sizes() == terrain_depth_limits.sizes(), "terrain fields must have matching lengths");
   TORCH_CHECK(box_centers.size(1) == box_half_sizes.size(1), "box_centers and box_half_sizes must have matching lengths");
   TORCH_CHECK(box_centers.size(1) == box_axes.size(1), "box_centers and box_axes must have matching lengths");
   TORCH_CHECK(box_centers.size(1) == box_colors.size(1), "box_centers and box_colors must have matching lengths");
@@ -654,6 +690,17 @@ void render_scene(
   TORCH_CHECK(cylinder_centers.size(1) == cylinder_half_heights.size(1), "cylinder_centers and cylinder_half_heights must have matching lengths");
   TORCH_CHECK(cylinder_centers.size(1) == cylinder_axes.size(1), "cylinder_centers and cylinder_axes must have matching lengths");
   TORCH_CHECK(cylinder_centers.size(1) == cylinder_colors.size(1), "cylinder_centers and cylinder_colors must have matching lengths");
+  TORCH_CHECK(sphere_class_ids.sizes() == sphere_radii.sizes(), "sphere metadata must match sphere slots");
+  TORCH_CHECK(sphere_instance_ids.sizes() == sphere_radii.sizes(), "sphere metadata must match sphere slots");
+  TORCH_CHECK(terrain_class_ids.sizes() == terrain_depth_limits.sizes(), "terrain metadata must match terrain slots");
+  TORCH_CHECK(terrain_instance_ids.sizes() == terrain_depth_limits.sizes(), "terrain metadata must match terrain slots");
+  TORCH_CHECK(terrain_colors.size(0) == image.size(0) && terrain_colors.size(1) == terrain_depth_limits.size(1), "terrain_colors must match terrain slots");
+  TORCH_CHECK(box_class_ids.size(0) == image.size(0) && box_class_ids.size(1) == box_centers.size(1), "box metadata must match box slots");
+  TORCH_CHECK(box_instance_ids.size(0) == image.size(0) && box_instance_ids.size(1) == box_centers.size(1), "box metadata must match box slots");
+  TORCH_CHECK(prism_class_ids.size(0) == image.size(0) && prism_class_ids.size(1) == prism_centers.size(1), "prism metadata must match prism slots");
+  TORCH_CHECK(prism_instance_ids.size(0) == image.size(0) && prism_instance_ids.size(1) == prism_centers.size(1), "prism metadata must match prism slots");
+  TORCH_CHECK(cylinder_class_ids.size(0) == image.size(0) && cylinder_class_ids.size(1) == cylinder_centers.size(1), "cylinder metadata must match cylinder slots");
+  TORCH_CHECK(cylinder_instance_ids.size(0) == image.size(0) && cylinder_instance_ids.size(1) == cylinder_centers.size(1), "cylinder metadata must match cylinder slots");
   TORCH_CHECK(
       sphere_centers.size(1) > 0 || plane_points.size(1) > 0 || terrain_depth_limits.size(1) > 0 ||
           box_centers.size(1) > 0 || prism_centers.size(1) > 0 || cylinder_centers.size(1) > 0,
@@ -694,6 +741,13 @@ void render_scene(
           terrain_counts.dtype() == torch::kInt32 && box_counts.dtype() == torch::kInt32 &&
           prism_counts.dtype() == torch::kInt32 && cylinder_counts.dtype() == torch::kInt32,
       "primitive counts must be int32");
+  TORCH_CHECK(
+      sphere_class_ids.dtype() == torch::kInt32 && sphere_instance_ids.dtype() == torch::kInt32 &&
+          terrain_class_ids.dtype() == torch::kInt32 && terrain_instance_ids.dtype() == torch::kInt32 &&
+          box_class_ids.dtype() == torch::kInt32 && box_instance_ids.dtype() == torch::kInt32 &&
+          prism_class_ids.dtype() == torch::kInt32 && prism_instance_ids.dtype() == torch::kInt32 &&
+          cylinder_class_ids.dtype() == torch::kInt32 && cylinder_instance_ids.dtype() == torch::kInt32,
+      "primitive metadata must be int32");
   TORCH_CHECK(image.is_contiguous(), "image must be contiguous");
   TORCH_CHECK(instance_map.is_contiguous() && semantic_map.is_contiguous(), "segmentation maps must be contiguous");
   TORCH_CHECK(sphere_centers.is_contiguous() && sphere_radii.is_contiguous(), "scene tensors must be contiguous");
@@ -714,6 +768,13 @@ void render_scene(
       sphere_counts.is_contiguous() && plane_counts.is_contiguous() && terrain_counts.is_contiguous() &&
           box_counts.is_contiguous() && prism_counts.is_contiguous() && cylinder_counts.is_contiguous(),
       "primitive count tensors must be contiguous");
+  TORCH_CHECK(
+      sphere_class_ids.is_contiguous() && sphere_instance_ids.is_contiguous() &&
+          terrain_class_ids.is_contiguous() && terrain_instance_ids.is_contiguous() &&
+          box_class_ids.is_contiguous() && box_instance_ids.is_contiguous() &&
+          prism_class_ids.is_contiguous() && prism_instance_ids.is_contiguous() &&
+          cylinder_class_ids.is_contiguous() && cylinder_instance_ids.is_contiguous(),
+      "primitive metadata tensors must be contiguous");
 
   render_scene_cuda(
       image,
@@ -722,6 +783,8 @@ void render_scene(
       sphere_centers,
       sphere_radii,
       sphere_counts,
+      sphere_class_ids,
+      sphere_instance_ids,
       plane_points,
       plane_normals,
       plane_counts,
@@ -732,19 +795,27 @@ void render_scene(
       terrain_dz,
       terrain_dz_growth,
       terrain_counts,
+      terrain_class_ids,
+      terrain_instance_ids,
       box_centers,
       box_half_sizes,
       box_axes,
       box_counts,
+      box_class_ids,
+      box_instance_ids,
       prism_centers,
       prism_half_sizes,
       prism_axes,
       prism_counts,
+      prism_class_ids,
+      prism_instance_ids,
       cylinder_centers,
       cylinder_radii,
       cylinder_half_heights,
       cylinder_axes,
       cylinder_counts,
+      cylinder_class_ids,
+      cylinder_instance_ids,
       light_dir,
       fov_degrees,
       background,

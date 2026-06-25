@@ -115,13 +115,12 @@ save_label_map_visualization(result.semantic_map[0], "outputs/semantic_map.png")
 
 `instance_map` is a `B x H x W int32` tensor with `0` for background and one
 sequential ID for each visible object in that image. `visible_count` is a
-`B int32` tensor with the number of visible objects per image, and
-`visible_classes` is a `B x MAX_GT int32` tensor where columns
-`0:visible_count[b]` contain the class labels corresponding to instance IDs
-`1:visible_count[b]` in `instance_map[b]`. `MAX_GT` is the total number of
-objects in the scene. Class labels are `1 = sphere`, `2 = terrain`, `3 = box`,
-`4 = cylinder`, `5 = prism`;
-unused class slots and background pixels are `0`.
+`B int32` tensor with the number of visible objects per image. `visible_classes`
+and `visible_instance_ids` are `B x MAX_GT int32` tensors where columns
+`0:visible_count[b]` contain the class labels and instance IDs for visible
+objects. `MAX_GT` is the total number of objects in the scene. Class labels are
+`1 = sphere`, `2 = terrain`, `3 = box`, `4 = cylinder`, `5 = prism`; unused
+class slots and background pixels are `0`.
 
 `semantic_map` is also returned as a `B x H x W int32` compatibility tensor with
 primitive class labels per pixel: `0 = background`, `1 = sphere`,
@@ -129,6 +128,55 @@ primitive class labels per pixel: `0 = background`, `1 = sphere`,
 Raw label maps are saved as 16-bit PNGs so the numeric IDs are preserved. The
 visualization helper maps each consecutive integer label to a deterministic
 random RGB color, keeping background label `0` black.
+
+Finite primitive families also accept optional `class_ids` and `instance_ids`
+metadata with shape `N` or `B x N`. Terrain is scene-level and has scalar
+`class_id` and `instance_id` fields instead. When custom metadata is present,
+`instance_map` preserves those instance IDs instead of compacting to sequential
+IDs, and `semantic_map` uses the provided classes. Composite objects can be
+positioned, rotated, and flattened into raw primitives before rendering. Terrain
+cannot be part of a composite object; pass it through `base_scene` if needed.
+
+```python
+from synthetic_scene import HouseConfig, Scene, Spheres, Terrain, TreeConfig, flatten_composite_objects, make_house, make_tree
+
+base_scene = Scene(
+    spheres=Spheres(centers=(), radii=(), colors=()),
+    terrain=Terrain(
+        base_heights=[-1.0],
+        depth_limits=[7.0],
+        phase_xs=[0.4],
+        phase_zs=[1.2],
+        dz=[0.05],
+        dz_growth=[0.0001],
+        colors=[(0.36, 0.46, 0.30)],
+    ),
+)
+
+scene = flatten_composite_objects([
+    make_house(
+        instance_id=1001,
+        config=HouseConfig(width=1.4, depth=1.0, body_height=0.9, roof_height=0.45),
+        position=(-1.0, -1.0, -4.0),
+        rotation=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    ),
+    make_house(
+        instance_id=1002,
+        config=HouseConfig(width=0.9, depth=0.8, body_height=0.65, roof_height=0.35),
+        position=(0.8, -1.0, -3.4),
+    ),
+    make_tree(
+        instance_id=2001,
+        config=TreeConfig(trunk_height=0.9, trunk_radius=0.08, crown_radius=0.36),
+        position=(-2.0, -1.0, -3.6),
+    ),
+    make_tree(
+        instance_id=2002,
+        config=TreeConfig(trunk_height=1.25, trunk_radius=0.12, crown_radius=0.52),
+        position=(1.8, -1.0, -4.2),
+    ),
+], base_scene=base_scene)
+```
 
 ## Random Scenes
 
@@ -142,6 +190,8 @@ height = 512
 generated = random_scene(
     seed=1234,
     batch_size=8,
+    house_count=3,
+    tree_count=8,
     aspect_ratio=width / height,
     depth_limit=7.0,
     terrain_dz=0.05,
@@ -156,9 +206,15 @@ result = render_scene(
 ```
 
 Random scenes always include a generated procedural terrain, include both
-grounded and floating primitives, and generate spheres, boxes, prisms, and cylinders by sampling screen-space
-coordinates within the camera frustum plus a camera distance. Grounded
-primitives are placed by sampling the terrain height at their X/Z location.
+grounded and floating primitives, and generate spheres, boxes, prisms, and
+cylinders by sampling screen-space coordinates within the camera frustum plus a
+camera distance. `house_count` and `tree_count` add randomized composite houses
+and trees with per-object instance IDs and semantic classes `10` and `11`; they
+are placed with the same camera-frustum sampling style as grounded primitives
+and grounded against the generated terrain height.
+The wrapper reserves primitive slots for requested composites before calling the
+native random primitive generator so the CUDA renderer still receives ordinary
+primitive tensors.
 
 ## Benchmark
 

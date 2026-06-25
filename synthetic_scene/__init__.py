@@ -1,4 +1,17 @@
+from .composites import (
+    HOUSE_CLASS_ID,
+    TREE_CLASS_ID,
+    HouseConfig,
+    TreeConfig,
+    composite_object,
+    empty_scene,
+    house_scene,
+    make_house,
+    make_tree,
+    tree_scene,
+)
 from .renderer import (
+    CompositeObject,
     Cylinders,
     OrientedBoxes,
     Prisms,
@@ -9,6 +22,7 @@ from .renderer import (
     Spheres,
     Terrain,
     colorize_label_map,
+    flatten_composite_objects,
     random_scene,
     render_scene,
     save_image,
@@ -16,9 +30,14 @@ from .renderer import (
 )
 
 __all__ = [
+    "HOUSE_CLASS_ID",
+    "TREE_CLASS_ID",
+    "HouseConfig",
+    "TreeConfig",
     "OrientedBoxes",
     "Prisms",
     "Cylinders",
+    "CompositeObject",
     "RenderOptions",
     "RenderResult",
     "RandomScene",
@@ -26,8 +45,15 @@ __all__ = [
     "Spheres",
     "Terrain",
     "colorize_label_map",
+    "composite_object",
+    "empty_scene",
+    "flatten_composite_objects",
+    "house_scene",
+    "make_house",
+    "make_tree",
     "random_scene",
     "render_scene",
     "save_image",
     "save_label_map_visualization",
+    "tree_scene",
 ]

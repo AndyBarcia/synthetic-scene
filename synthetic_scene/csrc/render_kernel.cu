@@ -38,6 +38,8 @@ struct SphereView {
   const float* radii;
   const float* colors;
   const int* counts;
+  const int* class_ids;
+  const int* instance_ids;
   int count;
 };
 
@@ -55,6 +57,8 @@ struct TerrainView {
   const float* dz_growth;
   const float* colors;
   const int* counts;
+  const int* class_ids;
+  const int* instance_ids;
 };
 
 struct BoxView {
@@ -63,6 +67,8 @@ struct BoxView {
   const float* axes;
   const float* colors;
   const int* counts;
+  const int* class_ids;
+  const int* instance_ids;
   int count;
 };
 
@@ -72,6 +78,8 @@ struct PrismView {
   const float* axes;
   const float* colors;
   const int* counts;
+  const int* class_ids;
+  const int* instance_ids;
   int count;
 };
 
@@ -82,6 +90,8 @@ struct CylinderView {
   const float* axes;
   const float* colors;
   const int* counts;
+  const int* class_ids;
+  const int* instance_ids;
   int count;
 };
 
@@ -1827,11 +1837,7 @@ __global__ void render_scene_kernel(
   const int batch_idx = blockIdx.z;
   const int tile_x = blockIdx.x;
   const int tile_y = blockIdx.y;
-  const int sphere_count = scene.spheres.counts[batch_idx];
-  const int plane_count = 0;
   const int terrain_count = scene.terrain.counts[batch_idx];
-  const int box_count = scene.boxes.counts[batch_idx];
-  const int prism_count = scene.prisms.counts[batch_idx];
 
   const float aspect = static_cast<float>(width) / static_cast<float>(height);
   const float fov_radians = options.fov_degrees * 0.017453292519943295f;
@@ -1935,8 +1941,8 @@ __global__ void render_scene_kernel(
 
   if (closest_sphere >= 0) {
     const int sphere_offset = batch_idx * scene.spheres.count + closest_sphere;
-    instance_id = closest_sphere + 1;
-    semantic_id = 1;
+    instance_id = scene.spheres.instance_ids[sphere_offset];
+    semantic_id = scene.spheres.class_ids[sphere_offset];
     const Vec3 sphere_center = load_vec3(scene.spheres.centers + sphere_offset * 3);
     const Vec3 sphere_color = load_vec3(scene.spheres.colors + sphere_offset * 3);
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
@@ -1960,8 +1966,8 @@ __global__ void render_scene_kernel(
         closest_sphere);
   } else if (closest_box >= 0) {
     const int box_offset = batch_idx * scene.boxes.count + closest_box;
-    instance_id = sphere_count + plane_count + terrain_count + closest_box + 1;
-    semantic_id = 3;
+    instance_id = scene.boxes.instance_ids[box_offset];
+    semantic_id = scene.boxes.class_ids[box_offset];
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(closest_box_normal);
     const Vec3 box_color = load_vec3(scene.boxes.colors + box_offset * 3);
@@ -1984,8 +1990,8 @@ __global__ void render_scene_kernel(
         closest_box);
   } else if (closest_prism >= 0) {
     const int prism_offset = batch_idx * scene.prisms.count + closest_prism;
-    instance_id = sphere_count + plane_count + terrain_count + box_count + closest_prism + 1;
-    semantic_id = 5;
+    instance_id = scene.prisms.instance_ids[prism_offset];
+    semantic_id = scene.prisms.class_ids[prism_offset];
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(closest_prism_normal);
     const Vec3 prism_color = load_vec3(scene.prisms.colors + prism_offset * 3);
@@ -2008,8 +2014,8 @@ __global__ void render_scene_kernel(
         closest_prism);
   } else if (closest_cylinder >= 0) {
     const int cylinder_offset = batch_idx * scene.cylinders.count + closest_cylinder;
-    instance_id = sphere_count + plane_count + terrain_count + box_count + prism_count + closest_cylinder + 1;
-    semantic_id = 4;
+    instance_id = scene.cylinders.instance_ids[cylinder_offset];
+    semantic_id = scene.cylinders.class_ids[cylinder_offset];
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 normal = normalize(closest_cylinder_normal);
     const Vec3 cylinder_color = load_vec3(scene.cylinders.colors + cylinder_offset * 3);
@@ -2031,8 +2037,8 @@ __global__ void render_scene_kernel(
         4,
         closest_cylinder);
   } else if (closest_terrain >= 0) {
-    instance_id = sphere_count + plane_count + 1;
-    semantic_id = 2;
+    instance_id = scene.terrain.instance_ids[batch_idx];
+    semantic_id = scene.terrain.class_ids[batch_idx];
     const Vec3 hit = add(ray_origin, mul(ray_dir, closest_t));
     const Vec3 terrain_color = load_vec3(scene.terrain.colors + batch_idx * 3);
     const int receiver_bin = depth_to_bin_from_edges(fmaxf(-hit.z, kCameraNear), batch_depth_edges);
@@ -2076,6 +2082,8 @@ void render_scene_cuda(
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
     torch::Tensor sphere_counts,
+    torch::Tensor sphere_class_ids,
+    torch::Tensor sphere_instance_ids,
     torch::Tensor plane_points,
     torch::Tensor plane_normals,
     torch::Tensor plane_counts,
@@ -2086,19 +2094,27 @@ void render_scene_cuda(
     torch::Tensor terrain_dz,
     torch::Tensor terrain_dz_growth,
     torch::Tensor terrain_counts,
+    torch::Tensor terrain_class_ids,
+    torch::Tensor terrain_instance_ids,
     torch::Tensor box_centers,
     torch::Tensor box_half_sizes,
     torch::Tensor box_axes,
     torch::Tensor box_counts,
+    torch::Tensor box_class_ids,
+    torch::Tensor box_instance_ids,
     torch::Tensor prism_centers,
     torch::Tensor prism_half_sizes,
     torch::Tensor prism_axes,
     torch::Tensor prism_counts,
+    torch::Tensor prism_class_ids,
+    torch::Tensor prism_instance_ids,
     torch::Tensor cylinder_centers,
     torch::Tensor cylinder_radii,
     torch::Tensor cylinder_half_heights,
     torch::Tensor cylinder_axes,
     torch::Tensor cylinder_counts,
+    torch::Tensor cylinder_class_ids,
+    torch::Tensor cylinder_instance_ids,
     torch::Tensor light_dir,
     double fov_degrees,
     torch::Tensor background,
@@ -2135,6 +2151,8 @@ void render_scene_cuda(
           sphere_radii.data_ptr<float>(),
           sphere_colors.data_ptr<float>(),
           sphere_counts.data_ptr<int>(),
+          sphere_class_ids.data_ptr<int>(),
+          sphere_instance_ids.data_ptr<int>(),
           sphere_count,
       },
       PlaneView{
@@ -2150,6 +2168,8 @@ void render_scene_cuda(
           terrain_dz_growth.data_ptr<float>(),
           terrain_colors.data_ptr<float>(),
           terrain_counts.data_ptr<int>(),
+          terrain_class_ids.data_ptr<int>(),
+          terrain_instance_ids.data_ptr<int>(),
       },
       BoxView{
           box_centers.data_ptr<float>(),
@@ -2157,6 +2177,8 @@ void render_scene_cuda(
           box_axes.data_ptr<float>(),
           box_colors.data_ptr<float>(),
           box_counts.data_ptr<int>(),
+          box_class_ids.data_ptr<int>(),
+          box_instance_ids.data_ptr<int>(),
           box_count,
       },
       PrismView{
@@ -2165,6 +2187,8 @@ void render_scene_cuda(
           prism_axes.data_ptr<float>(),
           prism_colors.data_ptr<float>(),
           prism_counts.data_ptr<int>(),
+          prism_class_ids.data_ptr<int>(),
+          prism_instance_ids.data_ptr<int>(),
           prism_count,
       },
       CylinderView{
@@ -2174,6 +2198,8 @@ void render_scene_cuda(
           cylinder_axes.data_ptr<float>(),
           cylinder_colors.data_ptr<float>(),
           cylinder_counts.data_ptr<int>(),
+          cylinder_class_ids.data_ptr<int>(),
+          cylinder_instance_ids.data_ptr<int>(),
           cylinder_count,
       },
   };
