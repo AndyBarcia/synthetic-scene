@@ -1,6 +1,7 @@
 from .renderer import (
     Cylinders,
     OrientedBoxes,
+    Prisms,
     RenderOptions,
     RenderResult,
     RandomScene,
@@ -16,6 +17,7 @@ from .renderer import (
 
 __all__ = [
     "OrientedBoxes",
+    "Prisms",
     "Cylinders",
     "RenderOptions",
     "RenderResult",

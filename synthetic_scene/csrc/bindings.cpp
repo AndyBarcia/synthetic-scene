@@ -13,6 +13,7 @@ namespace {
 
 constexpr int kRandomSceneMaxSpheres = 64;
 constexpr int kRandomSceneMaxBoxes = 64;
+constexpr int kRandomSceneMaxPrisms = 64;
 constexpr int kRandomSceneMaxCylinders = 64;
 constexpr float kTau = 6.28318530717958647692f;
 
@@ -200,6 +201,10 @@ void render_scene_cuda(
     torch::Tensor box_half_sizes,
     torch::Tensor box_axes,
     torch::Tensor box_counts,
+    torch::Tensor prism_centers,
+    torch::Tensor prism_half_sizes,
+    torch::Tensor prism_axes,
+    torch::Tensor prism_counts,
     torch::Tensor cylinder_centers,
     torch::Tensor cylinder_radii,
     torch::Tensor cylinder_half_heights,
@@ -212,6 +217,7 @@ void render_scene_cuda(
     torch::Tensor plane_colors,
     torch::Tensor terrain_colors,
     torch::Tensor box_colors,
+    torch::Tensor prism_colors,
     torch::Tensor cylinder_colors,
     double ambient,
     bool shadows,
@@ -274,6 +280,11 @@ py::dict random_scene(
   std::vector<float> box_axes;
   std::vector<float> box_colors;
   std::vector<int32_t> box_counts;
+  std::vector<float> prism_centers;
+  std::vector<float> prism_half_sizes;
+  std::vector<float> prism_axes;
+  std::vector<float> prism_colors;
+  std::vector<int32_t> prism_counts;
   std::vector<float> cylinder_centers;
   std::vector<float> cylinder_radii;
   std::vector<float> cylinder_half_heights;
@@ -291,9 +302,11 @@ py::dict random_scene(
   const int max_objects = ground_objects + floating_objects;
   const int64_t sphere_count = static_cast<int64_t>(max_objects);
   const int64_t box_count = static_cast<int64_t>(max_objects);
+  const int64_t prism_count = static_cast<int64_t>(max_objects);
   const int64_t cylinder_count = static_cast<int64_t>(max_objects);
   TORCH_CHECK(
-      sphere_count <= kRandomSceneMaxSpheres && box_count <= kRandomSceneMaxBoxes && cylinder_count <= kRandomSceneMaxCylinders,
+      sphere_count <= kRandomSceneMaxSpheres && box_count <= kRandomSceneMaxBoxes && prism_count <= kRandomSceneMaxPrisms &&
+          cylinder_count <= kRandomSceneMaxCylinders,
       "random_scene generated more primitives than the renderer supports");
 
   for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
@@ -312,6 +325,7 @@ py::dict random_scene(
 
     int scene_spheres = 0;
     int scene_boxes = 0;
+    int scene_prisms = 0;
     int scene_cylinders = 0;
     auto add_sphere = [&](Vec3 center, float radius) {
       append_vec3(sphere_centers, center);
@@ -325,6 +339,13 @@ py::dict random_scene(
       append_mat3(box_axes, axes);
       append_vec3(box_colors, random_color(generator));
       ++scene_boxes;
+    };
+    auto add_prism = [&](Vec3 center, Vec3 half_size, Mat3 axes) {
+      append_vec3(prism_centers, center);
+      append_vec3(prism_half_sizes, half_size);
+      append_mat3(prism_axes, axes);
+      append_vec3(prism_colors, random_color(generator));
+      ++scene_prisms;
     };
     auto add_cylinder = [&](Vec3 center, float radius, float half_height, Mat3 axes) {
       append_vec3(cylinder_centers, center);
@@ -348,16 +369,23 @@ py::dict random_scene(
       const float z = frustum_point.z;
       const float terrain_y = terrain_base_height + smooth_height(x, z, phase_x, phase_z);
       const float primitive_pick = rand_float(generator, 0.0f, 1.0f);
-      if (primitive_pick < 0.45f) {
+      if (primitive_pick < 0.36f) {
         const float radius = rand_float(generator, 0.18f, 0.65f);
         add_sphere(Vec3{x, terrain_y + radius, z}, radius);
-      } else if (primitive_pick < 0.78f) {
+      } else if (primitive_pick < 0.62f) {
         const Vec3 half_size{
             rand_float(generator, 0.18f, 0.6f),
             rand_float(generator, 0.18f, 0.75f),
             rand_float(generator, 0.18f, 0.6f),
         };
         add_box(Vec3{x, terrain_y + half_size.y, z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
+      } else if (primitive_pick < 0.82f) {
+        const Vec3 half_size{
+            rand_float(generator, 0.20f, 0.65f),
+            rand_float(generator, 0.22f, 0.75f),
+            rand_float(generator, 0.18f, 0.6f),
+        };
+        add_prism(Vec3{x, terrain_y + half_size.y, z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
       } else {
         const float radius = rand_float(generator, 0.16f, 0.45f);
         const float half_height = rand_float(generator, 0.25f, 0.8f);
@@ -382,16 +410,23 @@ py::dict random_scene(
       const float y = frustum_point.y;
       const float z = frustum_point.z;
       const float primitive_pick = rand_float(generator, 0.0f, 1.0f);
-      if (primitive_pick < 0.50f) {
+      if (primitive_pick < 0.40f) {
         const float radius = rand_float(generator, 0.15f, 0.5f);
         add_sphere(Vec3{x, y, z}, radius);
-      } else if (primitive_pick < 0.75f) {
+      } else if (primitive_pick < 0.62f) {
         const Vec3 half_size{
             rand_float(generator, 0.14f, 0.45f),
             rand_float(generator, 0.14f, 0.45f),
             rand_float(generator, 0.14f, 0.45f),
         };
         add_box(Vec3{x, y, z}, half_size, yaw_axes(rand_float(generator, 0.0f, kTau)));
+      } else if (primitive_pick < 0.80f) {
+        const Vec3 half_size{
+            rand_float(generator, 0.14f, 0.5f),
+            rand_float(generator, 0.14f, 0.5f),
+            rand_float(generator, 0.14f, 0.5f),
+        };
+        add_prism(Vec3{x, y, z}, half_size, random_axes(generator));
       } else {
         const float radius = rand_float(generator, 0.12f, 0.36f);
         const float half_height = rand_float(generator, 0.22f, 0.7f);
@@ -401,6 +436,7 @@ py::dict random_scene(
 
     const int real_spheres = scene_spheres;
     const int real_boxes = scene_boxes;
+    const int real_prisms = scene_prisms;
     const int real_cylinders = scene_cylinders;
     while (scene_spheres < max_objects) {
       append_vec3(sphere_centers, Vec3{0.0f, 0.0f, -1.0f});
@@ -415,6 +451,13 @@ py::dict random_scene(
       append_vec3(box_colors, Vec3{0.0f, 0.0f, 0.0f});
       ++scene_boxes;
     }
+    while (scene_prisms < max_objects) {
+      append_vec3(prism_centers, Vec3{0.0f, 0.0f, -1.0f});
+      append_vec3(prism_half_sizes, Vec3{1.0f, 1.0f, 1.0f});
+      append_mat3(prism_axes, yaw_axes(0.0f));
+      append_vec3(prism_colors, Vec3{0.0f, 0.0f, 0.0f});
+      ++scene_prisms;
+    }
     while (scene_cylinders < max_objects) {
       append_vec3(cylinder_centers, Vec3{0.0f, 0.0f, -1.0f});
       cylinder_radii.push_back(1.0f);
@@ -425,6 +468,7 @@ py::dict random_scene(
     }
     sphere_counts.push_back(static_cast<int32_t>(real_spheres));
     box_counts.push_back(static_cast<int32_t>(real_boxes));
+    prism_counts.push_back(static_cast<int32_t>(real_prisms));
     cylinder_counts.push_back(static_cast<int32_t>(real_cylinders));
   }
 
@@ -453,6 +497,11 @@ py::dict random_scene(
   result["box_axes"] = make_cuda_tensor(std::move(box_axes), {batch_size, box_count, 3, 3});
   result["box_colors"] = make_cuda_tensor(std::move(box_colors), {batch_size, box_count, 3});
   result["box_counts"] = make_cuda_int_tensor(std::move(box_counts), {batch_size});
+  result["prism_centers"] = make_cuda_tensor(std::move(prism_centers), {batch_size, prism_count, 3});
+  result["prism_half_sizes"] = make_cuda_tensor(std::move(prism_half_sizes), {batch_size, prism_count, 3});
+  result["prism_axes"] = make_cuda_tensor(std::move(prism_axes), {batch_size, prism_count, 3, 3});
+  result["prism_colors"] = make_cuda_tensor(std::move(prism_colors), {batch_size, prism_count, 3});
+  result["prism_counts"] = make_cuda_int_tensor(std::move(prism_counts), {batch_size});
   result["cylinder_centers"] = make_cuda_tensor(std::move(cylinder_centers), {batch_size, cylinder_count, 3});
   result["cylinder_radii"] = make_cuda_tensor(std::move(cylinder_radii), {batch_size, cylinder_count});
   result["cylinder_half_heights"] = make_cuda_tensor(std::move(cylinder_half_heights), {batch_size, cylinder_count});
@@ -472,6 +521,7 @@ void render_scene(
   const py::dict planes = require_dict(scene, "planes");
   const py::dict terrain = require_dict(scene, "terrain");
   const py::dict boxes = require_dict(scene, "boxes");
+  const py::dict prisms = require_dict(scene, "prisms");
   const py::dict cylinders = require_dict(scene, "cylinders");
 
   const torch::Tensor light_dir = require_tensor(options, "light_dir");
@@ -505,6 +555,11 @@ void render_scene(
   const torch::Tensor box_axes = require_tensor(boxes, "axes");
   const torch::Tensor box_colors = require_tensor(boxes, "colors");
   const torch::Tensor box_counts = require_tensor(boxes, "counts");
+  const torch::Tensor prism_centers = require_tensor(prisms, "centers");
+  const torch::Tensor prism_half_sizes = require_tensor(prisms, "half_sizes");
+  const torch::Tensor prism_axes = require_tensor(prisms, "axes");
+  const torch::Tensor prism_colors = require_tensor(prisms, "colors");
+  const torch::Tensor prism_counts = require_tensor(prisms, "counts");
   const torch::Tensor cylinder_centers = require_tensor(cylinders, "centers");
   const torch::Tensor cylinder_radii = require_tensor(cylinders, "radii");
   const torch::Tensor cylinder_half_heights = require_tensor(cylinders, "half_heights");
@@ -534,14 +589,15 @@ void render_scene(
           terrain_phase_zs.is_cuda() && terrain_dz.is_cuda() && terrain_dz_growth.is_cuda(),
       "scene tensors must be CUDA tensors");
   TORCH_CHECK(box_centers.is_cuda() && box_half_sizes.is_cuda() && box_axes.is_cuda(), "scene tensors must be CUDA tensors");
+  TORCH_CHECK(prism_centers.is_cuda() && prism_half_sizes.is_cuda() && prism_axes.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(cylinder_centers.is_cuda() && cylinder_radii.is_cuda() && cylinder_half_heights.is_cuda() && cylinder_axes.is_cuda(), "scene tensors must be CUDA tensors");
   TORCH_CHECK(
       light_dir.is_cuda() && background.is_cuda() && sphere_colors.is_cuda() && plane_colors.is_cuda() &&
-          terrain_colors.is_cuda() && box_colors.is_cuda() && cylinder_colors.is_cuda(),
+          terrain_colors.is_cuda() && box_colors.is_cuda() && prism_colors.is_cuda() && cylinder_colors.is_cuda(),
       "scene tensors must be CUDA tensors");
   TORCH_CHECK(
       sphere_counts.is_cuda() && plane_counts.is_cuda() && terrain_counts.is_cuda() && box_counts.is_cuda() &&
-          cylinder_counts.is_cuda(),
+          prism_counts.is_cuda() && cylinder_counts.is_cuda(),
       "primitive count tensors must be CUDA tensors");
   TORCH_CHECK(sphere_centers.dim() == 3 && sphere_centers.size(2) == 3, "sphere_centers must be B x N x 3");
   TORCH_CHECK(sphere_radii.dim() == 2, "sphere_radii must be B x N");
@@ -556,6 +612,9 @@ void render_scene(
   TORCH_CHECK(box_centers.dim() == 3 && box_centers.size(2) == 3, "box_centers must be B x N x 3");
   TORCH_CHECK(box_half_sizes.dim() == 3 && box_half_sizes.size(2) == 3, "box_half_sizes must be B x N x 3");
   TORCH_CHECK(box_axes.dim() == 4 && box_axes.size(2) == 3 && box_axes.size(3) == 3, "box_axes must be B x N x 3 x 3");
+  TORCH_CHECK(prism_centers.dim() == 3 && prism_centers.size(2) == 3, "prism_centers must be B x N x 3");
+  TORCH_CHECK(prism_half_sizes.dim() == 3 && prism_half_sizes.size(2) == 3, "prism_half_sizes must be B x N x 3");
+  TORCH_CHECK(prism_axes.dim() == 4 && prism_axes.size(2) == 3 && prism_axes.size(3) == 3, "prism_axes must be B x N x 3 x 3");
   TORCH_CHECK(cylinder_centers.dim() == 3 && cylinder_centers.size(2) == 3, "cylinder_centers must be B x N x 3");
   TORCH_CHECK(cylinder_radii.dim() == 2, "cylinder_radii must be B x N");
   TORCH_CHECK(cylinder_half_heights.dim() == 2, "cylinder_half_heights must be B x N");
@@ -564,20 +623,22 @@ void render_scene(
   TORCH_CHECK(plane_colors.dim() == 3 && plane_colors.size(2) == 3, "plane_colors must be B x N x 3");
   TORCH_CHECK(terrain_colors.dim() == 3 && terrain_colors.size(1) == 1 && terrain_colors.size(2) == 3, "terrain_colors must be B x 1 x 3");
   TORCH_CHECK(box_colors.dim() == 3 && box_colors.size(2) == 3, "box_colors must be B x N x 3");
+  TORCH_CHECK(prism_colors.dim() == 3 && prism_colors.size(2) == 3, "prism_colors must be B x N x 3");
   TORCH_CHECK(cylinder_colors.dim() == 3 && cylinder_colors.size(2) == 3, "cylinder_colors must be B x N x 3");
   TORCH_CHECK(
       sphere_counts.dim() == 1 && plane_counts.dim() == 1 && terrain_counts.dim() == 1 && box_counts.dim() == 1 &&
-          cylinder_counts.dim() == 1,
+          prism_counts.dim() == 1 && cylinder_counts.dim() == 1,
       "primitive counts must be B");
   TORCH_CHECK(sphere_centers.size(0) == image.size(0), "scene batch size must match image batch size");
   TORCH_CHECK(
       plane_points.size(0) == image.size(0) && terrain_depth_limits.size(0) == image.size(0) &&
-          box_centers.size(0) == image.size(0) && cylinder_centers.size(0) == image.size(0),
+          box_centers.size(0) == image.size(0) && prism_centers.size(0) == image.size(0) &&
+          cylinder_centers.size(0) == image.size(0),
       "scene batch size must match image batch size");
   TORCH_CHECK(
       sphere_counts.size(0) == image.size(0) && plane_counts.size(0) == image.size(0) &&
           terrain_counts.size(0) == image.size(0) && box_counts.size(0) == image.size(0) &&
-          cylinder_counts.size(0) == image.size(0),
+          prism_counts.size(0) == image.size(0) && cylinder_counts.size(0) == image.size(0),
       "primitive count batch size must match image batch size");
   TORCH_CHECK(sphere_centers.size(1) == sphere_radii.size(1), "sphere_centers and sphere_radii must have matching lengths");
   TORCH_CHECK(sphere_centers.size(1) == sphere_colors.size(1), "sphere_centers and sphere_colors must have matching lengths");
@@ -586,13 +647,16 @@ void render_scene(
   TORCH_CHECK(box_centers.size(1) == box_half_sizes.size(1), "box_centers and box_half_sizes must have matching lengths");
   TORCH_CHECK(box_centers.size(1) == box_axes.size(1), "box_centers and box_axes must have matching lengths");
   TORCH_CHECK(box_centers.size(1) == box_colors.size(1), "box_centers and box_colors must have matching lengths");
+  TORCH_CHECK(prism_centers.size(1) == prism_half_sizes.size(1), "prism_centers and prism_half_sizes must have matching lengths");
+  TORCH_CHECK(prism_centers.size(1) == prism_axes.size(1), "prism_centers and prism_axes must have matching lengths");
+  TORCH_CHECK(prism_centers.size(1) == prism_colors.size(1), "prism_centers and prism_colors must have matching lengths");
   TORCH_CHECK(cylinder_centers.size(1) == cylinder_radii.size(1), "cylinder_centers and cylinder_radii must have matching lengths");
   TORCH_CHECK(cylinder_centers.size(1) == cylinder_half_heights.size(1), "cylinder_centers and cylinder_half_heights must have matching lengths");
   TORCH_CHECK(cylinder_centers.size(1) == cylinder_axes.size(1), "cylinder_centers and cylinder_axes must have matching lengths");
   TORCH_CHECK(cylinder_centers.size(1) == cylinder_colors.size(1), "cylinder_centers and cylinder_colors must have matching lengths");
   TORCH_CHECK(
       sphere_centers.size(1) > 0 || plane_points.size(1) > 0 || terrain_depth_limits.size(1) > 0 ||
-          box_centers.size(1) > 0 || cylinder_centers.size(1) > 0,
+          box_centers.size(1) > 0 || prism_centers.size(1) > 0 || cylinder_centers.size(1) > 0,
       "at least one object slot is required");
   TORCH_CHECK(light_dir.numel() == 3 && background.numel() == 3, "light/background vectors must be vec3");
   TORCH_CHECK(ambient >= 0.0 && ambient <= 1.0, "ambient must be in the range [0, 1]");
@@ -610,6 +674,9 @@ void render_scene(
   TORCH_CHECK(box_centers.dtype() == torch::kFloat32, "box_centers must be float32");
   TORCH_CHECK(box_half_sizes.dtype() == torch::kFloat32, "box_half_sizes must be float32");
   TORCH_CHECK(box_axes.dtype() == torch::kFloat32, "box_axes must be float32");
+  TORCH_CHECK(prism_centers.dtype() == torch::kFloat32, "prism_centers must be float32");
+  TORCH_CHECK(prism_half_sizes.dtype() == torch::kFloat32, "prism_half_sizes must be float32");
+  TORCH_CHECK(prism_axes.dtype() == torch::kFloat32, "prism_axes must be float32");
   TORCH_CHECK(cylinder_centers.dtype() == torch::kFloat32, "cylinder_centers must be float32");
   TORCH_CHECK(cylinder_radii.dtype() == torch::kFloat32, "cylinder_radii must be float32");
   TORCH_CHECK(cylinder_half_heights.dtype() == torch::kFloat32, "cylinder_half_heights must be float32");
@@ -620,11 +687,12 @@ void render_scene(
   TORCH_CHECK(plane_colors.dtype() == torch::kFloat32, "plane_colors must be float32");
   TORCH_CHECK(terrain_colors.dtype() == torch::kFloat32, "terrain_colors must be float32");
   TORCH_CHECK(box_colors.dtype() == torch::kFloat32, "box_colors must be float32");
+  TORCH_CHECK(prism_colors.dtype() == torch::kFloat32, "prism_colors must be float32");
   TORCH_CHECK(cylinder_colors.dtype() == torch::kFloat32, "cylinder_colors must be float32");
   TORCH_CHECK(
       sphere_counts.dtype() == torch::kInt32 && plane_counts.dtype() == torch::kInt32 &&
           terrain_counts.dtype() == torch::kInt32 && box_counts.dtype() == torch::kInt32 &&
-          cylinder_counts.dtype() == torch::kInt32,
+          prism_counts.dtype() == torch::kInt32 && cylinder_counts.dtype() == torch::kInt32,
       "primitive counts must be int32");
   TORCH_CHECK(image.is_contiguous(), "image must be contiguous");
   TORCH_CHECK(instance_map.is_contiguous() && semantic_map.is_contiguous(), "segmentation maps must be contiguous");
@@ -636,14 +704,15 @@ void render_scene(
           terrain_dz.is_contiguous() && terrain_dz_growth.is_contiguous(),
       "scene tensors must be contiguous");
   TORCH_CHECK(box_centers.is_contiguous() && box_half_sizes.is_contiguous() && box_axes.is_contiguous(), "scene tensors must be contiguous");
+  TORCH_CHECK(prism_centers.is_contiguous() && prism_half_sizes.is_contiguous() && prism_axes.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(cylinder_centers.is_contiguous() && cylinder_radii.is_contiguous() && cylinder_half_heights.is_contiguous() && cylinder_axes.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(
       light_dir.is_contiguous() && background.is_contiguous() && sphere_colors.is_contiguous() && plane_colors.is_contiguous() &&
-          terrain_colors.is_contiguous() && box_colors.is_contiguous() && cylinder_colors.is_contiguous(),
+          terrain_colors.is_contiguous() && box_colors.is_contiguous() && prism_colors.is_contiguous() && cylinder_colors.is_contiguous(),
       "scene tensors must be contiguous");
   TORCH_CHECK(
       sphere_counts.is_contiguous() && plane_counts.is_contiguous() && terrain_counts.is_contiguous() &&
-          box_counts.is_contiguous() && cylinder_counts.is_contiguous(),
+          box_counts.is_contiguous() && prism_counts.is_contiguous() && cylinder_counts.is_contiguous(),
       "primitive count tensors must be contiguous");
 
   render_scene_cuda(
@@ -667,6 +736,10 @@ void render_scene(
       box_half_sizes,
       box_axes,
       box_counts,
+      prism_centers,
+      prism_half_sizes,
+      prism_axes,
+      prism_counts,
       cylinder_centers,
       cylinder_radii,
       cylinder_half_heights,
@@ -679,6 +752,7 @@ void render_scene(
       plane_colors,
       terrain_colors,
       box_colors,
+      prism_colors,
       cylinder_colors,
       ambient,
       shadows,
