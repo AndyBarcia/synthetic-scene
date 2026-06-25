@@ -68,12 +68,15 @@ Mat3 yaw_axes(float yaw) {
 
 float smooth_height(float x, float z, float phase_x, float phase_z) {
   const float forward_depth = std::max(-z, 0.0f);
-  const float far_rise = 0.055f * forward_depth + 0.0011f * forward_depth * forward_depth;
+  const float hill_t = std::min(std::max((forward_depth - 24.0f) / 48.0f, 0.0f), 1.0f);
+  const float far_hill_weight = hill_t * hill_t * (3.0f - 2.0f * hill_t);
+  const float near_flat_weight = 0.06f + 0.94f * far_hill_weight;
+  const float far_rise = far_hill_weight * (0.055f * forward_depth + 0.0011f * forward_depth * forward_depth);
   const float broad_undulation =
       1.20f * std::sin(0.18f * x + 0.11f * z + phase_x) + 0.85f * std::cos(0.13f * x - 0.20f * z + phase_z);
   const float foothills = 0.42f * std::sin(0.46f * x + 0.34f * z + phase_x * 0.61f + phase_z * 0.23f);
   const float worn_detail = 0.12f * std::sin(0.95f * x - 0.58f * z + phase_z * 1.37f);
-  return far_rise + broad_undulation + foothills + worn_detail;
+  return far_rise + near_flat_weight * (broad_undulation + foothills + worn_detail);
 }
 
 torch::Tensor make_cuda_tensor(std::vector<float>&& values, std::vector<int64_t> shape) {
