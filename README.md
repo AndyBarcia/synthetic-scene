@@ -12,13 +12,13 @@ renders draw different camera-space scenes.
 ## Build
 
 ```bash
-conda run -n clipdino-cu117 python setup.py build_ext --inplace
+conda run -n pytorch181 python setup.py build_ext --inplace
 ```
 
 ## Render
 
 ```bash
-conda run -n clipdino-cu117 python -m examples.render
+conda run -n pytorch181 python -m examples.render
 ```
 
 The example writes `outputs/render.png` plus side-by-side colorized instance and
@@ -163,7 +163,7 @@ primitives are placed by sampling the terrain height at their X/Z location.
 ## Benchmark
 
 ```bash
-conda run -n clipdino-cu117 python -m examples.benchmark
+conda run -n pytorch181 python -m examples.benchmark
 ```
 
 The benchmark renders the same seeded random scene style as `examples.render`
@@ -171,8 +171,22 @@ with a batch size of 8 by default. You can sweep the image size, batch size,
 sample count, and random seed:
 
 ```bash
-conda run -n clipdino-cu117 python -m examples.benchmark --width 1920 --height 1080 --batch-size 16 --iterations 200 --seed 5678
+conda run -n pytorch181 python -m examples.benchmark --width 1920 --height 1080 --batch-size 16 --iterations 200 --seed 5678
 ```
 
-The benchmark reports CUDA event timing for the render kernel, synchronized host
-wall time, output tensor size, and PyTorch CUDA allocated/reserved memory peaks.
+The benchmark reports CUDA event timing around the full render call,
+synchronized host wall time, output tensor size, and PyTorch CUDA
+allocated/reserved memory peaks.
+The event interval includes preprocessing and host submission gaps; it is not
+an isolated kernel measurement.
+
+On an NVIDIA GeForce GTX 1050, the default benchmark (768 x 512, batch size 8,
+10 warmup renders, 100 measured renders, seed 1234) produced:
+
+| Measurement | Mean | Median | p95 | Min / max |
+| --- | ---: | ---: | ---: | ---: |
+| Render call, CUDA events | 17.4714 ms | 17.4111 ms | 17.8790 ms | 16.9626 / 18.9952 ms |
+| Synchronized host wall time | 17.5786 ms | 17.5283 ms | 18.0485 ms | 17.0296 / 19.1578 ms |
+
+Mean render throughput was 180.05 Mpixels/s. Peak allocated CUDA memory was
+56.38 MiB. Timing depends on GPU model, clock state, driver, and scene contents.

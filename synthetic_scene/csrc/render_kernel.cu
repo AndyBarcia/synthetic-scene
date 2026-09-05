@@ -1525,18 +1525,19 @@ __global__ void build_shadow_cluster_masks_kernel(
     int tiles_y,
     SceneView scene,
     RenderOptionsView options) {
-  __shared__ int shared_valid;
-  __shared__ LightBounds shared_caster_bounds_ls;
+  // Each thread owns a receiver's complete mask. Cache caster bounds once per
+  // block, avoiding per-caster blocks, repeated receiver loads and atomic ORs.
+  __shared__ int caster_valid[kMaxFinitePrimitives];
+  __shared__ LightBounds caster_bounds[kMaxFinitePrimitives];
 
   const int cluster_linear = blockIdx.x * blockDim.x + threadIdx.x;
-  const int primitive_slot = blockIdx.y;
-  const int batch_idx = blockIdx.z;
+  const int batch_idx = blockIdx.y;
   const int total_clusters = tiles_x * tiles_y * kDepthBins;
+  const int primitive_count = scene.spheres.count + scene.boxes.count +
+      scene.prisms.count + scene.cylinders.count;
 
-  if (threadIdx.x == 0) {
-    shared_valid = 0;
-    shared_caster_bounds_ls = empty_light_bounds();
-
+  for (int primitive_slot = threadIdx.x; primitive_slot < primitive_count; primitive_slot += blockDim.x) {
+    caster_valid[primitive_slot] = 0;
     Vec3 center = make_vec3(0.0f, 0.0f, 0.0f);
     Vec3 half_size = make_vec3(0.0f, 0.0f, 0.0f);
     Aabb bounds = empty_aabb();
@@ -1545,33 +1546,28 @@ __global__ void build_shadow_cluster_masks_kernel(
     if (load_primitive_bounds_for_slot(scene, batch_idx, primitive_slot, &kind, &index, &bounds, &center, &half_size)) {
       const Vec3 light_dir = normalize(load_vec3(options.light_dir));
       const LightBasis light_basis = make_light_basis(light_dir);
-      shared_caster_bounds_ls = project_aabb_to_light_bounds(bounds, light_basis);
-      shared_valid = 1;
+      caster_bounds[primitive_slot] = project_aabb_to_light_bounds(bounds, light_basis);
+      caster_valid[primitive_slot] = 1;
     }
   }
   __syncthreads();
 
-  if (!shared_valid || cluster_linear >= total_clusters) {
+  if (cluster_linear >= total_clusters) {
     return;
   }
 
-  const int bin = cluster_linear % kDepthBins;
-  const int tile_linear = cluster_linear / kDepthBins;
-  const int tile_x = tile_linear % tiles_x;
-  const int tile_y = tile_linear / tiles_x;
-
   const int bounds_idx = (batch_idx * total_clusters + cluster_linear) * 6;
   const LightBounds receiver_bounds = load_light_bounds6(receiver_light_bounds + bounds_idx);
-  if (light_bounds_can_shadow_receiver(shared_caster_bounds_ls, receiver_bounds)) {
-    mark_primitive_in_cluster_mask(
-        shadow_cluster_masks,
-        batch_idx,
-        tile_y,
-        tile_x,
-        bin,
-        tiles_x,
-        tiles_y,
-        primitive_slot);
+  const int mask_idx = (batch_idx * total_clusters + cluster_linear) * kPrimitiveMaskWords;
+  for (int word = 0; word < kPrimitiveMaskWords; ++word) {
+    unsigned int bits = 0;
+    const int end = min(primitive_count, (word + 1) * 32);
+    for (int slot = word * 32; slot < end; ++slot) {
+      if (caster_valid[slot] && light_bounds_can_shadow_receiver(caster_bounds[slot], receiver_bounds)) {
+        bits |= 1u << (slot % 32);
+      }
+    }
+    shadow_cluster_masks[mask_idx + word] = static_cast<int>(bits);
   }
 }
 
@@ -2238,7 +2234,7 @@ void render_scene_cuda(
         options);
 
     if (shadows) {
-      shadow_cluster_masks = torch::zeros(
+      shadow_cluster_masks = torch::empty(
           {batch_size, tiles_y, tiles_x, kDepthBins, kPrimitiveMaskWords}, int_options);
       receiver_light_bounds = torch::empty(
           {batch_size, tiles_y, tiles_x, kDepthBins, 6}, image.options());
@@ -2253,7 +2249,7 @@ void render_scene_cuda(
           tiles_y,
           options);
 
-      const dim3 shadow_build_grid((total_clusters + cluster_threads - 1) / cluster_threads, primitive_slot_count, batch_size);
+      const dim3 shadow_build_grid((total_clusters + cluster_threads - 1) / cluster_threads, batch_size);
       build_shadow_cluster_masks_kernel<<<shadow_build_grid, cluster_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
           shadow_cluster_masks.data_ptr<int>(),
           receiver_light_bounds.data_ptr<float>(),
