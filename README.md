@@ -166,27 +166,59 @@ primitives are placed by sampling the terrain height at their X/Z location.
 conda run -n pytorch181 python -m examples.benchmark
 ```
 
-The benchmark renders the same seeded random scene style as `examples.render`
-with a batch size of 8 by default. You can sweep the image size, batch size,
-sample count, and random seed:
+The benchmark generates and renders the same seeded random scene style as
+`examples.render`, with a batch size of 8 by default. Each measured iteration
+generates a new deterministic scene and requests RGB, instance and semantic
+maps, and visible-instance metadata. You can sweep the image size, batch size,
+sample count, profiler sample count, and random seed:
 
 ```bash
-conda run -n pytorch181 python -m examples.benchmark --width 1920 --height 1080 --batch-size 16 --iterations 200 --seed 5678
+conda run -n pytorch181 python -m examples.benchmark --width 1920 --height 1080 --batch-size 16 --iterations 200 --profile-iterations 5 --seed 5678
 ```
 
-The benchmark reports CUDA event timing around the full render call,
-synchronized host wall time, output tensor size, and PyTorch CUDA
-allocated/reserved memory peaks.
-The event interval includes preprocessing and host submission gaps; it is not
-an isolated kernel measurement.
+Pass `--no-shadows` to measure the same pipeline with shadow rays disabled:
+
+```bash
+conda run -n pytorch181 python -m examples.benchmark --no-shadows
+```
+
+The benchmark uses an unprofiled pass for end-to-end CUDA event and synchronized
+host wall timing. A separate profiler pass attributes GPU execution to scene and
+tensor preparation, terrain rasterization, cluster-mask construction, rendering,
+and segmentation. The stage rows measure GPU work and exclude profiler overhead;
+their sum can be lower than the end-to-end CUDA event interval, which also
+includes CPU submission and synchronization gaps. The benchmark also reports
+the combined output tensor size and PyTorch CUDA allocated/reserved memory peaks.
 
 On an NVIDIA GeForce GTX 1050, the default benchmark (768 x 512, batch size 8,
-10 warmup renders, 100 measured renders, seed 1234) produced:
+10 warmup iterations, 100 measured iterations, 5 profiled iterations, seeds
+starting at 1234) produced:
 
 | Measurement | Mean | Median | p95 | Min / max |
 | --- | ---: | ---: | ---: | ---: |
-| Render call, CUDA events | 17.4714 ms | 17.4111 ms | 17.8790 ms | 16.9626 / 18.9952 ms |
-| Synchronized host wall time | 17.5786 ms | 17.5283 ms | 18.0485 ms | 17.0296 / 19.1578 ms |
+| Preparation, CUDA execution | 0.2224 ms | — | — | — |
+| Terrain, CUDA execution | 0.9578 ms | — | — | — |
+| Mask construction, CUDA execution | 0.4422 ms | — | — | — |
+| Rendering, CUDA execution | 11.4868 ms | — | — | — |
+| Segmentation, CUDA execution | 6.1078 ms | — | — | — |
+| End-to-end, CUDA events | 33.7910 ms | 33.6461 ms | 37.7078 ms | 28.9874 / 38.8045 ms |
+| Synchronized host wall time | 33.8560 ms | 33.6972 ms | 37.7404 ms | 29.1191 / 38.8681 ms |
 
-Mean render throughput was 180.05 Mpixels/s. Peak allocated CUDA memory was
-56.38 MiB. Timing depends on GPU model, clock state, driver, and scene contents.
+Mean end-to-end throughput was 93.09 Mpixels/s. The five output tensors occupied
+60.00 MiB, and peak allocated CUDA memory was 140.38 MiB. Timing depends on GPU
+model, clock state, driver, profiler version, and scene contents.
+
+With shadows disabled and every other default unchanged, the same GPU produced:
+
+| Measurement | Mean | Median | p95 | Min / max |
+| --- | ---: | ---: | ---: | ---: |
+| Preparation, CUDA execution | 0.1630 ms | — | — | — |
+| Terrain, CUDA execution | 0.9848 ms | — | — | — |
+| Mask construction, CUDA execution | 0.0850 ms | — | — | — |
+| Rendering, CUDA execution | 8.3390 ms | — | — | — |
+| Segmentation, CUDA execution | 6.1330 ms | — | — | — |
+| End-to-end, CUDA events | 30.3368 ms | 30.0053 ms | 33.4387 ms | 27.2323 / 33.8043 ms |
+| Synchronized host wall time | 30.3772 ms | 30.0509 ms | 33.4800 ms | 27.2503 / 33.8219 ms |
+
+Disabling shadows reduced mean end-to-end CUDA time by 10.2% and increased
+throughput to 103.69 Mpixels/s. Peak allocated CUDA memory was 136.63 MiB.

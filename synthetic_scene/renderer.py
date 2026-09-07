@@ -546,14 +546,15 @@ def render_scene(
         },
     )
     if return_maps:
-        visible_count, visible_classes, instance_map = _compact_visible_instances(
-            instance_map,
-            sphere_counts=sphere_counts,
-            terrain_counts=terrain_counts,
-            box_counts=box_counts,
-            prism_counts=prism_counts,
-            cylinder_counts=cylinder_counts,
-        )
+        with torch.autograd.profiler.record_function("synthetic_scene::segmentation"):
+            visible_count, visible_classes, instance_map = _compact_visible_instances(
+                instance_map,
+                sphere_counts=sphere_counts,
+                terrain_counts=terrain_counts,
+                box_counts=box_counts,
+                prism_counts=prism_counts,
+                cylinder_counts=cylinder_counts,
+            )
         return RenderResult(
             image=image,
             visible_count=visible_count,
