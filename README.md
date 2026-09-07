@@ -222,3 +222,20 @@ With shadows disabled and every other default unchanged, the same GPU produced:
 
 Disabling shadows reduced mean end-to-end CUDA time by 12.3% and increased
 throughput to 141.32 Mpixels/s. Peak allocated CUDA memory was 156.15 MiB.
+
+Pass `--no-terrain` to render the generated scenes without their procedural
+terrain:
+
+```bash
+conda run -n pytorch181 python -m examples.benchmark --no-terrain
+```
+
+| Measurement | Mean | Median | p95 | Min / max |
+| --- | ---: | ---: | ---: | ---: |
+| Preparation, CUDA execution | 0.2032 ms | — | — | — |
+| Terrain, CUDA execution | 0.1696 ms | — | — | — |
+| Mask construction, CUDA execution | 0.4404 ms | — | — | — |
+| Rendering, CUDA execution | 12.7842 ms | — | — | — |
+| Segmentation, CUDA execution | 1.7598 ms | — | — | — |
+| End-to-end, CUDA events | 26.7918 ms | 26.8099 ms | 28.2962 ms | 24.6876 / 29.6980 ms |
+| Synchronized host wall time | 26.8820 ms | 26.9125 ms | 28.3301 ms | 25.0906 / 29.7500 ms |

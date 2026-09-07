@@ -4,6 +4,7 @@ import argparse
 import statistics
 import time
 from collections.abc import Iterable
+from dataclasses import replace
 
 import torch
 
@@ -47,12 +48,22 @@ def format_bytes(num_bytes: int) -> str:
     return f"{value:.2f} GiB"
 
 
-def render_benchmark_scene(width: int, height: int, seed: int, batch_size: int, shadows: bool = True) -> RenderResult:
+def render_benchmark_scene(
+    width: int,
+    height: int,
+    seed: int,
+    batch_size: int,
+    shadows: bool = True,
+    terrain: bool = True,
+) -> RenderResult:
     generated = random_scene(seed=seed, batch_size=batch_size, aspect_ratio=width / height)
+    scene = generated.scene
+    if not terrain:
+        scene = replace(scene, terrain=replace(scene.terrain, counts=torch.zeros_like(scene.terrain.counts)))
     result = render_scene(
         width=width,
         height=height,
-        scene=generated.scene,
+        scene=scene,
         options=RenderOptions(shadows=shadows),
         return_maps=True,
     )
@@ -80,12 +91,13 @@ def profile_stages(
     iterations: int,
     seed: int,
     shadows: bool = True,
+    terrain: bool = True,
 ) -> dict[str, float]:
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     with torch.profiler.profile(activities=activities) as profile:
         for iteration in range(iterations):
             with torch.autograd.profiler.record_function("synthetic_scene::benchmark_iteration"):
-                render_benchmark_scene(width, height, seed + iteration, batch_size, shadows)
+                render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain)
         torch.cuda.synchronize()
 
     events = profile.key_averages()
@@ -122,6 +134,7 @@ def benchmark(
     profile_iterations: int,
     seed: int,
     shadows: bool = True,
+    terrain: bool = True,
 ) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to benchmark this renderer")
@@ -143,7 +156,7 @@ def benchmark(
 
     result = None
     for iteration in range(warmup):
-        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows)
+        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain)
     torch.cuda.synchronize(device)
     del result
 
@@ -158,7 +171,7 @@ def benchmark(
         end_event = torch.cuda.Event(enable_timing=True)
         host_start = time.perf_counter()
         start_event.record()
-        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows)
+        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain)
         end_event.record()
         torch.cuda.synchronize(device)
         host_times_ms.append((time.perf_counter() - host_start) * 1000.0)
@@ -173,7 +186,7 @@ def benchmark(
     output_bytes = sum(tensor.numel() * tensor.element_size() for tensor in outputs)
 
     print("profiling CUDA stages (excluded from end-to-end timing)...")
-    stage_times_ms = profile_stages(width, height, batch_size, profile_iterations, seed, shadows)
+    stage_times_ms = profile_stages(width, height, batch_size, profile_iterations, seed, shadows, terrain)
 
     pixels_per_scene = width * height
     pixels = batch_size * pixels_per_scene
@@ -183,6 +196,7 @@ def benchmark(
     print(f"batch size: {batch_size} ({pixels:,} total pixels)")
     print(f"scene seeds: {seed} through {seed + iterations - 1}")
     print(f"shadows: {'enabled' if shadows else 'disabled'}")
+    print(f"terrain: {'enabled' if terrain else 'disabled'}")
     print(f"warmup / measured / profiled iterations: {warmup} / {iterations} / {profile_iterations}")
     print("outputs: RGB, visible instances/classes, instance map, semantic map")
     print()
@@ -212,6 +226,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-iterations", type=int, default=5)
     parser.add_argument("--seed", type=int, default=RANDOM_SCENE_SEED)
     parser.add_argument("--no-shadows", action="store_true", help="disable shadow rays")
+    parser.add_argument("--no-terrain", action="store_true", help="render generated scenes without terrain")
     return parser.parse_args()
 
 
@@ -226,6 +241,7 @@ def main() -> None:
         args.profile_iterations,
         args.seed,
         not args.no_shadows,
+        not args.no_terrain,
     )
 
 
