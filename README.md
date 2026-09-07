@@ -196,29 +196,29 @@ starting at 1234) produced:
 
 | Measurement | Mean | Median | p95 | Min / max |
 | --- | ---: | ---: | ---: | ---: |
-| Preparation, CUDA execution | 0.2224 ms | — | — | — |
-| Terrain, CUDA execution | 0.9578 ms | — | — | — |
-| Mask construction, CUDA execution | 0.4422 ms | — | — | — |
-| Rendering, CUDA execution | 11.4868 ms | — | — | — |
-| Segmentation, CUDA execution | 6.1078 ms | — | — | — |
-| End-to-end, CUDA events | 33.7910 ms | 33.6461 ms | 37.7078 ms | 28.9874 / 38.8045 ms |
-| Synchronized host wall time | 33.8560 ms | 33.6972 ms | 37.7404 ms | 29.1191 / 38.8681 ms |
+| Preparation, CUDA execution | 0.2446 ms | — | — | — |
+| Terrain, CUDA execution | 0.9740 ms | — | — | — |
+| Mask construction, CUDA execution | 0.4438 ms | — | — | — |
+| Rendering, CUDA execution | 11.7886 ms | — | — | — |
+| Segmentation, CUDA execution | 1.6250 ms | — | — | — |
+| End-to-end, CUDA events | 25.3890 ms | 25.3358 ms | 28.5501 ms | 21.0534 / 30.2019 ms |
+| Synchronized host wall time | 25.4666 ms | 25.3634 ms | 28.5760 ms | 21.3753 / 30.2245 ms |
 
-Mean end-to-end throughput was 93.09 Mpixels/s. The five output tensors occupied
-60.00 MiB, and peak allocated CUDA memory was 140.38 MiB. Timing depends on GPU
+Mean end-to-end throughput was 123.90 Mpixels/s. The five output tensors occupied
+60.00 MiB, and peak allocated CUDA memory was 156.15 MiB. Timing depends on GPU
 model, clock state, driver, profiler version, and scene contents.
 
 With shadows disabled and every other default unchanged, the same GPU produced:
 
 | Measurement | Mean | Median | p95 | Min / max |
 | --- | ---: | ---: | ---: | ---: |
-| Preparation, CUDA execution | 0.1630 ms | — | — | — |
-| Terrain, CUDA execution | 0.9848 ms | — | — | — |
-| Mask construction, CUDA execution | 0.0850 ms | — | — | — |
-| Rendering, CUDA execution | 8.3390 ms | — | — | — |
-| Segmentation, CUDA execution | 6.1330 ms | — | — | — |
-| End-to-end, CUDA events | 30.3368 ms | 30.0053 ms | 33.4387 ms | 27.2323 / 33.8043 ms |
-| Synchronized host wall time | 30.3772 ms | 30.0509 ms | 33.4800 ms | 27.2503 / 33.8219 ms |
+| Preparation, CUDA execution | 0.2106 ms | — | — | — |
+| Terrain, CUDA execution | 0.9510 ms | — | — | — |
+| Mask construction, CUDA execution | 0.0872 ms | — | — | — |
+| Rendering, CUDA execution | 8.1914 ms | — | — | — |
+| Segmentation, CUDA execution | 1.5962 ms | — | — | — |
+| End-to-end, CUDA events | 22.2603 ms | 22.2802 ms | 24.6016 ms | 18.9635 / 28.9577 ms |
+| Synchronized host wall time | 22.3736 ms | 22.4496 ms | 24.6579 ms | 19.0210 / 29.0593 ms |
 
-Disabling shadows reduced mean end-to-end CUDA time by 10.2% and increased
-throughput to 103.69 Mpixels/s. Peak allocated CUDA memory was 136.63 MiB.
+Disabling shadows reduced mean end-to-end CUDA time by 12.3% and increased
+throughput to 141.32 Mpixels/s. Peak allocated CUDA memory was 156.15 MiB.

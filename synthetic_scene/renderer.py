@@ -106,45 +106,33 @@ def _compact_visible_instances(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return per-image visible classes and maps with compact 1-based IDs."""
     batch_size = instance_map.shape[0]
+    # This single aggregate readback preserves the public, count-dependent
+    # visible_classes shape.  All per-image counts stay on the device.
     max_gt = int((sphere_counts + terrain_counts + box_counts + prism_counts + cylinder_counts).max().item())
-    visible_count = torch.empty((batch_size,), dtype=torch.int32, device=instance_map.device)
+    labels = instance_map.reshape(batch_size, -1).to(torch.long)
+    visible = torch.zeros((batch_size, max_gt + 1), dtype=torch.int32, device=instance_map.device)
+    visible.scatter_(1, labels, 1)
+    visible[:, 0] = 0
+
+    remap = visible.cumsum(dim=1, dtype=torch.int32)
+    visible_count = remap[:, -1]
+    compact_map = remap.gather(1, labels).reshape_as(instance_map)
+
+    object_ids = torch.arange(1, max_gt + 1, dtype=torch.int32, device=instance_map.device).unsqueeze(0)
+    sphere_end = sphere_counts.unsqueeze(1)
+    terrain_end = sphere_end + terrain_counts.unsqueeze(1)
+    box_end = terrain_end + box_counts.unsqueeze(1)
+    prism_end = box_end + prism_counts.unsqueeze(1)
+    cylinder_end = prism_end + cylinder_counts.unsqueeze(1)
+    class_lookup = (
+        ((object_ids <= sphere_end) * 1)
+        + ((object_ids > sphere_end) & (object_ids <= terrain_end)) * 2
+        + ((object_ids > terrain_end) & (object_ids <= box_end)) * 3
+        + ((object_ids > box_end) & (object_ids <= prism_end)) * 5
+        + ((object_ids > prism_end) & (object_ids <= cylinder_end)) * 4
+    ).to(torch.int32)
     visible_classes = torch.zeros((batch_size, max_gt), dtype=torch.int32, device=instance_map.device)
-    compact_map = torch.empty_like(instance_map)
-
-    for batch_idx in range(batch_size):
-        sphere_count = int(sphere_counts[batch_idx].item())
-        terrain_count = int(terrain_counts[batch_idx].item())
-        box_count = int(box_counts[batch_idx].item())
-        prism_count = int(prism_counts[batch_idx].item())
-        cylinder_count = int(cylinder_counts[batch_idx].item())
-        class_lookup = torch.zeros((max_gt + 1,), dtype=torch.int32, device=instance_map.device)
-        if sphere_count:
-            class_lookup[1 : sphere_count + 1] = 1
-        if terrain_count:
-            terrain_start = sphere_count + 1
-            class_lookup[terrain_start : terrain_start + terrain_count] = 2
-        if box_count:
-            box_start = sphere_count + terrain_count + 1
-            class_lookup[box_start : box_start + box_count] = 3
-        if prism_count:
-            prism_start = sphere_count + terrain_count + box_count + 1
-            class_lookup[prism_start : prism_start + prism_count] = 5
-        if cylinder_count:
-            cylinder_start = sphere_count + terrain_count + box_count + prism_count + 1
-            class_lookup[cylinder_start : cylinder_start + cylinder_count] = 4
-
-        labels = torch.unique(instance_map[batch_idx])
-        labels = labels[labels > 0]
-        count = int(labels.numel())
-        visible_count[batch_idx] = count
-        if count == 0:
-            compact_map[batch_idx].zero_()
-            continue
-
-        remap = torch.zeros((max_gt + 1,), dtype=torch.int32, device=instance_map.device)
-        remap[labels.to(torch.long)] = torch.arange(1, count + 1, dtype=torch.int32, device=instance_map.device)
-        compact_map[batch_idx] = remap[instance_map[batch_idx].to(torch.long)]
-        visible_classes[batch_idx, :count] = class_lookup[labels.to(torch.long)]
+    visible_classes.scatter_add_(1, (remap[:, 1:] - 1).clamp_min_(0).to(torch.long), class_lookup * visible[:, 1:])
 
     return visible_count, visible_classes, compact_map
 
