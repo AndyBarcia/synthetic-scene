@@ -15,6 +15,7 @@ setup(
             name="synthetic_scene._cuda_renderer",
             sources=[
                 "synthetic_scene/csrc/bindings.cpp",
+                "synthetic_scene/csrc/random_scene_kernel.cu",
                 "synthetic_scene/csrc/render_kernel.cu",
             ],
             extra_compile_args={

@@ -539,6 +539,79 @@ py::dict random_scene(
   return result;
 }
 
+void random_scene_cuda(
+    const std::vector<torch::Tensor>& outputs,
+    int64_t seed,
+    float scatter_radius,
+    float ground_y,
+    float depth_limit,
+    float dz,
+    float dz_growth,
+    float fov_degrees,
+    float aspect_ratio,
+    int house_count,
+    int tree_count,
+    int cloud_count,
+    int car_count,
+    int person_count);
+
+py::dict random_scene_gpu(
+    int64_t seed, int batch_size, float scatter_radius, float ground_y, float depth_limit,
+    float dz, float dz_growth, float fov_degrees, float aspect_ratio,
+    int house_count, int tree_count, int cloud_count, int car_count, int person_count) {
+  TORCH_CHECK(c10::cuda::device_count() > 0, "CUDA is required to generate a native random scene");
+  TORCH_CHECK(batch_size > 0, "batch_size must be positive");
+  TORCH_CHECK(house_count >= 0 && tree_count >= 0 && cloud_count >= 0 && car_count >= 0 && person_count >= 0,
+              "composite object counts must be non-negative");
+  TORCH_CHECK(house_count + tree_count + cloud_count + car_count + person_count > 0,
+              "at least one composite object is required");
+  TORCH_CHECK(scatter_radius > 0 && depth_limit > 0 && dz > 0 && dz_growth >= 0,
+              "invalid scene dimensions");
+  TORCH_CHECK(fov_degrees > 0 && fov_degrees < 180 && aspect_ratio > 0,
+              "invalid camera parameters");
+  const int64_t ns = tree_count + cloud_count * 3 + person_count;
+  const int64_t nb = house_count + car_count + person_count * 5;
+  const int64_t np = house_count;
+  const int64_t nc = tree_count + car_count * 4;
+  TORCH_CHECK(ns <= kRandomSceneMaxSpheres && nb <= kRandomSceneMaxBoxes &&
+              np <= kRandomSceneMaxPrisms && nc <= kRandomSceneMaxCylinders,
+              "random_scene generated more primitives than the renderer supports");
+  auto f = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+  auto i = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+  std::vector<torch::Tensor> o = {
+      torch::empty({batch_size, ns, 3}, f), torch::empty({batch_size, ns}, f),
+      torch::empty({batch_size, ns, 3}, f), torch::empty({batch_size}, i),
+      torch::empty({batch_size, ns}, i), torch::empty({batch_size, ns}, i),
+      torch::empty({batch_size, 1}, f), torch::empty({batch_size, 1}, f),
+      torch::empty({batch_size, 1}, f), torch::empty({batch_size, 1}, f),
+      torch::empty({batch_size, 1}, f), torch::empty({batch_size, 1}, f),
+      torch::empty({batch_size, 1, 3}, f), torch::empty({batch_size}, i),
+      torch::empty({batch_size, nb, 3}, f), torch::empty({batch_size, nb, 3}, f),
+      torch::empty({batch_size, nb, 3, 3}, f), torch::empty({batch_size, nb, 3}, f),
+      torch::empty({batch_size}, i), torch::empty({batch_size, nb}, i), torch::empty({batch_size, nb}, i),
+      torch::empty({batch_size, np, 3}, f), torch::empty({batch_size, np, 3}, f),
+      torch::empty({batch_size, np, 3, 3}, f), torch::empty({batch_size, np, 3}, f),
+      torch::empty({batch_size}, i), torch::empty({batch_size, np}, i), torch::empty({batch_size, np}, i),
+      torch::empty({batch_size, nc, 3}, f), torch::empty({batch_size, nc}, f),
+      torch::empty({batch_size, nc}, f), torch::empty({batch_size, nc, 3, 3}, f),
+      torch::empty({batch_size, nc, 3}, f), torch::empty({batch_size}, i),
+      torch::empty({batch_size, nc}, i), torch::empty({batch_size, nc}, i)};
+  random_scene_cuda(o, seed, scatter_radius, ground_y, depth_limit, dz, dz_growth,
+                    fov_degrees, aspect_ratio, house_count, tree_count, cloud_count, car_count, person_count);
+  const char* names[] = {"sphere_centers","sphere_radii","sphere_colors","sphere_counts","sphere_class_ids","sphere_instance_ids",
+    "terrain_base_heights","terrain_depth_limits","terrain_phase_xs","terrain_phase_zs","terrain_dz","terrain_dz_growth","terrain_colors","terrain_counts",
+    "box_centers","box_half_sizes","box_axes","box_colors","box_counts","box_class_ids","box_instance_ids",
+    "prism_centers","prism_half_sizes","prism_axes","prism_colors","prism_counts","prism_class_ids","prism_instance_ids",
+    "cylinder_centers","cylinder_radii","cylinder_half_heights","cylinder_axes","cylinder_colors","cylinder_counts","cylinder_class_ids","cylinder_instance_ids"};
+  py::dict result;
+  for (size_t n = 0; n < o.size(); ++n) result[names[n]] = o[n];
+  result["plane_points"] = torch::empty({batch_size, 0, 3}, f);
+  result["plane_normals"] = torch::empty({batch_size, 0, 3}, f);
+  result["plane_colors"] = torch::empty({batch_size, 0, 3}, f);
+  result["plane_counts"] = torch::zeros({batch_size}, i);
+  return result;
+}
+
 void render_scene(
     torch::Tensor image,
     torch::Tensor instance_map,
@@ -858,7 +931,7 @@ void render_scene(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "random_scene",
-      &random_scene,
+      &random_scene_gpu,
       py::arg("seed"),
       py::arg("batch_size"),
       py::arg("scatter_radius"),
