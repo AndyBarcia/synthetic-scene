@@ -2,10 +2,10 @@
 
 #include "random_objects.h"
 
-#include <ATen/CPUGeneratorImpl.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <algorithm>
 #include <cmath>
+#include <random>
 #include <tuple>
 #include <vector>
 
@@ -29,13 +29,17 @@ constexpr int kRandomSceneMaxPrisms = 64;
 constexpr int kRandomSceneMaxCylinders = 64;
 constexpr float kTau = 6.28318530717958647692f;
 
-float rand_float(at::Generator& generator, float low, float high) {
+using RandomGenerator = std::mt19937_64;
+
+float rand_float(RandomGenerator& generator, float low, float high) {
   if (low == high) {
     return low;
   }
-  return torch::empty({}, torch::TensorOptions().dtype(torch::kFloat32))
-      .uniform_(low, high, generator)
-      .item<float>();
+  // Use the upper 24 random bits, matching the precision available in a float
+  // mantissa while avoiding a Tensor allocation/operator dispatch per sample.
+  constexpr float kInverse24BitRange = 1.0f / 16777216.0f;
+  const float unit = static_cast<float>(generator() >> 40) * kInverse24BitRange;
+  return low + (high - low) * unit;
 }
 
 Vec3 normalize3(Vec3 vector) {
@@ -45,7 +49,7 @@ Vec3 normalize3(Vec3 vector) {
 }
 
 Vec3 random_frustum_point(
-    at::Generator& generator,
+    RandomGenerator& generator,
     float fov_degrees,
     float aspect_ratio,
     float min_distance,
@@ -213,7 +217,7 @@ py::dict random_scene(
   TORCH_CHECK(fov_degrees > 0.0f && fov_degrees < 180.0f, "fov_degrees must be in the open interval (0, 180)");
   TORCH_CHECK(aspect_ratio > 0.0f, "aspect_ratio must be positive");
 
-  at::Generator generator = at::detail::createCPUGenerator(static_cast<uint64_t>(seed));
+  RandomGenerator generator(static_cast<uint64_t>(seed));
   std::vector<float> sphere_centers;
   std::vector<float> sphere_radii;
   std::vector<float> sphere_colors;
@@ -258,6 +262,53 @@ py::dict random_scene(
       sphere_count <= kRandomSceneMaxSpheres && box_count <= kRandomSceneMaxBoxes && prism_count <= kRandomSceneMaxPrisms &&
           cylinder_count <= kRandomSceneMaxCylinders,
       "random_scene generated more primitives than the renderer supports");
+
+  const size_t batch = static_cast<size_t>(batch_size);
+  const size_t spheres = batch * static_cast<size_t>(sphere_count);
+  const size_t boxes = batch * static_cast<size_t>(box_count);
+  const size_t prisms = batch * static_cast<size_t>(prism_count);
+  const size_t cylinders = batch * static_cast<size_t>(cylinder_count);
+
+  sphere_centers.reserve(spheres * 3);
+  sphere_radii.reserve(spheres);
+  sphere_colors.reserve(spheres * 3);
+  sphere_counts.reserve(batch);
+  sphere_class_ids.reserve(spheres);
+  sphere_instance_ids.reserve(spheres);
+
+  box_centers.reserve(boxes * 3);
+  box_half_sizes.reserve(boxes * 3);
+  box_axes.reserve(boxes * 9);
+  box_colors.reserve(boxes * 3);
+  box_counts.reserve(batch);
+  box_class_ids.reserve(boxes);
+  box_instance_ids.reserve(boxes);
+
+  prism_centers.reserve(prisms * 3);
+  prism_half_sizes.reserve(prisms * 3);
+  prism_axes.reserve(prisms * 9);
+  prism_colors.reserve(prisms * 3);
+  prism_counts.reserve(batch);
+  prism_class_ids.reserve(prisms);
+  prism_instance_ids.reserve(prisms);
+
+  cylinder_centers.reserve(cylinders * 3);
+  cylinder_radii.reserve(cylinders);
+  cylinder_half_heights.reserve(cylinders);
+  cylinder_axes.reserve(cylinders * 9);
+  cylinder_colors.reserve(cylinders * 3);
+  cylinder_counts.reserve(batch);
+  cylinder_class_ids.reserve(cylinders);
+  cylinder_instance_ids.reserve(cylinders);
+
+  terrain_base_heights.reserve(batch);
+  terrain_depth_limits.reserve(batch);
+  terrain_phase_xs.reserve(batch);
+  terrain_phase_zs.reserve(batch);
+  terrain_dz.reserve(batch);
+  terrain_dz_growth.reserve(batch);
+  terrain_colors.reserve(batch * 3);
+  terrain_counts.reserve(batch);
 
   for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
     const float terrain_base_height = ground_y;
