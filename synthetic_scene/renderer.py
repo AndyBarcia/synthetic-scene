@@ -89,6 +89,8 @@ class Scene:
     boxes: OrientedBoxes = field(default_factory=OrientedBoxes)
     prisms: Prisms = field(default_factory=Prisms)
     cylinders: Cylinders = field(default_factory=Cylinders)
+    # Native random scenes already satisfy the renderer's CUDA invariants.
+    _trusted_cuda_inputs: bool = field(default=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -266,8 +268,6 @@ def _counts(value: Sequence[int] | torch.Tensor | None, *, batch_size: int, coun
     tensor = torch.as_tensor(value, dtype=torch.int32, device=device).reshape(-1).contiguous()
     if tensor.shape[0] != batch_size:
         raise ValueError("primitive counts must have shape B")
-    if bool(((tensor < 0) | (tensor > count)).any().item()):
-        raise ValueError("primitive counts must be in range [0, N]")
     return tensor
 
 
@@ -300,8 +300,6 @@ def _metadata(
         raise ValueError("primitive metadata batch size must be 1 or B")
     if tensor.shape[0] == 1:
         tensor = tensor.expand(batch_size, count)
-    if bool((tensor < 0).any().item()):
-        raise ValueError("primitive metadata IDs must be non-negative")
     return tensor.contiguous()
 
 
@@ -684,6 +682,7 @@ def random_scene(
             class_ids=native["cylinder_class_ids"],
             instance_ids=native["cylinder_instance_ids"],
         ),
+        _trusted_cuda_inputs=True,
     )
     return RandomScene(
         scene=scene,
@@ -875,8 +874,6 @@ def render_scene(
             scene_data.cylinders.instance_ids,
         )
     )
-    if bool(((sphere_counts + plane_counts + terrain_counts + box_counts + prism_counts + cylinder_counts) <= 0).any().item()):
-        raise ValueError("at least one object is required")
     if radii.shape[1] != sphere_count or colors.shape[1] != sphere_count:
         raise ValueError("sphere_centers, sphere_radii, and sphere_colors must have matching lengths")
     terrain_slots = terrain_depth_limits.shape[1]
@@ -902,28 +899,40 @@ def render_scene(
         or cylinder_colors.shape[1] != cylinder_count
     ):
         raise ValueError("cylinder_centers, cylinder_radii, cylinder_half_heights, cylinder_axes, and cylinder_colors must have matching lengths")
-    if bool((radii <= 0).any().item()):
-        raise ValueError("sphere_radii must all be positive")
-    if bool((terrain_depth_limits <= 0).any().item()):
-        raise ValueError("terrain depth_limits must be positive")
-    if bool((terrain_dz <= 0).any().item()):
-        raise ValueError("terrain dz must be positive")
-    if bool((terrain_dz_growth < 0).any().item()):
-        raise ValueError("terrain dz_growth must be non-negative")
-    if bool((box_half_sizes <= 0).any().item()):
-        raise ValueError("box_half_sizes must all be positive")
-    if bool((box_axes.norm(dim=3) <= 1.0e-8).any().item()):
-        raise ValueError("box_axes must contain non-zero axis vectors")
-    if bool((prism_half_sizes <= 0).any().item()):
-        raise ValueError("prism_half_sizes must all be positive")
-    if bool((prism_axes.norm(dim=3) <= 1.0e-8).any().item()):
-        raise ValueError("prism_axes must contain non-zero axis vectors")
-    if bool((cylinder_radii <= 0).any().item()):
-        raise ValueError("cylinder_radii must all be positive")
-    if bool((cylinder_half_heights <= 0).any().item()):
-        raise ValueError("cylinder_half_heights must all be positive")
-    if bool((cylinder_axes.norm(dim=3) <= 1.0e-8).any().item()):
-        raise ValueError("cylinder_axes must contain non-zero axis vectors")
+    if not scene_data._trusted_cuda_inputs:
+        # Run all value checks on CUDA, then transfer their results together.
+        # This replaces 25 separate `.item()` stream synchronizations with one.
+        checks = (
+            (((sphere_counts < 0) | (sphere_counts > sphere_count)).any(), "primitive counts must be in range [0, N]"),
+            (((terrain_counts < 0) | (terrain_counts > terrain_count)).any(), "primitive counts must be in range [0, N]"),
+            (((box_counts < 0) | (box_counts > box_count)).any(), "primitive counts must be in range [0, N]"),
+            (((prism_counts < 0) | (prism_counts > prism_count)).any(), "primitive counts must be in range [0, N]"),
+            (((cylinder_counts < 0) | (cylinder_counts > cylinder_count)).any(), "primitive counts must be in range [0, N]"),
+            ((sphere_class_ids < 0).any(), "primitive metadata IDs must be non-negative"),
+            ((box_class_ids < 0).any(), "primitive metadata IDs must be non-negative"),
+            ((prism_class_ids < 0).any(), "primitive metadata IDs must be non-negative"),
+            ((cylinder_class_ids < 0).any(), "primitive metadata IDs must be non-negative"),
+            ((sphere_instance_ids < 0).any(), "primitive metadata IDs must be non-negative"),
+            ((box_instance_ids < 0).any(), "primitive metadata IDs must be non-negative"),
+            ((prism_instance_ids < 0).any(), "primitive metadata IDs must be non-negative"),
+            ((cylinder_instance_ids < 0).any(), "primitive metadata IDs must be non-negative"),
+            (((sphere_counts + plane_counts + terrain_counts + box_counts + prism_counts + cylinder_counts) <= 0).any(), "at least one object is required"),
+            ((radii <= 0).any(), "sphere_radii must all be positive"),
+            ((terrain_depth_limits <= 0).any(), "terrain depth_limits must be positive"),
+            ((terrain_dz <= 0).any(), "terrain dz must be positive"),
+            ((terrain_dz_growth < 0).any(), "terrain dz_growth must be non-negative"),
+            ((box_half_sizes <= 0).any(), "box_half_sizes must all be positive"),
+            ((box_axes.norm(dim=3) <= 1.0e-8).any(), "box_axes must contain non-zero axis vectors"),
+            ((prism_half_sizes <= 0).any(), "prism_half_sizes must all be positive"),
+            ((prism_axes.norm(dim=3) <= 1.0e-8).any(), "prism_axes must contain non-zero axis vectors"),
+            ((cylinder_radii <= 0).any(), "cylinder_radii must all be positive"),
+            ((cylinder_half_heights <= 0).any(), "cylinder_half_heights must all be positive"),
+            ((cylinder_axes.norm(dim=3) <= 1.0e-8).any(), "cylinder_axes must contain non-zero axis vectors"),
+        )
+        failed = torch.stack([flag for flag, _ in checks]).to(device="cpu").tolist()
+        for did_fail, (_, message) in zip(failed, checks):
+            if did_fail:
+                raise ValueError(message)
 
     image = torch.empty((batch_size, 3, height, width), dtype=torch.float32, device=device)
     instance_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
