@@ -1,115 +1,15 @@
 #include <torch/extension.h>
 
-#include "random_objects.h"
-
 #include <c10/cuda/CUDAFunctions.h>
-#include <algorithm>
-#include <cmath>
-#include <random>
-#include <tuple>
 #include <vector>
 
 namespace py = pybind11;
-using synthetic_scene::Mat3;
-using synthetic_scene::RandomPrimitiveWriter;
-using synthetic_scene::Vec3;
-using synthetic_scene::add_random_car;
-using synthetic_scene::add_random_cloud;
-using synthetic_scene::add_random_house;
-using synthetic_scene::add_random_person;
-using synthetic_scene::add_random_tree;
-using synthetic_scene::append_mat3;
-using synthetic_scene::append_vec3;
-
 namespace {
 
 constexpr int kRandomSceneMaxSpheres = 64;
 constexpr int kRandomSceneMaxBoxes = 64;
 constexpr int kRandomSceneMaxPrisms = 64;
 constexpr int kRandomSceneMaxCylinders = 64;
-constexpr float kTau = 6.28318530717958647692f;
-
-using RandomGenerator = std::mt19937_64;
-
-float rand_float(RandomGenerator& generator, float low, float high) {
-  if (low == high) {
-    return low;
-  }
-  // Use the upper 24 random bits, matching the precision available in a float
-  // mantissa while avoiding a Tensor allocation/operator dispatch per sample.
-  constexpr float kInverse24BitRange = 1.0f / 16777216.0f;
-  const float unit = static_cast<float>(generator() >> 40) * kInverse24BitRange;
-  return low + (high - low) * unit;
-}
-
-Vec3 normalize3(Vec3 vector) {
-  const float length = std::sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z);
-  TORCH_CHECK(length > 1.0e-8f, "expected a non-zero vector");
-  return Vec3{vector.x / length, vector.y / length, vector.z / length};
-}
-
-Vec3 random_frustum_point(
-    RandomGenerator& generator,
-    float fov_degrees,
-    float aspect_ratio,
-    float min_distance,
-    float max_distance,
-    float min_ndc_y,
-    float max_ndc_y) {
-  const float fov_radians = fov_degrees * 0.017453292519943295f;
-  const float image_plane_scale = std::tan(0.5f * fov_radians);
-  const float ndc_x = rand_float(generator, -1.0f, 1.0f);
-  const float ndc_y = rand_float(generator, min_ndc_y, max_ndc_y);
-  const float px = ndc_x * aspect_ratio * image_plane_scale;
-  const float py = ndc_y * image_plane_scale;
-  const Vec3 ray_dir = normalize3(Vec3{px, py, -1.0f});
-  const float distance = rand_float(generator, min_distance, max_distance);
-  return Vec3{ray_dir.x * distance, ray_dir.y * distance, ray_dir.z * distance};
-}
-
-Mat3 yaw_axes(float yaw) {
-  const float cos_yaw = std::cos(yaw);
-  const float sin_yaw = std::sin(yaw);
-  return Mat3{{Vec3{cos_yaw, 0.0f, -sin_yaw}, Vec3{0.0f, 1.0f, 0.0f}, Vec3{sin_yaw, 0.0f, cos_yaw}}};
-}
-
-float smooth_height(float x, float z, float phase_x, float phase_z) {
-  const float forward_depth = std::max(-z, 0.0f);
-  const float hill_t = std::min(std::max((forward_depth - 24.0f) / 48.0f, 0.0f), 1.0f);
-  const float far_hill_weight = hill_t * hill_t * (3.0f - 2.0f * hill_t);
-  const float near_flat_weight = 0.06f + 0.94f * far_hill_weight;
-  const float far_rise = far_hill_weight * (0.055f * forward_depth + 0.0011f * forward_depth * forward_depth);
-  const float broad_undulation =
-      1.20f * std::sin(0.18f * x + 0.11f * z + phase_x) + 0.85f * std::cos(0.13f * x - 0.20f * z + phase_z);
-  const float foothills = 0.42f * std::sin(0.46f * x + 0.34f * z + phase_x * 0.61f + phase_z * 0.23f);
-  const float worn_detail = 0.12f * std::sin(0.95f * x - 0.58f * z + phase_z * 1.37f);
-  return far_rise + near_flat_weight * (broad_undulation + foothills + worn_detail);
-}
-
-torch::Tensor make_cuda_tensor(std::vector<float>&& values, std::vector<int64_t> shape) {
-  int64_t numel = 1;
-  for (const int64_t dim : shape) {
-    numel *= dim;
-  }
-  if (numel == 0) {
-    return torch::empty(shape, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
-  }
-  auto cpu_tensor = torch::from_blob(values.data(), shape, torch::TensorOptions().dtype(torch::kFloat32)).clone();
-  return cpu_tensor.to(torch::kCUDA, /*non_blocking=*/true).contiguous();
-}
-
-torch::Tensor make_cuda_int_tensor(std::vector<int32_t>&& values, std::vector<int64_t> shape) {
-  int64_t numel = 1;
-  for (const int64_t dim : shape) {
-    numel *= dim;
-  }
-  if (numel == 0) {
-    return torch::empty(shape, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-  }
-  auto cpu_tensor = torch::from_blob(values.data(), shape, torch::TensorOptions().dtype(torch::kInt32)).clone();
-  return cpu_tensor.to(torch::kCUDA, /*non_blocking=*/true).contiguous();
-}
-
 }  // namespace
 
 void render_scene_cuda(
@@ -190,355 +90,6 @@ bool require_bool(py::dict values, const char* key) {
   return values[py_key].cast<bool>();
 }
 
-py::dict random_scene(
-    int64_t seed,
-    int batch_size,
-    float scatter_radius,
-    float ground_y,
-    float depth_limit,
-    float dz,
-    float dz_growth,
-    float fov_degrees,
-    float aspect_ratio,
-    int house_count,
-    int tree_count,
-    int cloud_count,
-    int car_count,
-    int person_count) {
-  TORCH_CHECK(c10::cuda::device_count() > 0, "CUDA is required to generate a native random scene");
-  TORCH_CHECK(
-      house_count >= 0 && tree_count >= 0 && cloud_count >= 0 && car_count >= 0 && person_count >= 0,
-      "composite object counts must be non-negative");
-  TORCH_CHECK(house_count + tree_count + cloud_count + car_count + person_count > 0, "at least one composite object is required");
-  TORCH_CHECK(batch_size > 0, "batch_size must be positive");
-  TORCH_CHECK(scatter_radius > 0.0f, "scatter_radius must be positive");
-  TORCH_CHECK(depth_limit > 0.0f, "depth_limit must be positive");
-  TORCH_CHECK(dz > 0.0f, "dz must be positive");
-  TORCH_CHECK(dz_growth >= 0.0f, "dz_growth must be non-negative");
-  TORCH_CHECK(fov_degrees > 0.0f && fov_degrees < 180.0f, "fov_degrees must be in the open interval (0, 180)");
-  TORCH_CHECK(aspect_ratio > 0.0f, "aspect_ratio must be positive");
-
-  RandomGenerator generator(static_cast<uint64_t>(seed));
-  std::vector<float> sphere_centers;
-  std::vector<float> sphere_radii;
-  std::vector<float> sphere_colors;
-  std::vector<int32_t> sphere_counts;
-  std::vector<int32_t> sphere_class_ids;
-  std::vector<int32_t> sphere_instance_ids;
-  std::vector<float> box_centers;
-  std::vector<float> box_half_sizes;
-  std::vector<float> box_axes;
-  std::vector<float> box_colors;
-  std::vector<int32_t> box_counts;
-  std::vector<int32_t> box_class_ids;
-  std::vector<int32_t> box_instance_ids;
-  std::vector<float> prism_centers;
-  std::vector<float> prism_half_sizes;
-  std::vector<float> prism_axes;
-  std::vector<float> prism_colors;
-  std::vector<int32_t> prism_counts;
-  std::vector<int32_t> prism_class_ids;
-  std::vector<int32_t> prism_instance_ids;
-  std::vector<float> cylinder_centers;
-  std::vector<float> cylinder_radii;
-  std::vector<float> cylinder_half_heights;
-  std::vector<float> cylinder_axes;
-  std::vector<float> cylinder_colors;
-  std::vector<int32_t> cylinder_counts;
-  std::vector<int32_t> cylinder_class_ids;
-  std::vector<int32_t> cylinder_instance_ids;
-  std::vector<float> terrain_base_heights;
-  std::vector<float> terrain_depth_limits;
-  std::vector<float> terrain_phase_xs;
-  std::vector<float> terrain_phase_zs;
-  std::vector<float> terrain_dz;
-  std::vector<float> terrain_dz_growth;
-  std::vector<float> terrain_colors;
-  std::vector<int32_t> terrain_counts;
-  const int64_t sphere_count = static_cast<int64_t>(tree_count + cloud_count * 3 + person_count);
-  const int64_t box_count = static_cast<int64_t>(house_count + car_count + person_count * 5);
-  const int64_t prism_count = static_cast<int64_t>(house_count);
-  const int64_t cylinder_count = static_cast<int64_t>(tree_count + car_count * 4);
-  TORCH_CHECK(
-      sphere_count <= kRandomSceneMaxSpheres && box_count <= kRandomSceneMaxBoxes && prism_count <= kRandomSceneMaxPrisms &&
-          cylinder_count <= kRandomSceneMaxCylinders,
-      "random_scene generated more primitives than the renderer supports");
-
-  const size_t batch = static_cast<size_t>(batch_size);
-  const size_t spheres = batch * static_cast<size_t>(sphere_count);
-  const size_t boxes = batch * static_cast<size_t>(box_count);
-  const size_t prisms = batch * static_cast<size_t>(prism_count);
-  const size_t cylinders = batch * static_cast<size_t>(cylinder_count);
-
-  sphere_centers.reserve(spheres * 3);
-  sphere_radii.reserve(spheres);
-  sphere_colors.reserve(spheres * 3);
-  sphere_counts.reserve(batch);
-  sphere_class_ids.reserve(spheres);
-  sphere_instance_ids.reserve(spheres);
-
-  box_centers.reserve(boxes * 3);
-  box_half_sizes.reserve(boxes * 3);
-  box_axes.reserve(boxes * 9);
-  box_colors.reserve(boxes * 3);
-  box_counts.reserve(batch);
-  box_class_ids.reserve(boxes);
-  box_instance_ids.reserve(boxes);
-
-  prism_centers.reserve(prisms * 3);
-  prism_half_sizes.reserve(prisms * 3);
-  prism_axes.reserve(prisms * 9);
-  prism_colors.reserve(prisms * 3);
-  prism_counts.reserve(batch);
-  prism_class_ids.reserve(prisms);
-  prism_instance_ids.reserve(prisms);
-
-  cylinder_centers.reserve(cylinders * 3);
-  cylinder_radii.reserve(cylinders);
-  cylinder_half_heights.reserve(cylinders);
-  cylinder_axes.reserve(cylinders * 9);
-  cylinder_colors.reserve(cylinders * 3);
-  cylinder_counts.reserve(batch);
-  cylinder_class_ids.reserve(cylinders);
-  cylinder_instance_ids.reserve(cylinders);
-
-  terrain_base_heights.reserve(batch);
-  terrain_depth_limits.reserve(batch);
-  terrain_phase_xs.reserve(batch);
-  terrain_phase_zs.reserve(batch);
-  terrain_dz.reserve(batch);
-  terrain_dz_growth.reserve(batch);
-  terrain_colors.reserve(batch * 3);
-  terrain_counts.reserve(batch);
-
-  for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-    const float terrain_base_height = ground_y;
-    const float terrain_depth_limit = depth_limit;
-    const float phase_x = rand_float(generator, 0.0f, kTau);
-    const float phase_z = rand_float(generator, 0.0f, kTau);
-    terrain_base_heights.push_back(terrain_base_height);
-    terrain_depth_limits.push_back(terrain_depth_limit);
-    terrain_phase_xs.push_back(phase_x);
-    terrain_phase_zs.push_back(phase_z);
-    terrain_dz.push_back(dz);
-    terrain_dz_growth.push_back(dz_growth);
-    append_vec3(terrain_colors, Vec3{0.34f, 0.46f, 0.28f});
-    terrain_counts.push_back(1);
-
-    int scene_spheres = 0;
-    int scene_boxes = 0;
-    int scene_prisms = 0;
-    int scene_cylinders = 0;
-    int next_instance_id = 1;
-    RandomPrimitiveWriter writer{
-        sphere_centers,
-        sphere_radii,
-        sphere_colors,
-        sphere_class_ids,
-        sphere_instance_ids,
-        scene_spheres,
-        box_centers,
-        box_half_sizes,
-        box_axes,
-        box_colors,
-        box_class_ids,
-        box_instance_ids,
-        scene_boxes,
-        prism_centers,
-        prism_half_sizes,
-        prism_axes,
-        prism_colors,
-        prism_class_ids,
-        prism_instance_ids,
-        scene_prisms,
-        cylinder_centers,
-        cylinder_radii,
-        cylinder_half_heights,
-        cylinder_axes,
-        cylinder_colors,
-        cylinder_class_ids,
-        cylinder_instance_ids,
-        scene_cylinders,
-    };
-    auto object_rand_float = [&](float low, float high) { return rand_float(generator, low, high); };
-
-    for (int i = 0; i < house_count; ++i) {
-      const Vec3 frustum_point = random_frustum_point(
-          generator,
-          fov_degrees,
-          aspect_ratio,
-          2.0f,
-          2.0f + scatter_radius,
-          -0.82f,
-          -0.18f);
-      const float terrain_y = terrain_base_height + smooth_height(frustum_point.x, frustum_point.z, phase_x, phase_z);
-      add_random_house(
-          writer,
-          Vec3{frustum_point.x, terrain_y, frustum_point.z},
-          yaw_axes(rand_float(generator, -3.14159265f, 3.14159265f)),
-          next_instance_id++,
-          object_rand_float);
-    }
-
-    for (int i = 0; i < tree_count; ++i) {
-      const Vec3 frustum_point = random_frustum_point(
-          generator,
-          fov_degrees,
-          aspect_ratio,
-          2.0f,
-          2.0f + scatter_radius,
-          -0.82f,
-          -0.18f);
-      const float terrain_y = terrain_base_height + smooth_height(frustum_point.x, frustum_point.z, phase_x, phase_z);
-      add_random_tree(writer, Vec3{frustum_point.x, terrain_y, frustum_point.z}, yaw_axes(0.0f), next_instance_id++, object_rand_float);
-    }
-
-    for (int i = 0; i < cloud_count; ++i) {
-      const Vec3 frustum_point = random_frustum_point(
-          generator,
-          fov_degrees,
-          aspect_ratio,
-          5.0f,
-          5.0f + scatter_radius,
-          0.24f,
-          0.88f);
-      add_random_cloud(
-          writer,
-          Vec3{frustum_point.x, frustum_point.y + 1.8f, frustum_point.z},
-          yaw_axes(rand_float(generator, -3.14159265f, 3.14159265f)),
-          next_instance_id++,
-          object_rand_float);
-    }
-
-    for (int i = 0; i < car_count; ++i) {
-      const Vec3 frustum_point = random_frustum_point(
-          generator,
-          fov_degrees,
-          aspect_ratio,
-          2.0f,
-          2.0f + scatter_radius,
-          -0.82f,
-          -0.18f);
-      const float terrain_y = terrain_base_height + smooth_height(frustum_point.x, frustum_point.z, phase_x, phase_z);
-      add_random_car(
-          writer,
-          Vec3{frustum_point.x, terrain_y, frustum_point.z},
-          yaw_axes(rand_float(generator, -3.14159265f, 3.14159265f)),
-          next_instance_id++,
-          object_rand_float);
-    }
-
-    for (int i = 0; i < person_count; ++i) {
-      const Vec3 frustum_point = random_frustum_point(
-          generator,
-          fov_degrees,
-          aspect_ratio,
-          2.0f,
-          2.0f + scatter_radius,
-          -0.82f,
-          -0.18f);
-      const float terrain_y = terrain_base_height + smooth_height(frustum_point.x, frustum_point.z, phase_x, phase_z);
-      add_random_person(
-          writer,
-          Vec3{frustum_point.x, terrain_y, frustum_point.z},
-          yaw_axes(rand_float(generator, -3.14159265f, 3.14159265f)),
-          next_instance_id++,
-          object_rand_float);
-    }
-
-    const int real_spheres = scene_spheres;
-    const int real_boxes = scene_boxes;
-    const int real_prisms = scene_prisms;
-    const int real_cylinders = scene_cylinders;
-    while (scene_spheres < sphere_count) {
-      append_vec3(sphere_centers, Vec3{0.0f, 0.0f, -1.0f});
-      sphere_radii.push_back(1.0f);
-      append_vec3(sphere_colors, Vec3{0.0f, 0.0f, 0.0f});
-      sphere_class_ids.push_back(0);
-      sphere_instance_ids.push_back(0);
-      ++scene_spheres;
-    }
-    while (scene_boxes < box_count) {
-      append_vec3(box_centers, Vec3{0.0f, 0.0f, -1.0f});
-      append_vec3(box_half_sizes, Vec3{1.0f, 1.0f, 1.0f});
-      append_mat3(box_axes, yaw_axes(0.0f));
-      append_vec3(box_colors, Vec3{0.0f, 0.0f, 0.0f});
-      box_class_ids.push_back(0);
-      box_instance_ids.push_back(0);
-      ++scene_boxes;
-    }
-    while (scene_prisms < prism_count) {
-      append_vec3(prism_centers, Vec3{0.0f, 0.0f, -1.0f});
-      append_vec3(prism_half_sizes, Vec3{1.0f, 1.0f, 1.0f});
-      append_mat3(prism_axes, yaw_axes(0.0f));
-      append_vec3(prism_colors, Vec3{0.0f, 0.0f, 0.0f});
-      prism_class_ids.push_back(0);
-      prism_instance_ids.push_back(0);
-      ++scene_prisms;
-    }
-    while (scene_cylinders < cylinder_count) {
-      append_vec3(cylinder_centers, Vec3{0.0f, 0.0f, -1.0f});
-      cylinder_radii.push_back(1.0f);
-      cylinder_half_heights.push_back(1.0f);
-      append_mat3(cylinder_axes, yaw_axes(0.0f));
-      append_vec3(cylinder_colors, Vec3{0.0f, 0.0f, 0.0f});
-      cylinder_class_ids.push_back(0);
-      cylinder_instance_ids.push_back(0);
-      ++scene_cylinders;
-    }
-    sphere_counts.push_back(static_cast<int32_t>(real_spheres));
-    box_counts.push_back(static_cast<int32_t>(real_boxes));
-    prism_counts.push_back(static_cast<int32_t>(real_prisms));
-    cylinder_counts.push_back(static_cast<int32_t>(real_cylinders));
-  }
-
-  std::vector<float> plane_points;
-  std::vector<float> plane_normals;
-  std::vector<float> plane_colors;
-  py::dict result;
-  result["sphere_centers"] = make_cuda_tensor(std::move(sphere_centers), {batch_size, sphere_count, 3});
-  result["sphere_radii"] = make_cuda_tensor(std::move(sphere_radii), {batch_size, sphere_count});
-  result["sphere_colors"] = make_cuda_tensor(std::move(sphere_colors), {batch_size, sphere_count, 3});
-  result["sphere_counts"] = make_cuda_int_tensor(std::move(sphere_counts), {batch_size});
-  result["sphere_class_ids"] = make_cuda_int_tensor(std::move(sphere_class_ids), {batch_size, sphere_count});
-  result["sphere_instance_ids"] = make_cuda_int_tensor(std::move(sphere_instance_ids), {batch_size, sphere_count});
-  result["plane_points"] = make_cuda_tensor(std::move(plane_points), {batch_size, 0, 3});
-  result["plane_normals"] = make_cuda_tensor(std::move(plane_normals), {batch_size, 0, 3});
-  result["plane_colors"] = make_cuda_tensor(std::move(plane_colors), {batch_size, 0, 3});
-  result["plane_counts"] = make_cuda_int_tensor(std::vector<int32_t>(batch_size, 0), {batch_size});
-  result["terrain_base_heights"] = make_cuda_tensor(std::move(terrain_base_heights), {batch_size, 1});
-  result["terrain_depth_limits"] = make_cuda_tensor(std::move(terrain_depth_limits), {batch_size, 1});
-  result["terrain_phase_xs"] = make_cuda_tensor(std::move(terrain_phase_xs), {batch_size, 1});
-  result["terrain_phase_zs"] = make_cuda_tensor(std::move(terrain_phase_zs), {batch_size, 1});
-  result["terrain_dz"] = make_cuda_tensor(std::move(terrain_dz), {batch_size, 1});
-  result["terrain_dz_growth"] = make_cuda_tensor(std::move(terrain_dz_growth), {batch_size, 1});
-  result["terrain_colors"] = make_cuda_tensor(std::move(terrain_colors), {batch_size, 1, 3});
-  result["terrain_counts"] = make_cuda_int_tensor(std::move(terrain_counts), {batch_size});
-  result["box_centers"] = make_cuda_tensor(std::move(box_centers), {batch_size, box_count, 3});
-  result["box_half_sizes"] = make_cuda_tensor(std::move(box_half_sizes), {batch_size, box_count, 3});
-  result["box_axes"] = make_cuda_tensor(std::move(box_axes), {batch_size, box_count, 3, 3});
-  result["box_colors"] = make_cuda_tensor(std::move(box_colors), {batch_size, box_count, 3});
-  result["box_counts"] = make_cuda_int_tensor(std::move(box_counts), {batch_size});
-  result["box_class_ids"] = make_cuda_int_tensor(std::move(box_class_ids), {batch_size, box_count});
-  result["box_instance_ids"] = make_cuda_int_tensor(std::move(box_instance_ids), {batch_size, box_count});
-  result["prism_centers"] = make_cuda_tensor(std::move(prism_centers), {batch_size, prism_count, 3});
-  result["prism_half_sizes"] = make_cuda_tensor(std::move(prism_half_sizes), {batch_size, prism_count, 3});
-  result["prism_axes"] = make_cuda_tensor(std::move(prism_axes), {batch_size, prism_count, 3, 3});
-  result["prism_colors"] = make_cuda_tensor(std::move(prism_colors), {batch_size, prism_count, 3});
-  result["prism_counts"] = make_cuda_int_tensor(std::move(prism_counts), {batch_size});
-  result["prism_class_ids"] = make_cuda_int_tensor(std::move(prism_class_ids), {batch_size, prism_count});
-  result["prism_instance_ids"] = make_cuda_int_tensor(std::move(prism_instance_ids), {batch_size, prism_count});
-  result["cylinder_centers"] = make_cuda_tensor(std::move(cylinder_centers), {batch_size, cylinder_count, 3});
-  result["cylinder_radii"] = make_cuda_tensor(std::move(cylinder_radii), {batch_size, cylinder_count});
-  result["cylinder_half_heights"] = make_cuda_tensor(std::move(cylinder_half_heights), {batch_size, cylinder_count});
-  result["cylinder_axes"] = make_cuda_tensor(std::move(cylinder_axes), {batch_size, cylinder_count, 3, 3});
-  result["cylinder_colors"] = make_cuda_tensor(std::move(cylinder_colors), {batch_size, cylinder_count, 3});
-  result["cylinder_counts"] = make_cuda_int_tensor(std::move(cylinder_counts), {batch_size});
-  result["cylinder_class_ids"] = make_cuda_int_tensor(std::move(cylinder_class_ids), {batch_size, cylinder_count});
-  result["cylinder_instance_ids"] = make_cuda_int_tensor(std::move(cylinder_instance_ids), {batch_size, cylinder_count});
-  return result;
-}
-
 void random_scene_cuda(
     const std::vector<torch::Tensor>& outputs,
     int64_t seed,
@@ -555,61 +106,165 @@ void random_scene_cuda(
     int car_count,
     int person_count);
 
-py::dict random_scene_gpu(
-    int64_t seed, int batch_size, float scatter_radius, float ground_y, float depth_limit,
-    float dz, float dz_growth, float fov_degrees, float aspect_ratio,
-    int house_count, int tree_count, int cloud_count, int car_count, int person_count) {
-  TORCH_CHECK(c10::cuda::device_count() > 0, "CUDA is required to generate a native random scene");
+struct PackedViews {
+  std::vector<torch::Tensor> scene;
+  torch::Tensor plane_counts;
+  torch::Tensor terrain_class_ids;
+  torch::Tensor terrain_instance_ids;
+};
+
+PackedViews unpack_scene(
+    torch::Tensor float_data,
+    torch::Tensor integer_data,
+    int64_t batch_size,
+    int64_t sphere_count,
+    int64_t box_count,
+    int64_t prism_count,
+    int64_t cylinder_count) {
+  int64_t float_offset = 0;
+  int64_t integer_offset = 0;
+  auto take_float = [&](std::vector<int64_t> shape) {
+    const int64_t size = c10::multiply_integers(shape);
+    auto view = float_data.narrow(0, float_offset, size).view(shape);
+    float_offset += size;
+    return view;
+  };
+  auto take_integer = [&](std::vector<int64_t> shape) {
+    const int64_t size = c10::multiply_integers(shape);
+    auto view = integer_data.narrow(0, integer_offset, size).view(shape);
+    integer_offset += size;
+    return view;
+  };
+
+  std::vector<torch::Tensor> scene = {
+      take_float({batch_size, sphere_count, 3}),
+      take_float({batch_size, sphere_count}),
+      take_float({batch_size, sphere_count, 3}),
+      take_integer({batch_size}),
+      take_integer({batch_size, sphere_count}),
+      take_integer({batch_size, sphere_count}),
+      take_float({batch_size, 1}),
+      take_float({batch_size, 1}),
+      take_float({batch_size, 1}),
+      take_float({batch_size, 1}),
+      take_float({batch_size, 1}),
+      take_float({batch_size, 1}),
+      take_float({batch_size, 1, 3}),
+      take_integer({batch_size}),
+      take_float({batch_size, box_count, 3}),
+      take_float({batch_size, box_count, 3}),
+      take_float({batch_size, box_count, 3, 3}),
+      take_float({batch_size, box_count, 3}),
+      take_integer({batch_size}),
+      take_integer({batch_size, box_count}),
+      take_integer({batch_size, box_count}),
+      take_float({batch_size, prism_count, 3}),
+      take_float({batch_size, prism_count, 3}),
+      take_float({batch_size, prism_count, 3, 3}),
+      take_float({batch_size, prism_count, 3}),
+      take_integer({batch_size}),
+      take_integer({batch_size, prism_count}),
+      take_integer({batch_size, prism_count}),
+      take_float({batch_size, cylinder_count, 3}),
+      take_float({batch_size, cylinder_count}),
+      take_float({batch_size, cylinder_count}),
+      take_float({batch_size, cylinder_count, 3, 3}),
+      take_float({batch_size, cylinder_count, 3}),
+      take_integer({batch_size}),
+      take_integer({batch_size, cylinder_count}),
+      take_integer({batch_size, cylinder_count}),
+  };
+  auto plane_counts = take_integer({batch_size});
+  auto terrain_class_ids = take_integer({batch_size, 1});
+  auto terrain_instance_ids = take_integer({batch_size, 1});
+  TORCH_CHECK(float_offset == float_data.numel() && integer_offset == integer_data.numel(),
+              "packed scene size does not match its capacities");
+  return {std::move(scene), plane_counts, terrain_class_ids, terrain_instance_ids};
+}
+
+py::tuple generate_random_scene_packed(
+    int64_t seed,
+    int batch_size,
+    float scatter_radius,
+    float ground_y,
+    float depth_limit,
+    float dz,
+    float dz_growth,
+    float fov_degrees,
+    float aspect_ratio,
+    int house_count,
+    int tree_count,
+    int cloud_count,
+    int car_count,
+    int person_count) {
+  TORCH_CHECK(c10::cuda::device_count() > 0, "CUDA is required");
   TORCH_CHECK(batch_size > 0, "batch_size must be positive");
-  TORCH_CHECK(house_count >= 0 && tree_count >= 0 && cloud_count >= 0 && car_count >= 0 && person_count >= 0,
-              "composite object counts must be non-negative");
+  TORCH_CHECK(house_count >= 0 && tree_count >= 0 && cloud_count >= 0 &&
+              car_count >= 0 && person_count >= 0, "object counts must be non-negative");
   TORCH_CHECK(house_count + tree_count + cloud_count + car_count + person_count > 0,
               "at least one composite object is required");
-  TORCH_CHECK(scatter_radius > 0 && depth_limit > 0 && dz > 0 && dz_growth >= 0,
-              "invalid scene dimensions");
-  TORCH_CHECK(fov_degrees > 0 && fov_degrees < 180 && aspect_ratio > 0,
-              "invalid camera parameters");
-  const int64_t ns = tree_count + cloud_count * 3 + person_count;
-  const int64_t nb = house_count + car_count + person_count * 5;
-  const int64_t np = house_count;
-  const int64_t nc = tree_count + car_count * 4;
-  TORCH_CHECK(ns <= kRandomSceneMaxSpheres && nb <= kRandomSceneMaxBoxes &&
-              np <= kRandomSceneMaxPrisms && nc <= kRandomSceneMaxCylinders,
-              "random_scene generated more primitives than the renderer supports");
-  auto f = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-  auto i = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
-  std::vector<torch::Tensor> o = {
-      torch::empty({batch_size, ns, 3}, f), torch::empty({batch_size, ns}, f),
-      torch::empty({batch_size, ns, 3}, f), torch::empty({batch_size}, i),
-      torch::empty({batch_size, ns}, i), torch::empty({batch_size, ns}, i),
-      torch::empty({batch_size, 1}, f), torch::empty({batch_size, 1}, f),
-      torch::empty({batch_size, 1}, f), torch::empty({batch_size, 1}, f),
-      torch::empty({batch_size, 1}, f), torch::empty({batch_size, 1}, f),
-      torch::empty({batch_size, 1, 3}, f), torch::empty({batch_size}, i),
-      torch::empty({batch_size, nb, 3}, f), torch::empty({batch_size, nb, 3}, f),
-      torch::empty({batch_size, nb, 3, 3}, f), torch::empty({batch_size, nb, 3}, f),
-      torch::empty({batch_size}, i), torch::empty({batch_size, nb}, i), torch::empty({batch_size, nb}, i),
-      torch::empty({batch_size, np, 3}, f), torch::empty({batch_size, np, 3}, f),
-      torch::empty({batch_size, np, 3, 3}, f), torch::empty({batch_size, np, 3}, f),
-      torch::empty({batch_size}, i), torch::empty({batch_size, np}, i), torch::empty({batch_size, np}, i),
-      torch::empty({batch_size, nc, 3}, f), torch::empty({batch_size, nc}, f),
-      torch::empty({batch_size, nc}, f), torch::empty({batch_size, nc, 3, 3}, f),
-      torch::empty({batch_size, nc, 3}, f), torch::empty({batch_size}, i),
-      torch::empty({batch_size, nc}, i), torch::empty({batch_size, nc}, i)};
-  random_scene_cuda(o, seed, scatter_radius, ground_y, depth_limit, dz, dz_growth,
-                    fov_degrees, aspect_ratio, house_count, tree_count, cloud_count, car_count, person_count);
-  const char* names[] = {"sphere_centers","sphere_radii","sphere_colors","sphere_counts","sphere_class_ids","sphere_instance_ids",
-    "terrain_base_heights","terrain_depth_limits","terrain_phase_xs","terrain_phase_zs","terrain_dz","terrain_dz_growth","terrain_colors","terrain_counts",
-    "box_centers","box_half_sizes","box_axes","box_colors","box_counts","box_class_ids","box_instance_ids",
-    "prism_centers","prism_half_sizes","prism_axes","prism_colors","prism_counts","prism_class_ids","prism_instance_ids",
-    "cylinder_centers","cylinder_radii","cylinder_half_heights","cylinder_axes","cylinder_colors","cylinder_counts","cylinder_class_ids","cylinder_instance_ids"};
-  py::dict result;
-  for (size_t n = 0; n < o.size(); ++n) result[names[n]] = o[n];
-  result["plane_points"] = torch::empty({batch_size, 0, 3}, f);
-  result["plane_normals"] = torch::empty({batch_size, 0, 3}, f);
-  result["plane_colors"] = torch::empty({batch_size, 0, 3}, f);
-  result["plane_counts"] = torch::zeros({batch_size}, i);
-  return result;
+
+  const int64_t sphere_count = tree_count + cloud_count * 3 + person_count;
+  const int64_t box_count = house_count + car_count + person_count * 5;
+  const int64_t prism_count = house_count;
+  const int64_t cylinder_count = tree_count + car_count * 4;
+  TORCH_CHECK(sphere_count <= kRandomSceneMaxSpheres && box_count <= kRandomSceneMaxBoxes &&
+              prism_count <= kRandomSceneMaxPrisms && cylinder_count <= kRandomSceneMaxCylinders,
+              "generated scene exceeds renderer capacities");
+
+  const int64_t float_size = batch_size *
+      (7 * sphere_count + 9 + 18 * box_count + 18 * prism_count + 17 * cylinder_count);
+  const int64_t integer_size = batch_size *
+      (8 + 2 * (sphere_count + box_count + prism_count + cylinder_count));
+  auto float_data = torch::empty(
+      {float_size}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+  auto integer_data = torch::empty(
+      {integer_size}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+  auto views = unpack_scene(
+      float_data, integer_data, batch_size, sphere_count, box_count, prism_count, cylinder_count);
+  views.plane_counts.zero_();
+  views.terrain_class_ids.fill_(2);
+  views.terrain_instance_ids.fill_(sphere_count + 1);
+
+  random_scene_cuda(
+      views.scene, seed, scatter_radius, ground_y, depth_limit, dz, dz_growth,
+      fov_degrees, aspect_ratio, house_count, tree_count, cloud_count, car_count, person_count);
+  return py::make_tuple(float_data, integer_data);
+}
+
+void render_packed_scene(
+    torch::Tensor image,
+    torch::Tensor instance_map,
+    torch::Tensor semantic_map,
+    torch::Tensor visible_masks,
+    torch::Tensor float_data,
+    torch::Tensor integer_data,
+    int sphere_count,
+    int box_count,
+    int prism_count,
+    int cylinder_count,
+    torch::Tensor light_direction,
+    double fov_degrees,
+    torch::Tensor background,
+    double ambient,
+    bool shadows,
+    double shadow_strength) {
+  auto packed = unpack_scene(
+      float_data, integer_data, image.size(0), sphere_count, box_count, prism_count, cylinder_count);
+  const auto& scene = packed.scene;
+  const auto empty_planes = float_data.narrow(0, 0, 0).view({image.size(0), 0, 3});
+  render_scene_cuda(
+      image, instance_map, semantic_map, visible_masks,
+      scene[0], scene[1], scene[3], scene[4], scene[5],
+      empty_planes, empty_planes, packed.plane_counts,
+      scene[6], scene[7], scene[8], scene[9], scene[10], scene[11], scene[13],
+      packed.terrain_class_ids, packed.terrain_instance_ids,
+      scene[14], scene[15], scene[16], scene[18], scene[19], scene[20],
+      scene[21], scene[22], scene[23], scene[25], scene[26], scene[27],
+      scene[28], scene[29], scene[30], scene[31], scene[33], scene[34], scene[35],
+      light_direction, fov_degrees, background,
+      scene[2], empty_planes, scene[12], scene[17], scene[24], scene[32],
+      ambient, shadows, shadow_strength);
 }
 
 void render_scene(
@@ -930,8 +585,8 @@ void render_scene(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
-      "random_scene",
-      &random_scene_gpu,
+      "generate_random_scene",
+      &generate_random_scene_packed,
       py::arg("seed"),
       py::arg("batch_size"),
       py::arg("scatter_radius"),
@@ -946,6 +601,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("cloud_count"),
       py::arg("car_count"),
       py::arg("person_count"),
-      "Generate random camera-space scene tensors directly from the native extension");
+      "Generate a random scene in two packed CUDA buffers");
+  m.def("render_packed_scene", &render_packed_scene, "Render directly from packed CUDA buffers");
   m.def("render_scene", &render_scene, "Render Lambert-shaded geometric objects (CUDA)");
 }

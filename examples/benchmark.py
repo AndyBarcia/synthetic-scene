@@ -3,11 +3,9 @@ from __future__ import annotations
 import argparse
 import statistics
 import time
-from dataclasses import replace
-
 import torch
 
-from synthetic_scene import RenderOptions, RenderResult, random_scene, render_scene
+from synthetic_scene import RandomSceneOptions, RenderOptions, RenderResult, generate_random_scene, render_scene
 
 
 RANDOM_SCENE_SEED = 1234
@@ -53,10 +51,10 @@ def render_benchmark_scene(
     terrain: bool = True,
 ) -> RenderResult:
     with torch.autograd.profiler.record_function("synthetic_scene::scene_generation"):
-        generated = random_scene(seed=seed, batch_size=batch_size, aspect_ratio=width / height)
-        scene = generated.scene
+        scene_options = RandomSceneOptions(aspect_ratio=width / height)
+        scene = generate_random_scene(seed=seed, batch_size=batch_size, options=scene_options)
         if not terrain:
-            scene = replace(scene, terrain=replace(scene.terrain, counts=torch.zeros_like(scene.terrain.counts)))
+            raise ValueError("packed random scenes currently always include terrain")
     result = render_scene(
         width=width,
         height=height,

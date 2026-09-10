@@ -25,6 +25,22 @@ class RenderOptions:
 
 
 @dataclass(frozen=True)
+class RandomSceneOptions:
+    house_count: int = 10
+    tree_count: int = 10
+    cloud_count: int = 5
+    car_count: int = 5
+    person_count: int = 5
+    scatter_radius: float = 50.0
+    ground_y: float = -1.0
+    depth_limit: float = 50.0
+    terrain_dz: float = 0.005
+    terrain_dz_growth: float = 0.0001
+    fov_degrees: float = 50.0
+    aspect_ratio: float = 1.5
+
+
+@dataclass(frozen=True)
 class Spheres:
     centers: Vec3List = ((0.0, 0.0, -3.0),)
     radii: Sequence[float] | torch.Tensor = (1.0,)
@@ -107,8 +123,16 @@ class CompositeObject:
 
 
 @dataclass(frozen=True)
-class RandomScene:
-    scene: Scene
+class PackedScene:
+    """A generated scene stored in contiguous floating-point and integer buffers."""
+
+    float_data: torch.Tensor = field(repr=False)
+    integer_data: torch.Tensor = field(repr=False)
+    batch_size: int
+    sphere_count: int
+    box_count: int
+    prism_count: int
+    cylinder_count: int
 
 
 @dataclass(frozen=True)
@@ -596,96 +620,165 @@ def flatten_composite_objects(
     )
 
 
-def random_scene(
+def generate_random_scene(
     seed: int,
     *,
-    house_count: int = 10,
-    tree_count: int = 10,
-    cloud_count: int = 5,
-    car_count: int = 5,
-    person_count: int = 5,
     batch_size: int = 4,
-    scatter_radius: float = 50.0,
-    ground_y: float = -1.0,
-    depth_limit: float = 50.0,
-    terrain_dz: float = 0.005,
-    terrain_dz_growth: float = 0.0001,
-    fov_degrees: float = 50.0,
-    aspect_ratio: float = 1.5,
-) -> RandomScene:
-    """Generate deterministic random camera-space scenes from a seed."""
-    if min(house_count, tree_count, cloud_count, car_count, person_count) < 0:
-        raise ValueError("composite object counts must be non-negative")
-    if house_count + tree_count + cloud_count + car_count + person_count <= 0:
-        raise ValueError("at least one composite object is required")
-    native = _cuda_renderer.random_scene(
-        int(seed),
-        int(batch_size),
-        float(scatter_radius),
-        float(ground_y),
-        float(depth_limit),
-        float(terrain_dz),
-        float(terrain_dz_growth),
-        float(fov_degrees),
-        float(aspect_ratio),
-        int(house_count),
-        int(tree_count),
-        int(cloud_count),
-        int(car_count),
-        int(person_count),
+    options: RandomSceneOptions | None = None,
+) -> PackedScene:
+    """Generate a packed CUDA scene using a reusable options object."""
+    config = options or RandomSceneOptions()
+    sphere_count = config.tree_count + 3 * config.cloud_count + config.person_count
+    box_count = config.house_count + config.car_count + 5 * config.person_count
+    prism_count = config.house_count
+    cylinder_count = config.tree_count + 4 * config.car_count
+    float_data, integer_data = _cuda_renderer.generate_random_scene(
+        seed,
+        batch_size,
+        config.scatter_radius,
+        config.ground_y,
+        config.depth_limit,
+        config.terrain_dz,
+        config.terrain_dz_growth,
+        config.fov_degrees,
+        config.aspect_ratio,
+        config.house_count,
+        config.tree_count,
+        config.cloud_count,
+        config.car_count,
+        config.person_count,
+    )
+    return PackedScene(
+        float_data=float_data,
+        integer_data=integer_data,
+        batch_size=batch_size,
+        sphere_count=sphere_count,
+        box_count=box_count,
+        prism_count=prism_count,
+        cylinder_count=cylinder_count,
     )
 
-    scene = Scene(
-        spheres=Spheres(
-            centers=native["sphere_centers"],
-            radii=native["sphere_radii"],
-            colors=native["sphere_colors"],
-            counts=native["sphere_counts"],
-            class_ids=native["sphere_class_ids"],
-            instance_ids=native["sphere_instance_ids"],
-        ),
-        terrain=Terrain(
-            base_heights=native["terrain_base_heights"],
-            depth_limits=native["terrain_depth_limits"],
-            phase_xs=native["terrain_phase_xs"],
-            phase_zs=native["terrain_phase_zs"],
-            dz=native["terrain_dz"],
-            dz_growth=native["terrain_dz_growth"],
-            colors=native["terrain_colors"],
-            counts=native["terrain_counts"],
-        ),
-        boxes=OrientedBoxes(
-            centers=native["box_centers"],
-            half_sizes=native["box_half_sizes"],
-            axes=native["box_axes"],
-            colors=native["box_colors"],
-            counts=native["box_counts"],
-            class_ids=native["box_class_ids"],
-            instance_ids=native["box_instance_ids"],
-        ),
-        prisms=Prisms(
-            centers=native["prism_centers"],
-            half_sizes=native["prism_half_sizes"],
-            axes=native["prism_axes"],
-            colors=native["prism_colors"],
-            counts=native["prism_counts"],
-            class_ids=native["prism_class_ids"],
-            instance_ids=native["prism_instance_ids"],
-        ),
-        cylinders=Cylinders(
-            centers=native["cylinder_centers"],
-            radii=native["cylinder_radii"],
-            half_heights=native["cylinder_half_heights"],
-            axes=native["cylinder_axes"],
-            colors=native["cylinder_colors"],
-            counts=native["cylinder_counts"],
-            class_ids=native["cylinder_class_ids"],
-            instance_ids=native["cylinder_instance_ids"],
-        ),
-        _trusted_cuda_inputs=True,
-    )
-    return RandomScene(
+
+def render_random_scene(
+    seed: int,
+    width: int = 512,
+    height: int = 512,
+    *,
+    batch_size: int = 4,
+    scene_options: RandomSceneOptions | None = None,
+    render_options: RenderOptions | None = None,
+    return_maps: bool = False,
+) -> torch.Tensor | RenderResult:
+    """Generate a packed scene and render it without exposing intermediate fields."""
+    scene = generate_random_scene(seed, batch_size=batch_size, options=scene_options)
+    return render_scene(
+        width=width,
+        height=height,
         scene=scene,
+        options=render_options,
+        return_maps=return_maps,
+    )
+
+
+def _render_packed_scene(
+    scene: PackedScene,
+    width: int,
+    height: int,
+    options: RenderOptions,
+    return_maps: bool,
+) -> torch.Tensor | RenderResult:
+    input_preparation_range = torch.autograd.profiler.record_function(
+        "synthetic_scene::input_preparation"
+    )
+    input_preparation_range.__enter__()
+    device = scene.float_data.device
+    image = torch.empty((scene.batch_size, 3, height, width), dtype=torch.float32, device=device)
+    instance_map = (
+        torch.empty((scene.batch_size, height, width), dtype=torch.int32, device=device)
+        if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
+    )
+    semantic_map = torch.empty_like(instance_map)
+    visible_masks = (
+        torch.zeros((scene.batch_size, 9), dtype=torch.int32, device=device)
+        if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
+    )
+    light_direction = torch.as_tensor(options.light_dir, dtype=torch.float32, device=device)
+    background = torch.as_tensor(options.background, dtype=torch.float32, device=device)
+    input_preparation_range.__exit__(None, None, None)
+    _cuda_renderer.render_packed_scene(
+        image,
+        instance_map,
+        semantic_map,
+        visible_masks,
+        scene.float_data,
+        scene.integer_data,
+        scene.sphere_count,
+        scene.box_count,
+        scene.prism_count,
+        scene.cylinder_count,
+        light_direction,
+        options.fov_degrees,
+        background,
+        options.ambient,
+        options.shadows,
+        options.shadow_strength,
+    )
+    if not return_maps:
+        return image
+
+    segmentation_range = torch.autograd.profiler.record_function("synthetic_scene::segmentation")
+    segmentation_range.__enter__()
+    # Metadata occupies the integer buffer in this fixed order. These are views,
+    # not new allocations, and are needed only for visible-instance compaction.
+    offset = 0
+
+    def take(shape: tuple[int, ...]) -> torch.Tensor:
+        nonlocal offset
+        element_count = 1
+        for dimension in shape:
+            element_count *= dimension
+        view = scene.integer_data.narrow(0, offset, element_count).view(shape)
+        offset += element_count
+        return view
+
+    batch = scene.batch_size
+    take((batch,))  # sphere counts
+    sphere_classes = take((batch, scene.sphere_count))
+    sphere_instances = take((batch, scene.sphere_count))
+    take((batch,))  # terrain counts
+    take((batch,))  # box counts
+    box_classes = take((batch, scene.box_count))
+    box_instances = take((batch, scene.box_count))
+    take((batch,))  # prism counts
+    prism_classes = take((batch, scene.prism_count))
+    prism_instances = take((batch, scene.prism_count))
+    take((batch,))  # cylinder counts
+    cylinder_classes = take((batch, scene.cylinder_count))
+    cylinder_instances = take((batch, scene.cylinder_count))
+    take((batch,))  # plane counts
+    terrain_classes = take((batch, 1))
+    terrain_instances = take((batch, 1))
+    visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(
+        visible_masks,
+        sphere_instance_ids=sphere_instances,
+        sphere_class_ids=sphere_classes,
+        terrain_instance_ids=terrain_instances,
+        terrain_class_ids=terrain_classes,
+        box_instance_ids=box_instances,
+        box_class_ids=box_classes,
+        prism_instance_ids=prism_instances,
+        prism_class_ids=prism_classes,
+        cylinder_instance_ids=cylinder_instances,
+        cylinder_class_ids=cylinder_classes,
+    )
+    segmentation_range.__exit__(None, None, None)
+    return RenderResult(
+        image=image,
+        visible_count=visible_count,
+        visible_classes=visible_classes,
+        visible_instance_ids=visible_instance_ids,
+        instance_map=instance_map,
+        semantic_map=semantic_map,
     )
 
 
@@ -694,7 +787,7 @@ def render_scene(
     width: int = 512,
     height: int = 512,
     *,
-    scene: Scene | None = None,
+    scene: Scene | PackedScene | None = None,
     options: RenderOptions | None = None,
     return_maps: bool = False,
 ) -> torch.Tensor: ...
@@ -705,7 +798,7 @@ def render_scene(
     width: int = 512,
     height: int = 512,
     *,
-    scene: Scene | None = None,
+    scene: Scene | PackedScene | None = None,
     options: RenderOptions | None = None,
     return_maps: bool,
 ) -> torch.Tensor | RenderResult: ...
@@ -715,7 +808,7 @@ def render_scene(
     width: int = 512,
     height: int = 512,
     *,
-    scene: Scene | None = None,
+    scene: Scene | PackedScene | None = None,
     options: RenderOptions | None = None,
     return_maps: bool = False,
 ) -> torch.Tensor | RenderResult:
@@ -726,13 +819,15 @@ def render_scene(
         raise ValueError("width and height must be positive")
 
     options_data = options or RenderOptions()
-    scene_data = scene or Scene()
     if options_data.fov_degrees <= 0.0 or options_data.fov_degrees >= 180.0:
         raise ValueError("fov_degrees must be in the open interval (0, 180)")
     if options_data.ambient < 0.0 or options_data.ambient > 1.0:
         raise ValueError("ambient must be in the range [0, 1]")
     if options_data.shadow_strength < 0.0 or options_data.shadow_strength > 1.0:
         raise ValueError("shadow_strength must be in the range [0, 1]")
+    if isinstance(scene, PackedScene):
+        return _render_packed_scene(scene, width, height, options_data, return_maps)
+    scene_data = scene or Scene()
 
     input_preparation_range = torch.autograd.profiler.record_function("synthetic_scene::input_preparation")
     input_preparation_range.__enter__()

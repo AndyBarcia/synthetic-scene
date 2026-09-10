@@ -200,13 +200,11 @@ scene = flatten_composite_objects([
 For synthetic data generation, create seeded random camera-space scenes:
 
 ```python
-from synthetic_scene import random_scene, render_scene
+from synthetic_scene import RandomSceneOptions, generate_random_scene, render_scene
 
 width = 768
 height = 512
-generated = random_scene(
-    seed=1234,
-    batch_size=8,
+scene_options = RandomSceneOptions(
     house_count=3,
     tree_count=8,
     cloud_count=2,
@@ -217,11 +215,42 @@ generated = random_scene(
     terrain_dz=0.05,
     terrain_dz_growth=0.0001,
 )
+generated = generate_random_scene(seed=1234, batch_size=8, options=scene_options)
 result = render_scene(
     width=width,
     height=height,
-    scene=generated.scene,
+    scene=generated,
     return_maps=True,
+)
+```
+
+Randomly generated scenes use a packed CUDA representation containing one
+floating-point buffer, one integer buffer, and the primitive capacities needed
+to interpret them. Generation and rendering exchange these buffers directly;
+they do not construct nested dictionaries or intermediate `Scene` objects.
+
+The structured API separates reusable generation options from execution:
+
+```python
+from synthetic_scene import RandomSceneOptions, generate_random_scene, render_scene
+
+scene_options = RandomSceneOptions(house_count=12, tree_count=20)
+packed_scene = generate_random_scene(1234, batch_size=8, options=scene_options)
+image = render_scene(1024, 1024, scene=packed_scene)
+```
+
+When the intermediate scene is not needed, generation and rendering can be
+expressed as one operation:
+
+```python
+from synthetic_scene import render_random_scene
+
+image = render_random_scene(
+    1234,
+    width=1024,
+    height=1024,
+    batch_size=8,
+    scene_options=scene_options,
 )
 ```
 
@@ -231,9 +260,8 @@ composite objects. `house_count`, `tree_count`, `cloud_count`, `car_count`, and
 per-object instance IDs and semantic classes `10` through `14`. Ground objects
 are placed with camera-frustum sampling and grounded against the generated
 terrain height; clouds are sampled in the upper frustum.
-The native random scene generator expands composite templates into ordinary
-primitive tensors, so rendering still receives the same sphere, box, prism, and
-cylinder arrays.
+The native random scene generator expands composite templates directly into
+the packed buffers consumed by the renderer.
 
 ## Benchmark
 

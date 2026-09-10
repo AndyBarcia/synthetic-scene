@@ -2,18 +2,18 @@ from pathlib import Path
 
 import torch
 
-from synthetic_scene import colorize_label_map, random_scene, render_scene, save_image
+from synthetic_scene import colorize_label_map, generate_random_scene, render_scene, save_image
 
 
 RANDOM_SCENE_SEED = 44
 
 
 def main() -> None:
-    generated = random_scene(seed=RANDOM_SCENE_SEED, batch_size=2)
+    generated = generate_random_scene(seed=RANDOM_SCENE_SEED, batch_size=2)
     result = render_scene(
         width=768,
         height=512,
-        scene=generated.scene,
+        scene=generated,
         return_maps=True,
     )
     output = Path("outputs/render.png")
