@@ -14,6 +14,7 @@ constexpr int kDepthBins = 8;
 constexpr int kTileWidth = 16;
 constexpr int kTileHeight = 16;
 constexpr int kPrimitiveMaskWords = (kMaxFinitePrimitives + 31) / 32;
+constexpr int kVisibilityMaskWords = (kMaxFinitePrimitives + 1 + 31) / 32;
 constexpr float kRayTMin = 1.0e-4f;
 constexpr float kParallelEpsilon = 1.0e-6f;
 constexpr float kFloatMax = 3.402823466e+38f;
@@ -1820,6 +1821,7 @@ __global__ void render_scene_kernel(
     float* image,
     int* instance_map,
     int* semantic_map,
+    int* visible_primitive_masks,
     const float* terrain_depth,
     const int* primary_cluster_masks,
     const int* shadow_cluster_masks,
@@ -2071,6 +2073,28 @@ __global__ void render_scene_kernel(
   if (semantic_map != nullptr) {
     semantic_map[map_offset] = semantic_id;
   }
+  if (visible_primitive_masks != nullptr) {
+    int primitive_slot = -1;
+    if (closest_sphere >= 0) {
+      primitive_slot = closest_sphere;
+    } else if (closest_box >= 0) {
+      primitive_slot = scene.spheres.count + closest_box;
+    } else if (closest_prism >= 0) {
+      primitive_slot = scene.spheres.count + scene.boxes.count + closest_prism;
+    } else if (closest_cylinder >= 0) {
+      primitive_slot = scene.spheres.count + scene.boxes.count + scene.prisms.count + closest_cylinder;
+    } else if (closest_terrain >= 0) {
+      primitive_slot = scene.spheres.count + scene.boxes.count + scene.prisms.count + scene.cylinders.count;
+    }
+    const unsigned int active = __activemask();
+    const unsigned int peers = __match_any_sync(active, primitive_slot);
+    const int lane = (threadIdx.y * blockDim.x + threadIdx.x) & 31;
+    if (primitive_slot >= 0 && __ffs(peers) - 1 == lane) {
+      atomicOr(
+          visible_primitive_masks + batch_idx * kVisibilityMaskWords + primitive_slot / 32,
+          static_cast<int>(1u << (primitive_slot & 31)));
+    }
+  }
 }
 
 }  // namespace
@@ -2079,6 +2103,7 @@ void render_scene_cuda(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
+    torch::Tensor visible_primitive_masks,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
     torch::Tensor sphere_counts,
@@ -2309,6 +2334,7 @@ void render_scene_cuda(
         image.data_ptr<float>(),
         instance_map.numel() == 0 ? nullptr : instance_map.data_ptr<int>(),
         semantic_map.numel() == 0 ? nullptr : semantic_map.data_ptr<int>(),
+        visible_primitive_masks.numel() == 0 ? nullptr : visible_primitive_masks.data_ptr<int>(),
         terrain_depth.data_ptr<float>(),
         primary_cluster_masks.data_ptr<int>(),
         shadow_cluster_masks_ptr,

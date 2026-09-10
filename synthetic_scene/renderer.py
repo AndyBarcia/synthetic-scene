@@ -163,27 +163,51 @@ def _compact_visible_instances(
 
 
 def _visible_custom_instances(
-    instance_map: torch.Tensor,
-    semantic_map: torch.Tensor,
+    visible_primitive_masks: torch.Tensor,
+    *,
+    sphere_instance_ids: torch.Tensor,
+    sphere_class_ids: torch.Tensor,
+    terrain_instance_ids: torch.Tensor,
+    terrain_class_ids: torch.Tensor,
+    box_instance_ids: torch.Tensor,
+    box_class_ids: torch.Tensor,
+    prism_instance_ids: torch.Tensor,
+    prism_class_ids: torch.Tensor,
+    cylinder_instance_ids: torch.Tensor,
+    cylinder_class_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return visible custom instance IDs and their classes without remapping the map."""
-    batch_size = instance_map.shape[0]
-    labels = instance_map.reshape(batch_size, -1)
-    classes = semantic_map.reshape(batch_size, -1)
-    sorted_labels, order = labels.sort(dim=1)
-    sorted_classes = classes.gather(1, order)
-    first = sorted_labels > 0
-    first[:, 1:] &= sorted_labels[:, 1:] != sorted_labels[:, :-1]
+    """Return visible custom IDs from the renderer's small primitive bitset."""
+    batch_size = visible_primitive_masks.shape[0]
+    candidate_ids = torch.cat(
+        (sphere_instance_ids, box_instance_ids, prism_instance_ids, cylinder_instance_ids, terrain_instance_ids),
+        dim=1,
+    )
+    candidate_classes = torch.cat(
+        (sphere_class_ids, box_class_ids, prism_class_ids, cylinder_class_ids, terrain_class_ids),
+        dim=1,
+    )
+    candidate_count = candidate_ids.shape[1]
+    slots = torch.arange(candidate_count, device=visible_primitive_masks.device)
+    visible = (
+        (visible_primitive_masks[:, slots // 32] >> (slots % 32)) & 1
+    ).to(torch.bool) & (candidate_ids > 0)
+
+    # Several primitives may form one custom instance. Keep the first visible
+    # primitive for each ID; output ordering is intentionally unspecified.
+    same_id = candidate_ids.unsqueeze(2) == candidate_ids.unsqueeze(1)
+    earlier = slots.unsqueeze(0) < slots.unsqueeze(1)
+    duplicate = (same_id & visible.unsqueeze(1) & earlier.unsqueeze(0)).any(dim=2)
+    first = visible & ~duplicate
 
     visible_count = first.sum(dim=1, dtype=torch.int32)
     max_visible = int(visible_count.max().item())
-    visible_classes = torch.zeros((batch_size, max_visible), dtype=torch.int32, device=instance_map.device)
-    visible_instance_ids = torch.zeros((batch_size, max_visible), dtype=torch.int32, device=instance_map.device)
+    visible_classes = torch.zeros((batch_size, max_visible), dtype=torch.int32, device=visible_primitive_masks.device)
+    visible_instance_ids = torch.zeros((batch_size, max_visible), dtype=torch.int32, device=visible_primitive_masks.device)
     if max_visible:
         positions = first.cumsum(dim=1, dtype=torch.long) - 1
-        batch_indices = torch.arange(batch_size, device=instance_map.device).unsqueeze(1).expand_as(labels)
-        visible_instance_ids[batch_indices[first], positions[first]] = sorted_labels[first]
-        visible_classes[batch_indices[first], positions[first]] = sorted_classes[first]
+        batch_indices = torch.arange(batch_size, device=visible_primitive_masks.device).unsqueeze(1).expand_as(candidate_ids)
+        visible_instance_ids[batch_indices[first], positions[first]] = candidate_ids[first]
+        visible_classes[batch_indices[first], positions[first]] = candidate_classes[first]
     return visible_count, visible_classes, visible_instance_ids
 
 
@@ -904,11 +928,17 @@ def render_scene(
     image = torch.empty((batch_size, 3, height, width), dtype=torch.float32, device=device)
     instance_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
     semantic_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
+    visible_primitive_masks = (
+        torch.zeros((batch_size, 9), dtype=torch.int32, device=device)
+        if return_maps
+        else torch.empty((0,), dtype=torch.int32, device=device)
+    )
     input_preparation_range.__exit__(None, None, None)
     _cuda_renderer.render_scene(
         image,
         instance_map,
         semantic_map,
+        visible_primitive_masks,
         {
             "spheres": {
                 "centers": centers,
@@ -977,7 +1007,19 @@ def render_scene(
     if return_maps:
         with torch.autograd.profiler.record_function("synthetic_scene::segmentation"):
             if has_custom_metadata:
-                visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(instance_map, semantic_map)
+                visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(
+                    visible_primitive_masks,
+                    sphere_instance_ids=sphere_instance_ids,
+                    sphere_class_ids=sphere_class_ids,
+                    terrain_instance_ids=terrain_instance_ids,
+                    terrain_class_ids=terrain_class_ids,
+                    box_instance_ids=box_instance_ids,
+                    box_class_ids=box_class_ids,
+                    prism_instance_ids=prism_instance_ids,
+                    prism_class_ids=prism_class_ids,
+                    cylinder_instance_ids=cylinder_instance_ids,
+                    cylinder_class_ids=cylinder_class_ids,
+                )
             else:
                 visible_count, visible_classes, instance_map = _compact_visible_instances(
                     instance_map,

@@ -116,6 +116,7 @@ void render_scene_cuda(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
+    torch::Tensor visible_primitive_masks,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
     torch::Tensor sphere_counts,
@@ -542,6 +543,7 @@ void render_scene(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
+    torch::Tensor visible_primitive_masks,
     py::dict scene,
     py::dict options) {
   const py::dict spheres = require_dict(scene, "spheres");
@@ -605,9 +607,14 @@ void render_scene(
   const torch::Tensor cylinder_instance_ids = require_tensor(cylinders, "instance_ids");
 
   TORCH_CHECK(image.is_cuda(), "image must be a CUDA tensor");
-  TORCH_CHECK(instance_map.is_cuda() && semantic_map.is_cuda(), "segmentation maps must be CUDA tensors");
+  TORCH_CHECK(instance_map.is_cuda() && semantic_map.is_cuda() && visible_primitive_masks.is_cuda(), "segmentation tensors must be CUDA tensors");
   TORCH_CHECK(image.dtype() == torch::kFloat32, "image must be float32");
-  TORCH_CHECK(instance_map.dtype() == torch::kInt32 && semantic_map.dtype() == torch::kInt32, "segmentation maps must be int32");
+  TORCH_CHECK(instance_map.dtype() == torch::kInt32 && semantic_map.dtype() == torch::kInt32 && visible_primitive_masks.dtype() == torch::kInt32, "segmentation tensors must be int32");
+  TORCH_CHECK(
+      visible_primitive_masks.numel() == 0 ||
+          (visible_primitive_masks.dim() == 2 && visible_primitive_masks.size(0) == image.size(0) &&
+           visible_primitive_masks.size(1) == 9),
+      "visible primitive masks must be empty or B x 9");
   TORCH_CHECK(image.dim() == 4 && image.size(1) == 3, "image must be B x 3 x H x W");
   TORCH_CHECK(
       instance_map.numel() == 0 ||
@@ -766,7 +773,7 @@ void render_scene(
           cylinder_class_ids.dtype() == torch::kInt32 && cylinder_instance_ids.dtype() == torch::kInt32,
       "primitive metadata must be int32");
   TORCH_CHECK(image.is_contiguous(), "image must be contiguous");
-  TORCH_CHECK(instance_map.is_contiguous() && semantic_map.is_contiguous(), "segmentation maps must be contiguous");
+  TORCH_CHECK(instance_map.is_contiguous() && semantic_map.is_contiguous() && visible_primitive_masks.is_contiguous(), "segmentation tensors must be contiguous");
   TORCH_CHECK(sphere_centers.is_contiguous() && sphere_radii.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(plane_points.is_contiguous() && plane_normals.is_contiguous(), "scene tensors must be contiguous");
   TORCH_CHECK(
@@ -797,6 +804,7 @@ void render_scene(
       image,
       instance_map,
       semantic_map,
+      visible_primitive_masks,
       sphere_centers,
       sphere_radii,
       sphere_counts,
