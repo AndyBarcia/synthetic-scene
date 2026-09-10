@@ -71,9 +71,13 @@ __device__ Vec3 rotate_yaw(Vec3 vector, float cosine, float sine) {
   return {cosine * vector.x - sine * vector.z, vector.y, sine * vector.x + cosine * vector.z};
 }
 
-// SplitMix64 gives every batch element a small, independent deterministic RNG.
+// SplitMix64 supports constant-time advancement to an object's random draws.
 struct RandomGenerator {
   unsigned long long state;
+
+  __device__ void advance(unsigned long long draws) {
+    state += 0x9e3779b97f4a7c15ULL * draws;
+  }
 
   __device__ unsigned long long next() {
     state += 0x9e3779b97f4a7c15ULL;
@@ -351,12 +355,17 @@ __global__ void generate_random_scenes(
     int box_capacity,
     int prism_capacity,
     int cylinder_capacity) {
-  const int batch_index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (batch_index >= batch_size) {
+  const int batch_index = blockIdx.y;
+  const int object_index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int tree_start = house_count;
+  const int cloud_start = tree_start + tree_count;
+  const int car_start = cloud_start + cloud_count;
+  const int person_start = car_start + car_count;
+  if (object_index >= person_start + person_count) {
     return;
   }
 
-  // A thread owns one complete batch slice, so writing primitives requires no atomics.
+  // Each object owns disjoint primitive slots; no atomics or barriers are needed.
   SceneWriter writer{
       float_outputs[kSphereCenters] + batch_index * sphere_capacity * 3,
       float_outputs[kSphereRadii] + batch_index * sphere_capacity,
@@ -389,30 +398,64 @@ __global__ void generate_random_scenes(
   const float phase_x = random.uniform(0.0f, kTau);
   const float phase_z = random.uniform(0.0f, kTau);
 
-  float_outputs[kTerrainBaseHeights][batch_index] = ground_y;
-  float_outputs[kTerrainDepthLimits][batch_index] = depth_limit;
-  float_outputs[kTerrainPhaseXs][batch_index] = phase_x;
-  float_outputs[kTerrainPhaseZs][batch_index] = phase_z;
-  float_outputs[kTerrainDz][batch_index] = terrain_dz;
-  float_outputs[kTerrainDzGrowth][batch_index] = terrain_dz_growth;
-  SceneWriter::write_vec3(float_outputs[kTerrainColors], batch_index, {0.34f, 0.46f, 0.28f});
-  integer_outputs[kTerrainCounts][batch_index] = 1;
+  if (object_index == 0) {
+    float_outputs[kTerrainBaseHeights][batch_index] = ground_y;
+    float_outputs[kTerrainDepthLimits][batch_index] = depth_limit;
+    float_outputs[kTerrainPhaseXs][batch_index] = phase_x;
+    float_outputs[kTerrainPhaseZs][batch_index] = phase_z;
+    float_outputs[kTerrainDz][batch_index] = terrain_dz;
+    float_outputs[kTerrainDzGrowth][batch_index] = terrain_dz_growth;
+    SceneWriter::write_vec3(float_outputs[kTerrainColors], batch_index, {0.34f, 0.46f, 0.28f});
+    integer_outputs[kTerrainCounts][batch_index] = 1;
+    integer_outputs[kSphereCounts][batch_index] = sphere_capacity;
+    integer_outputs[kBoxCounts][batch_index] = box_capacity;
+    integer_outputs[kPrismCounts][batch_index] = prism_capacity;
+    integer_outputs[kCylinderCounts][batch_index] = cylinder_capacity;
+  }
 
-  int instance_id = 1;
-  add_houses(writer, random, house_count, fov_degrees, aspect_ratio, scatter_radius,
+  // Draw counts must match the add_* helpers: position (3), optional yaw (1),
+  // then dimensions/colors. Advancing preserves the original serial RNG stream.
+  constexpr int kHouseDraws = 8;
+  constexpr int kTreeDraws = 6;
+  constexpr int kCloudDraws = 5;
+  constexpr int kCarDraws = 10;
+  constexpr int kPersonDraws = 5;
+  int instance_id = object_index + 1;
+  if (object_index < tree_start) {
+    writer.box_count = object_index;
+    writer.prism_count = object_index;
+    random.advance(kHouseDraws * object_index);
+    add_houses(writer, random, 1, fov_degrees, aspect_ratio, scatter_radius,
+               ground_y, phase_x, phase_z, instance_id);
+  } else if (object_index < cloud_start) {
+    const int index = object_index - tree_start;
+    writer.sphere_count = index;
+    writer.cylinder_count = index;
+    random.advance(kHouseDraws * house_count + kTreeDraws * index);
+    add_trees(writer, random, 1, fov_degrees, aspect_ratio, scatter_radius,
+              ground_y, phase_x, phase_z, instance_id);
+  } else if (object_index < car_start) {
+    const int index = object_index - cloud_start;
+    writer.sphere_count = tree_count + 3 * index;
+    random.advance(kHouseDraws * house_count + kTreeDraws * tree_count + kCloudDraws * index);
+    add_clouds(writer, random, 1, fov_degrees, aspect_ratio, scatter_radius, instance_id);
+  } else if (object_index < person_start) {
+    const int index = object_index - car_start;
+    writer.box_count = house_count + index;
+    writer.cylinder_count = tree_count + 4 * index;
+    random.advance(kHouseDraws * house_count + kTreeDraws * tree_count +
+                   kCloudDraws * cloud_count + kCarDraws * index);
+    add_cars(writer, random, 1, fov_degrees, aspect_ratio, scatter_radius,
              ground_y, phase_x, phase_z, instance_id);
-  add_trees(writer, random, tree_count, fov_degrees, aspect_ratio, scatter_radius,
-            ground_y, phase_x, phase_z, instance_id);
-  add_clouds(writer, random, cloud_count, fov_degrees, aspect_ratio, scatter_radius, instance_id);
-  add_cars(writer, random, car_count, fov_degrees, aspect_ratio, scatter_radius,
-           ground_y, phase_x, phase_z, instance_id);
-  add_people(writer, random, person_count, fov_degrees, aspect_ratio, scatter_radius,
-             ground_y, phase_x, phase_z, instance_id);
-
-  integer_outputs[kSphereCounts][batch_index] = writer.sphere_count;
-  integer_outputs[kBoxCounts][batch_index] = writer.box_count;
-  integer_outputs[kPrismCounts][batch_index] = writer.prism_count;
-  integer_outputs[kCylinderCounts][batch_index] = writer.cylinder_count;
+  } else {
+    const int index = object_index - person_start;
+    writer.sphere_count = tree_count + 3 * cloud_count + index;
+    writer.box_count = house_count + car_count + 5 * index;
+    random.advance(kHouseDraws * house_count + kTreeDraws * tree_count +
+                   kCloudDraws * cloud_count + kCarDraws * car_count + kPersonDraws * index);
+    add_people(writer, random, 1, fov_degrees, aspect_ratio, scatter_radius,
+               ground_y, phase_x, phase_z, instance_id);
+  }
 }
 
 }  // namespace
@@ -465,9 +508,10 @@ void random_scene_cuda(
   const int box_capacity = outputs[kBoxHalfSizes].size(1);
   const int prism_capacity = outputs[kPrismHalfSizes].size(1);
   const int cylinder_capacity = outputs[kCylinderRadii].size(1);
-  const int block_count = (batch_size + kThreadsPerBlock - 1) / kThreadsPerBlock;
+  const int object_count = house_count + tree_count + cloud_count + car_count + person_count;
+  const dim3 grid((object_count + kThreadsPerBlock - 1) / kThreadsPerBlock, batch_size);
 
-  generate_random_scenes<<<block_count, kThreadsPerBlock, 0, stream>>>(
+  generate_random_scenes<<<grid, kThreadsPerBlock, 0, stream>>>(
       reinterpret_cast<float**>(device_float_pointers.data_ptr()),
       reinterpret_cast<int**>(device_integer_pointers.data_ptr()),
       seed,

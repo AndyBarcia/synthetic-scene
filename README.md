@@ -262,6 +262,11 @@ are placed with camera-frustum sampling and grounded against the generated
 terrain height; clouds are sampled in the upper frustum.
 The native random scene generator expands composite templates directly into
 the packed buffers consumed by the renderer.
+Objects within each scene are generated in parallel into disjoint primitive
+slots. Each object advances directly to its portion of the seeded random stream,
+preserving the serial generator's random draws and object ordering (floating-point
+rounding can differ). Changes to a template's
+random draws must also update its draw count in the CUDA dispatcher.
 
 ## Benchmark
 
