@@ -131,29 +131,33 @@ def _compact_visible_instances(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return per-image visible classes and maps with compact 1-based IDs."""
     batch_size = instance_map.shape[0]
+    # This single aggregate readback preserves the public, count-dependent
+    # visible_classes shape. All per-image counts stay on the device.
     max_gt = int((sphere_counts + terrain_counts + box_counts + prism_counts + cylinder_counts).max().item())
-    visible_count = torch.empty((batch_size,), dtype=torch.int32, device=instance_map.device)
+    labels = instance_map.reshape(batch_size, -1).to(torch.long)
+    visible = torch.zeros((batch_size, max_gt + 1), dtype=torch.int32, device=instance_map.device)
+    visible.scatter_(1, labels, 1)
+    visible[:, 0] = 0
+
+    remap = visible.cumsum(dim=1, dtype=torch.int32)
+    visible_count = remap[:, -1]
+    compact_map = remap.gather(1, labels).reshape_as(instance_map)
+
+    object_ids = torch.arange(1, max_gt + 1, dtype=torch.int32, device=instance_map.device).unsqueeze(0)
+    sphere_end = sphere_counts.unsqueeze(1)
+    terrain_end = sphere_end + terrain_counts.unsqueeze(1)
+    box_end = terrain_end + box_counts.unsqueeze(1)
+    prism_end = box_end + prism_counts.unsqueeze(1)
+    cylinder_end = prism_end + cylinder_counts.unsqueeze(1)
+    class_lookup = (
+        ((object_ids <= sphere_end) * 1)
+        + ((object_ids > sphere_end) & (object_ids <= terrain_end)) * 2
+        + ((object_ids > terrain_end) & (object_ids <= box_end)) * 3
+        + ((object_ids > box_end) & (object_ids <= prism_end)) * 5
+        + ((object_ids > prism_end) & (object_ids <= cylinder_end)) * 4
+    ).to(torch.int32)
     visible_classes = torch.zeros((batch_size, max_gt), dtype=torch.int32, device=instance_map.device)
-    compact_map = torch.empty_like(instance_map)
-
-    for batch_idx in range(batch_size):
-        labels = torch.unique(instance_map[batch_idx])
-        labels = labels[labels > 0]
-        count = int(labels.numel())
-        visible_count[batch_idx] = count
-        if count == 0:
-            compact_map[batch_idx].zero_()
-            continue
-
-        remap_size = int(labels.max().item()) + 1
-        remap = torch.zeros((remap_size,), dtype=torch.int32, device=instance_map.device)
-        remap[labels.to(torch.long)] = torch.arange(1, count + 1, dtype=torch.int32, device=instance_map.device)
-        compact_map[batch_idx] = remap[instance_map[batch_idx].clamp(max=remap_size - 1).to(torch.long)]
-        for label_idx, label in enumerate(labels):
-            semantic_values = torch.unique(semantic_map[batch_idx][instance_map[batch_idx] == label])
-            semantic_values = semantic_values[semantic_values > 0]
-            if semantic_values.numel() > 0:
-                visible_classes[batch_idx, label_idx] = semantic_values[0].to(torch.int32)
+    visible_classes.scatter_add_(1, (remap[:, 1:] - 1).clamp_min_(0).to(torch.long), class_lookup * visible[:, 1:])
 
     return visible_count, visible_classes, compact_map
 
@@ -164,28 +168,22 @@ def _visible_custom_instances(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return visible custom instance IDs and their classes without remapping the map."""
     batch_size = instance_map.shape[0]
-    per_batch_labels = []
-    max_visible = 0
-    for batch_idx in range(batch_size):
-        labels = torch.unique(instance_map[batch_idx])
-        labels = labels[labels > 0]
-        per_batch_labels.append(labels)
-        max_visible = max(max_visible, int(labels.numel()))
+    labels = instance_map.reshape(batch_size, -1)
+    classes = semantic_map.reshape(batch_size, -1)
+    sorted_labels, order = labels.sort(dim=1)
+    sorted_classes = classes.gather(1, order)
+    first = sorted_labels > 0
+    first[:, 1:] &= sorted_labels[:, 1:] != sorted_labels[:, :-1]
 
-    visible_count = torch.empty((batch_size,), dtype=torch.int32, device=instance_map.device)
+    visible_count = first.sum(dim=1, dtype=torch.int32)
+    max_visible = int(visible_count.max().item())
     visible_classes = torch.zeros((batch_size, max_visible), dtype=torch.int32, device=instance_map.device)
     visible_instance_ids = torch.zeros((batch_size, max_visible), dtype=torch.int32, device=instance_map.device)
-    for batch_idx, labels in enumerate(per_batch_labels):
-        count = int(labels.numel())
-        visible_count[batch_idx] = count
-        if count == 0:
-            continue
-        visible_instance_ids[batch_idx, :count] = labels.to(torch.int32)
-        for label_idx, label in enumerate(labels):
-            semantic_values = torch.unique(semantic_map[batch_idx][instance_map[batch_idx] == label])
-            semantic_values = semantic_values[semantic_values > 0]
-            if semantic_values.numel() > 0:
-                visible_classes[batch_idx, label_idx] = semantic_values[0].to(torch.int32)
+    if max_visible:
+        positions = first.cumsum(dim=1, dtype=torch.long) - 1
+        batch_indices = torch.arange(batch_size, device=instance_map.device).unsqueeze(1).expand_as(labels)
+        visible_instance_ids[batch_indices[first], positions[first]] = sorted_labels[first]
+        visible_classes[batch_indices[first], positions[first]] = sorted_classes[first]
     return visible_count, visible_classes, visible_instance_ids
 
 
@@ -713,6 +711,8 @@ def render_scene(
     if options_data.shadow_strength < 0.0 or options_data.shadow_strength > 1.0:
         raise ValueError("shadow_strength must be in the range [0, 1]")
 
+    input_preparation_range = torch.autograd.profiler.record_function("synthetic_scene::input_preparation")
+    input_preparation_range.__enter__()
     device = torch.device("cuda")
     centers = _vec3_batch(scene_data.spheres.centers, device=device)
     radii = _scalar_batch(scene_data.spheres.radii, device=device)
@@ -904,6 +904,7 @@ def render_scene(
     image = torch.empty((batch_size, 3, height, width), dtype=torch.float32, device=device)
     instance_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
     semantic_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
+    input_preparation_range.__exit__(None, None, None)
     _cuda_renderer.render_scene(
         image,
         instance_map,
@@ -974,23 +975,24 @@ def render_scene(
         },
     )
     if return_maps:
-        if has_custom_metadata:
-            visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(instance_map, semantic_map)
-        else:
-            visible_count, visible_classes, instance_map = _compact_visible_instances(
-                instance_map,
-                semantic_map,
-                sphere_counts=sphere_counts,
-                terrain_counts=terrain_counts,
-                box_counts=box_counts,
-                prism_counts=prism_counts,
-                cylinder_counts=cylinder_counts,
-            )
-            visible_instance_ids = torch.zeros_like(visible_classes)
-            for batch_idx in range(batch_size):
-                count = int(visible_count[batch_idx].item())
-                if count > 0:
-                    visible_instance_ids[batch_idx, :count] = torch.arange(1, count + 1, dtype=torch.int32, device=device)
+        with torch.autograd.profiler.record_function("synthetic_scene::segmentation"):
+            if has_custom_metadata:
+                visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(instance_map, semantic_map)
+            else:
+                visible_count, visible_classes, instance_map = _compact_visible_instances(
+                    instance_map,
+                    semantic_map,
+                    sphere_counts=sphere_counts,
+                    terrain_counts=terrain_counts,
+                    box_counts=box_counts,
+                    prism_counts=prism_counts,
+                    cylinder_counts=cylinder_counts,
+                )
+                visible_instance_ids = torch.zeros_like(visible_classes)
+                visible_instance_ids.copy_(
+                    torch.arange(1, visible_classes.shape[1] + 1, dtype=torch.int32, device=device).unsqueeze(0)
+                    * (torch.arange(visible_classes.shape[1], device=device).unsqueeze(0) < visible_count.unsqueeze(1))
+                )
         return RenderResult(
             image=image,
             visible_count=visible_count,

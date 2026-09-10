@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/record_function.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
@@ -1538,18 +1539,19 @@ __global__ void build_shadow_cluster_masks_kernel(
     int tiles_y,
     SceneView scene,
     RenderOptionsView options) {
-  __shared__ int shared_valid;
-  __shared__ LightBounds shared_caster_bounds_ls;
+  // Each thread owns a receiver's complete mask. Cache caster bounds once per
+  // block, avoiding per-caster blocks, repeated receiver loads and atomic ORs.
+  __shared__ int caster_valid[kMaxFinitePrimitives];
+  __shared__ LightBounds caster_bounds[kMaxFinitePrimitives];
 
   const int cluster_linear = blockIdx.x * blockDim.x + threadIdx.x;
-  const int primitive_slot = blockIdx.y;
-  const int batch_idx = blockIdx.z;
+  const int batch_idx = blockIdx.y;
   const int total_clusters = tiles_x * tiles_y * kDepthBins;
+  const int primitive_count = scene.spheres.count + scene.boxes.count +
+      scene.prisms.count + scene.cylinders.count;
 
-  if (threadIdx.x == 0) {
-    shared_valid = 0;
-    shared_caster_bounds_ls = empty_light_bounds();
-
+  for (int primitive_slot = threadIdx.x; primitive_slot < primitive_count; primitive_slot += blockDim.x) {
+    caster_valid[primitive_slot] = 0;
     Vec3 center = make_vec3(0.0f, 0.0f, 0.0f);
     Vec3 half_size = make_vec3(0.0f, 0.0f, 0.0f);
     Aabb bounds = empty_aabb();
@@ -1558,33 +1560,28 @@ __global__ void build_shadow_cluster_masks_kernel(
     if (load_primitive_bounds_for_slot(scene, batch_idx, primitive_slot, &kind, &index, &bounds, &center, &half_size)) {
       const Vec3 light_dir = normalize(load_vec3(options.light_dir));
       const LightBasis light_basis = make_light_basis(light_dir);
-      shared_caster_bounds_ls = project_aabb_to_light_bounds(bounds, light_basis);
-      shared_valid = 1;
+      caster_bounds[primitive_slot] = project_aabb_to_light_bounds(bounds, light_basis);
+      caster_valid[primitive_slot] = 1;
     }
   }
   __syncthreads();
 
-  if (!shared_valid || cluster_linear >= total_clusters) {
+  if (cluster_linear >= total_clusters) {
     return;
   }
 
-  const int bin = cluster_linear % kDepthBins;
-  const int tile_linear = cluster_linear / kDepthBins;
-  const int tile_x = tile_linear % tiles_x;
-  const int tile_y = tile_linear / tiles_x;
-
   const int bounds_idx = (batch_idx * total_clusters + cluster_linear) * 6;
   const LightBounds receiver_bounds = load_light_bounds6(receiver_light_bounds + bounds_idx);
-  if (light_bounds_can_shadow_receiver(shared_caster_bounds_ls, receiver_bounds)) {
-    mark_primitive_in_cluster_mask(
-        shadow_cluster_masks,
-        batch_idx,
-        tile_y,
-        tile_x,
-        bin,
-        tiles_x,
-        tiles_y,
-        primitive_slot);
+  const int mask_idx = (batch_idx * total_clusters + cluster_linear) * kPrimitiveMaskWords;
+  for (int word = 0; word < kPrimitiveMaskWords; ++word) {
+    unsigned int bits = 0;
+    const int end = min(primitive_count, (word + 1) * 32);
+    for (int slot = word * 32; slot < end; ++slot) {
+      if (caster_valid[slot] && light_bounds_can_shadow_receiver(caster_bounds[slot], receiver_bounds)) {
+        bits |= 1u << (slot % 32);
+      }
+    }
+    shadow_cluster_masks[mask_idx + word] = static_cast<int>(bits);
   }
 }
 
@@ -2215,36 +2212,29 @@ void render_scene_cuda(
       static_cast<float>(shadow_strength),
   };
 
-  auto terrain_depth = torch::empty({batch_size, height, width}, image.options());
-  const int terrain_depth_count = batch_size * height * width;
-  const int init_threads = 256;
-  const int init_blocks = (terrain_depth_count + init_threads - 1) / init_threads;
-  init_terrain_depth_kernel<<<init_blocks, init_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-      terrain_depth.data_ptr<float>(), terrain_depth_count);
+  torch::Tensor terrain_depth;
+  {
+    RECORD_USER_SCOPE("synthetic_scene::terrain");
+    terrain_depth = torch::empty({batch_size, height, width}, image.options());
+    const int terrain_depth_count = batch_size * height * width;
+    const int init_threads = 256;
+    const int init_blocks = (terrain_depth_count + init_threads - 1) / init_threads;
+    init_terrain_depth_kernel<<<init_blocks, init_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        terrain_depth.data_ptr<float>(), terrain_depth_count);
 
-  if (terrain_depth_limits.size(1) > 0) {
-    const int voxel_threads = 128;
-    const dim3 voxel_grid((width + voxel_threads - 1) / voxel_threads, batch_size);
-    voxel_space_terrain_kernel<<<voxel_grid, voxel_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        terrain_depth.data_ptr<float>(), width, height, scene, options);
+    if (terrain_depth_limits.size(1) > 0) {
+      const int voxel_threads = 128;
+      const dim3 voxel_grid((width + voxel_threads - 1) / voxel_threads, batch_size);
+      voxel_space_terrain_kernel<<<voxel_grid, voxel_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          terrain_depth.data_ptr<float>(), width, height, scene, options);
+    }
   }
 
   const auto int_options = image.options().dtype(torch::kInt32);
-  auto depth_edges = torch::empty({batch_size, kDepthBins + 1}, image.options());
-  auto scene_bounds = torch::empty({batch_size, 6}, image.options());
-  auto scene_bounds_valid = torch::empty({batch_size}, int_options);
-
-  compute_cluster_metadata_kernel<<<batch_size, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
-      depth_edges.data_ptr<float>(),
-      scene_bounds.data_ptr<float>(),
-      scene_bounds_valid.data_ptr<int>(),
-      width,
-      height,
-      scene);
-
-  auto primary_cluster_masks = torch::zeros(
-      {batch_size, tiles_y, tiles_x, kDepthBins, kPrimitiveMaskWords}, int_options);
-
+  torch::Tensor depth_edges;
+  torch::Tensor scene_bounds;
+  torch::Tensor scene_bounds_valid;
+  torch::Tensor primary_cluster_masks;
   torch::Tensor shadow_cluster_masks;
   torch::Tensor receiver_light_bounds;
   int* shadow_cluster_masks_ptr = nullptr;
@@ -2254,64 +2244,84 @@ void render_scene_cuda(
   const int total_clusters = total_tiles * kDepthBins;
   const int cluster_threads = 128;
 
-  if (primitive_slot_count > 0) {
-    const dim3 primary_build_grid(primitive_slot_count, batch_size);
-    build_primary_cluster_masks_object_driven_kernel<<<primary_build_grid, cluster_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        primary_cluster_masks.data_ptr<int>(),
+  {
+    RECORD_USER_SCOPE("synthetic_scene::mask_construction");
+    depth_edges = torch::empty({batch_size, kDepthBins + 1}, image.options());
+    scene_bounds = torch::empty({batch_size, 6}, image.options());
+    scene_bounds_valid = torch::empty({batch_size}, int_options);
+    compute_cluster_metadata_kernel<<<batch_size, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
         depth_edges.data_ptr<float>(),
+        scene_bounds.data_ptr<float>(),
+        scene_bounds_valid.data_ptr<int>(),
         width,
         height,
-        tiles_x,
-        tiles_y,
-        scene,
-        options);
+        scene);
 
-    if (shadows) {
-      shadow_cluster_masks = torch::zeros(
-          {batch_size, tiles_y, tiles_x, kDepthBins, kPrimitiveMaskWords}, int_options);
-      receiver_light_bounds = torch::empty(
-          {batch_size, tiles_y, tiles_x, kDepthBins, 6}, image.options());
+    primary_cluster_masks = torch::zeros(
+        {batch_size, tiles_y, tiles_x, kDepthBins, kPrimitiveMaskWords}, int_options);
 
-      const dim3 receiver_grid((total_clusters + cluster_threads - 1) / cluster_threads, batch_size);
-      compute_receiver_light_bounds_kernel<<<receiver_grid, cluster_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-          receiver_light_bounds.data_ptr<float>(),
+    if (primitive_slot_count > 0) {
+      const dim3 primary_build_grid(primitive_slot_count, batch_size);
+      build_primary_cluster_masks_object_driven_kernel<<<primary_build_grid, cluster_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          primary_cluster_masks.data_ptr<int>(),
           depth_edges.data_ptr<float>(),
-          width,
-          height,
-          tiles_x,
-          tiles_y,
-          options);
-
-      const dim3 shadow_build_grid((total_clusters + cluster_threads - 1) / cluster_threads, primitive_slot_count, batch_size);
-      build_shadow_cluster_masks_kernel<<<shadow_build_grid, cluster_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-          shadow_cluster_masks.data_ptr<int>(),
-          receiver_light_bounds.data_ptr<float>(),
           width,
           height,
           tiles_x,
           tiles_y,
           scene,
           options);
-      shadow_cluster_masks_ptr = shadow_cluster_masks.data_ptr<int>();
+
+      if (shadows) {
+        shadow_cluster_masks = torch::empty(
+            {batch_size, tiles_y, tiles_x, kDepthBins, kPrimitiveMaskWords}, int_options);
+        receiver_light_bounds = torch::empty(
+            {batch_size, tiles_y, tiles_x, kDepthBins, 6}, image.options());
+
+        const dim3 receiver_grid((total_clusters + cluster_threads - 1) / cluster_threads, batch_size);
+        compute_receiver_light_bounds_kernel<<<receiver_grid, cluster_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            receiver_light_bounds.data_ptr<float>(),
+            depth_edges.data_ptr<float>(),
+            width,
+            height,
+            tiles_x,
+            tiles_y,
+            options);
+
+        const dim3 shadow_build_grid((total_clusters + cluster_threads - 1) / cluster_threads, batch_size);
+        build_shadow_cluster_masks_kernel<<<shadow_build_grid, cluster_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            shadow_cluster_masks.data_ptr<int>(),
+            receiver_light_bounds.data_ptr<float>(),
+            width,
+            height,
+            tiles_x,
+            tiles_y,
+            scene,
+            options);
+        shadow_cluster_masks_ptr = shadow_cluster_masks.data_ptr<int>();
+      }
     }
   }
 
-  render_scene_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-      image.data_ptr<float>(),
-      instance_map.numel() == 0 ? nullptr : instance_map.data_ptr<int>(),
-      semantic_map.numel() == 0 ? nullptr : semantic_map.data_ptr<int>(),
-      terrain_depth.data_ptr<float>(),
-      primary_cluster_masks.data_ptr<int>(),
-      shadow_cluster_masks_ptr,
-      depth_edges.data_ptr<float>(),
-      scene_bounds.data_ptr<float>(),
-      scene_bounds_valid.data_ptr<int>(),
-      width,
-      height,
-      tiles_x,
-      tiles_y,
-      scene,
-      options);
+  {
+    RECORD_USER_SCOPE("synthetic_scene::rendering");
+    render_scene_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        image.data_ptr<float>(),
+        instance_map.numel() == 0 ? nullptr : instance_map.data_ptr<int>(),
+        semantic_map.numel() == 0 ? nullptr : semantic_map.data_ptr<int>(),
+        terrain_depth.data_ptr<float>(),
+        primary_cluster_masks.data_ptr<int>(),
+        shadow_cluster_masks_ptr,
+        depth_edges.data_ptr<float>(),
+        scene_bounds.data_ptr<float>(),
+        scene_bounds_valid.data_ptr<int>(),
+        width,
+        height,
+        tiles_x,
+        tiles_y,
+        scene,
+        options);
+  }
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

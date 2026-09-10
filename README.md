@@ -241,13 +241,32 @@ cylinder arrays.
 conda run -n clipdino-cu117 python -m examples.benchmark
 ```
 
-The benchmark renders the same seeded random scene style as `examples.render`
-with a batch size of 8 by default. You can sweep the image size, batch size,
-sample count, and random seed:
+The benchmark generates and renders the same seeded random scene style as
+`examples.render`, with a batch size of 8 by default. Each measured iteration
+generates a new deterministic scene and requests RGB, instance and semantic
+maps, and visible-instance metadata. You can sweep the image size, batch size,
+sample count, profiler sample count, and random seed:
 
 ```bash
-conda run -n clipdino-cu117 python -m examples.benchmark --width 1920 --height 1080 --batch-size 16 --iterations 200 --seed 5678
+conda run -n clipdino-cu117 python -m examples.benchmark --width 1920 --height 1080 --batch-size 16 --iterations 200 --profile-iterations 5 --seed 5678
 ```
 
-The benchmark reports CUDA event timing for the render kernel, synchronized host
-wall time, output tensor size, and PyTorch CUDA allocated/reserved memory peaks.
+Pass `--no-shadows` to measure the pipeline with shadow rays disabled, or
+`--no-terrain` to render generated scenes without their procedural terrain:
+
+```bash
+conda run -n clipdino-cu117 python -m examples.benchmark --no-shadows
+conda run -n clipdino-cu117 python -m examples.benchmark --no-terrain
+```
+
+The benchmark uses an unprofiled pass for end-to-end CUDA event and synchronized
+host wall timing. A separate profiler pass attributes GPU execution to random
+scene generation, renderer input preparation, terrain rasterization, cluster-mask
+construction, rendering, and segmentation. Input preparation includes device
+conversion, batch broadcasting, validation, metadata construction, and output
+allocation. Time in the profiled interval that is not owned by one of those
+ranges is reported as `unattributed / profiler overhead`; it includes submission
+gaps and instrumentation overhead. Because profiling can slow workloads with
+many small tensor operations, compare the stage rows with the displayed profiled
+total, not with the unprofiled end-to-end result. The benchmark also reports the
+combined output tensor size and PyTorch CUDA allocated/reserved memory peaks.

@@ -3,13 +3,21 @@ from __future__ import annotations
 import argparse
 import statistics
 import time
+from dataclasses import replace
 
 import torch
 
-from synthetic_scene import RandomScene, random_scene, render_scene
+from synthetic_scene import RenderOptions, RenderResult, random_scene, render_scene
 
 
 RANDOM_SCENE_SEED = 1234
+STAGE_RANGES = {
+    "scene generation": "synthetic_scene::scene_generation",
+    "input preparation": "synthetic_scene::input_preparation",
+    "terrain": "synthetic_scene::terrain",
+    "mask construction": "synthetic_scene::mask_construction",
+    "rendering": "synthetic_scene::rendering",
+}
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -36,15 +44,91 @@ def format_bytes(num_bytes: int) -> str:
     return f"{value:.2f} GiB"
 
 
-def render_benchmark_scene(width: int, height: int, generated: RandomScene) -> torch.Tensor:
-    return render_scene(
+def render_benchmark_scene(
+    width: int,
+    height: int,
+    seed: int,
+    batch_size: int,
+    shadows: bool = True,
+    terrain: bool = True,
+) -> RenderResult:
+    with torch.autograd.profiler.record_function("synthetic_scene::scene_generation"):
+        generated = random_scene(seed=seed, batch_size=batch_size, aspect_ratio=width / height)
+        scene = generated.scene
+        if not terrain:
+            scene = replace(scene, terrain=replace(scene.terrain, counts=torch.zeros_like(scene.terrain.counts)))
+    result = render_scene(
         width=width,
         height=height,
-        scene=generated.scene,
+        scene=scene,
+        options=RenderOptions(shadows=shadows),
+        return_maps=True,
     )
+    assert isinstance(result, RenderResult)
+    return result
 
 
-def benchmark(width: int, height: int, batch_size: int, warmup: int, iterations: int, seed: int) -> None:
+def total_cuda_time_us(event: object) -> float:
+    # PyTorch renamed this field after 1.8; support both names.
+    return float(getattr(event, "cuda_time_total", getattr(event, "device_time_total", 0.0)))
+
+
+def profile_stages(
+    width: int,
+    height: int,
+    batch_size: int,
+    iterations: int,
+    seed: int,
+    shadows: bool = True,
+    terrain: bool = True,
+) -> tuple[dict[str, float], float]:
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=activities) as profile:
+        for iteration in range(iterations):
+            with torch.autograd.profiler.record_function("synthetic_scene::benchmark_iteration"):
+                render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain)
+        torch.cuda.synchronize()
+
+    events = profile.key_averages()
+    stage_times = {
+        stage: sum(total_cuda_time_us(event) for event in events if str(event.key) == range_name)
+        / 1000.0
+        / iterations
+        for stage, range_name in STAGE_RANGES.items()
+    }
+    attributed_ms = sum(stage_times.values())
+    segmentation_ms = sum(
+        total_cuda_time_us(event) for event in events if str(event.key) == "synthetic_scene::segmentation"
+    ) / 1000.0 / iterations
+    total_cuda_ms = sum(
+        total_cuda_time_us(event) for event in events if str(event.key) == "synthetic_scene::benchmark_iteration"
+    ) / 1000.0 / iterations
+    stage_times["segmentation"] = segmentation_ms
+    stage_times["unattributed / profiler overhead"] = max(
+        0.0, total_cuda_ms - attributed_ms - segmentation_ms
+    )
+    return stage_times, total_cuda_ms
+
+
+def print_timing_summary(label: str, values: list[float]) -> None:
+    print(f"{label}:")
+    print(f"  mean: {fmean(values):.4f} ms")
+    print(f"  median: {statistics.median(values):.4f} ms")
+    print(f"  p95: {percentile(values, 95):.4f} ms")
+    print(f"  min / max: {min(values):.4f} / {max(values):.4f} ms")
+
+
+def benchmark(
+    width: int,
+    height: int,
+    batch_size: int,
+    warmup: int,
+    iterations: int,
+    profile_iterations: int,
+    seed: int,
+    shadows: bool = True,
+    terrain: bool = True,
+) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to benchmark this renderer")
     if width <= 0 or height <= 0:
@@ -55,101 +139,120 @@ def benchmark(width: int, height: int, batch_size: int, warmup: int, iterations:
         raise ValueError("warmup must be non-negative")
     if iterations <= 0:
         raise ValueError("iterations must be positive")
+    if profile_iterations <= 0:
+        raise ValueError("profile_iterations must be positive")
+
     device_index = 0
     device = torch.device("cuda", device_index)
     torch.cuda.set_device(device_index)
     torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
-    generated = random_scene(seed=seed, batch_size=batch_size, aspect_ratio=width / height)
 
-    image = None
-    for _ in range(warmup):
-        image = render_benchmark_scene(width, height, generated)
+    result = None
+    for iteration in range(warmup):
+        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain)
     torch.cuda.synchronize(device)
-    del image
+    del result
 
     torch.cuda.reset_peak_memory_stats(device)
     before_allocated = torch.cuda.memory_allocated(device)
     before_reserved = torch.cuda.memory_reserved(device)
-
     host_times_ms: list[float] = []
-    kernel_times_ms: list[float] = []
+    cuda_times_ms: list[float] = []
 
-    for _ in range(iterations):
-        image = None
+    for iteration in range(iterations):
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
-
         host_start = time.perf_counter()
         start_event.record()
-        image = render_benchmark_scene(width, height, generated)
+        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain)
         end_event.record()
         torch.cuda.synchronize(device)
-        host_end = time.perf_counter()
+        host_times_ms.append((time.perf_counter() - host_start) * 1000.0)
+        cuda_times_ms.append(start_event.elapsed_time(end_event))
 
-        kernel_times_ms.append(start_event.elapsed_time(end_event))
-        host_times_ms.append((host_end - host_start) * 1000.0)
-
-    # Keep the last tensor alive so "after allocated" includes the output image.
-    _ = image
-
+    assert result is not None
+    outputs = (
+        result.image,
+        result.visible_count,
+        result.visible_classes,
+        result.visible_instance_ids,
+        result.instance_map,
+        result.semantic_map,
+    )
     after_allocated = torch.cuda.memory_allocated(device)
     after_reserved = torch.cuda.memory_reserved(device)
     peak_allocated = torch.cuda.max_memory_allocated(device)
     peak_reserved = torch.cuda.max_memory_reserved(device)
-    image_bytes = batch_size * width * height * 3 * torch.finfo(torch.float32).bits // 8
+    output_bytes = sum(tensor.numel() * tensor.element_size() for tensor in outputs)
+
+    print("profiling CUDA stages (excluded from end-to-end timing)...")
+    stage_times_ms, profiled_total_ms = profile_stages(
+        width, height, batch_size, profile_iterations, seed, shadows, terrain
+    )
 
     pixels_per_scene = width * height
     pixels = batch_size * pixels_per_scene
-    mean_kernel = fmean(kernel_times_ms)
-    mean_host = fmean(host_times_ms)
-
+    mean_cuda = fmean(cuda_times_ms)
     print(f"device: {torch.cuda.get_device_name(device)}")
     print(f"resolution: {width} x {height} ({pixels_per_scene:,} pixels per scene)")
     print(f"batch size: {batch_size} ({pixels:,} total pixels)")
-    print(f"scene: random seed {seed}")
-    print(f"warmup / iterations: {warmup} / {iterations}")
+    print(f"scene seeds: {seed} through {seed + iterations - 1}")
+    print(f"shadows: {'enabled' if shadows else 'disabled'}")
+    print(f"terrain: {'enabled' if terrain else 'disabled'}")
+    print(f"warmup / measured / profiled iterations: {warmup} / {iterations} / {profile_iterations}")
+    print("outputs: RGB, visible instances/classes/IDs, instance map, semantic map")
     print()
-    print("render kernel time:")
-    print(f"  mean: {mean_kernel:.4f} ms")
-    print(f"  median: {statistics.median(kernel_times_ms):.4f} ms")
-    print(f"  p95: {percentile(kernel_times_ms, 95):.4f} ms")
-    print(f"  min / max: {min(kernel_times_ms):.4f} / {max(kernel_times_ms):.4f} ms")
-    print(f"  throughput: {pixels / (mean_kernel / 1000.0) / 1_000_000.0:.2f} Mpixels/s")
+    print("mean CUDA stage time (profiled pass):")
+    for stage in (
+        "scene generation",
+        "input preparation",
+        "terrain",
+        "mask construction",
+        "rendering",
+        "segmentation",
+        "unattributed / profiler overhead",
+    ):
+        print(f"  {stage}: {stage_times_ms[stage]:.4f} ms")
+    print(f"  profiled total: {profiled_total_ms:.4f} ms")
     print()
-    print("host wall time:")
-    print(f"  mean: {mean_host:.4f} ms")
-    print(f"  median: {statistics.median(host_times_ms):.4f} ms")
-    print(f"  p95: {percentile(host_times_ms, 95):.4f} ms")
-    print(f"  min / max: {min(host_times_ms):.4f} / {max(host_times_ms):.4f} ms")
+    print_timing_summary("end-to-end CUDA time", cuda_times_ms)
+    print(f"  throughput: {pixels / (mean_cuda / 1000.0) / 1_000_000.0:.2f} Mpixels/s")
+    print()
+    print_timing_summary("synchronized host wall time", host_times_ms)
     print()
     print("cuda memory:")
-    print(f"  output tensor: {format_bytes(image_bytes)}")
+    print(f"  output tensors: {format_bytes(output_bytes)}")
     print(f"  allocated before / after: {format_bytes(before_allocated)} / {format_bytes(after_allocated)}")
     print(f"  reserved before / after: {format_bytes(before_reserved)} / {format_bytes(after_reserved)}")
     print(f"  peak allocated / reserved: {format_bytes(peak_allocated)} / {format_bytes(peak_reserved)}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark the CUDA scene renderer.")
+    parser = argparse.ArgumentParser(description="Benchmark end-to-end CUDA scene generation and rendering.")
     parser.add_argument("--width", type=int, default=768)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--profile-iterations", type=int, default=5)
     parser.add_argument("--seed", type=int, default=RANDOM_SCENE_SEED)
+    parser.add_argument("--no-shadows", action="store_true", help="disable shadow rays")
+    parser.add_argument("--no-terrain", action="store_true", help="render generated scenes without terrain")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     benchmark(
-        width=args.width,
-        height=args.height,
-        batch_size=args.batch_size,
-        warmup=args.warmup,
-        iterations=args.iterations,
-        seed=args.seed,
+        args.width,
+        args.height,
+        args.batch_size,
+        args.warmup,
+        args.iterations,
+        args.profile_iterations,
+        args.seed,
+        not args.no_shadows,
+        not args.no_terrain,
     )
 
 
