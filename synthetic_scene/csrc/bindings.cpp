@@ -224,7 +224,13 @@ py::tuple generate_random_scene_packed(
       float_data, integer_data, batch_size, sphere_count, box_count, prism_count, cylinder_count);
   views.plane_counts.zero_();
   views.terrain_class_ids.fill_(2);
-  views.terrain_instance_ids.fill_(sphere_count + 1);
+  // Composite object IDs occupy [1, object_count]. Primitive capacities are
+  // unrelated to that ID space, so deriving this from sphere_count can collide
+  // with an object ID (for example, the default scene used 31 for both terrain
+  // and a car). Keep terrain distinct by placing it after every composite.
+  const int64_t object_count =
+      house_count + tree_count + cloud_count + car_count + person_count;
+  views.terrain_instance_ids.fill_(object_count + 1);
 
   random_scene_cuda(
       views.scene, seed, scatter_radius, ground_y, depth_limit, dz, dz_growth,

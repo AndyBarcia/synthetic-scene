@@ -57,6 +57,29 @@ class RandomGenerationTests(unittest.TestCase):
                             reference = torch.tensor(expected, dtype=torch.int32).expand(batch, -1)
                             self.assertTrue(torch.equal(actual, reference))
 
+                    take(1)  # plane counts
+                    self.assertTrue((take(1) == 2).all())  # terrain class IDs
+                    terrain_id = houses + trees + clouds + cars + people + 1
+                    self.assertTrue((take(1) == terrain_id).all())
+
+    def test_terrain_instance_id_does_not_collide_with_composites(self):
+        options = RandomSceneOptions(
+            house_count=10, tree_count=10, cloud_count=5, car_count=5, person_count=5
+        )
+        result = render_scene(
+            96,
+            64,
+            scene=generate_random_scene(1234, batch_size=2, options=options),
+            return_maps=True,
+        )
+        terrain_id = 36
+        for batch_index in range(2):
+            terrain_pixels = result.semantic_map[batch_index] == 2
+            self.assertTrue(terrain_pixels.any())
+            self.assertTrue((result.instance_map[batch_index][terrain_pixels] == terrain_id).all())
+            object_pixels = result.semantic_map[batch_index] >= 10
+            self.assertTrue((result.instance_map[batch_index][object_pixels] < terrain_id).all())
+
     def test_render_and_seed_variation(self):
         first = generate_random_scene(42, batch_size=8)
         second = generate_random_scene(43, batch_size=8)
