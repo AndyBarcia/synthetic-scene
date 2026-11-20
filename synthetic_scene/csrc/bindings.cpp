@@ -12,7 +12,7 @@ constexpr int kRandomSceneMaxPrisms = 64;
 constexpr int kRandomSceneMaxCylinders = 64;
 }  // namespace
 
-void render_scene_cuda(
+std::vector<torch::Tensor> render_scene_cuda(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
@@ -64,7 +64,8 @@ void render_scene_cuda(
     torch::Tensor cylinder_colors,
     double ambient,
     bool shadows,
-    double shadow_strength);
+    double shadow_strength,
+    bool return_occlusion);
 
 py::dict require_dict(py::dict values, const char* key) {
   const py::str py_key(key);
@@ -238,7 +239,7 @@ py::tuple generate_random_scene_packed(
   return py::make_tuple(float_data, integer_data);
 }
 
-void render_packed_scene(
+std::vector<torch::Tensor> render_packed_scene(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
@@ -254,12 +255,13 @@ void render_packed_scene(
     torch::Tensor background,
     double ambient,
     bool shadows,
-    double shadow_strength) {
+    double shadow_strength,
+    bool return_occlusion) {
   auto packed = unpack_scene(
       float_data, integer_data, image.size(0), sphere_count, box_count, prism_count, cylinder_count);
   const auto& scene = packed.scene;
   const auto empty_planes = float_data.narrow(0, 0, 0).view({image.size(0), 0, 3});
-  render_scene_cuda(
+  return render_scene_cuda(
       image, instance_map, semantic_map, visible_masks,
       scene[0], scene[1], scene[3], scene[4], scene[5],
       empty_planes, empty_planes, packed.plane_counts,
@@ -270,10 +272,10 @@ void render_packed_scene(
       scene[28], scene[29], scene[30], scene[31], scene[33], scene[34], scene[35],
       light_direction, fov_degrees, background,
       scene[2], empty_planes, scene[12], scene[17], scene[24], scene[32],
-      ambient, shadows, shadow_strength);
+      ambient, shadows, shadow_strength, return_occlusion);
 }
 
-void render_scene(
+std::vector<torch::Tensor> render_scene(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
@@ -534,7 +536,7 @@ void render_scene(
           cylinder_class_ids.is_contiguous() && cylinder_instance_ids.is_contiguous(),
       "primitive metadata tensors must be contiguous");
 
-  render_scene_cuda(
+  return render_scene_cuda(
       image,
       instance_map,
       semantic_map,
@@ -586,7 +588,8 @@ void render_scene(
       cylinder_colors,
       ambient,
       shadows,
-      shadow_strength);
+      shadow_strength,
+      options.contains("return_occlusion") && require_bool(options, "return_occlusion"));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

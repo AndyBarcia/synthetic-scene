@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence, Union, overload
+from typing import Literal, Sequence, Union, overload
 from PIL import Image
 
+import numpy as np
 import torch
 
 from . import _cuda_renderer
@@ -136,6 +137,18 @@ class PackedScene:
 
 
 @dataclass(frozen=True)
+class AmodalAnnotations:
+    """One image's masks for instances with at least one visible camera pixel."""
+    instance_ids: torch.Tensor
+    class_ids: torch.Tensor
+    amodal_masks: torch.Tensor
+    visible_masks: torch.Tensor
+    occlusion_fraction: torch.Tensor
+    # [i, j] is true when instance_ids[i] covers any hidden pixel of instance_ids[j].
+    occlusion_matrix: torch.Tensor
+
+
+@dataclass(frozen=True)
 class RenderResult:
     image: torch.Tensor
     visible_count: torch.Tensor
@@ -143,6 +156,25 @@ class RenderResult:
     visible_instance_ids: torch.Tensor
     instance_map: torch.Tensor
     semantic_map: torch.Tensor
+    amodal: list["AmodalAnnotations"] | None = None
+
+    @property
+    def panoptic_map(self) -> torch.Tensor:
+        """B x H x W x 2 int32 map, storing (semantic class, instance ID)."""
+        return torch.stack((self.semantic_map, self.instance_map), dim=-1)
+
+
+def _decode_occlusion(tensors: list[torch.Tensor]) -> list["AmodalAnnotations"]:
+    counts, ids, classes, masks, visible, fractions, relationships = tensors[:7]
+    return [AmodalAnnotations(ids[b, :n], classes[b, :n], masks[b, :n],
+                              visible[b, :n], fractions[b, :n], relationships[b, :n, :n])
+            for b, n in enumerate(counts.tolist()[:-1])]
+
+
+def _occlusion_visible_metadata(tensors: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # CUDA already produced the visible instance list for the annotation pass.
+    max_visible = tensors[3].shape[1]
+    return tensors[7], tensors[2][:, :max_visible], tensors[1][:, :max_visible]
 
 
 def _compact_visible_instances(
@@ -668,6 +700,7 @@ def render_random_scene(
     scene_options: RandomSceneOptions | None = None,
     render_options: RenderOptions | None = None,
     return_maps: bool = False,
+    return_occlusion: bool = False,
 ) -> torch.Tensor | RenderResult:
     """Generate a packed scene and render it without exposing intermediate fields."""
     scene = generate_random_scene(seed, batch_size=batch_size, options=scene_options)
@@ -677,6 +710,7 @@ def render_random_scene(
         scene=scene,
         options=render_options,
         return_maps=return_maps,
+        return_occlusion=return_occlusion,
     )
 
 
@@ -686,6 +720,7 @@ def _render_packed_scene(
     height: int,
     options: RenderOptions,
     return_maps: bool,
+    return_occlusion: bool = False,
 ) -> torch.Tensor | RenderResult:
     input_preparation_range = torch.autograd.profiler.record_function(
         "synthetic_scene::input_preparation"
@@ -705,7 +740,7 @@ def _render_packed_scene(
     light_direction = torch.as_tensor(options.light_dir, dtype=torch.float32, device=device)
     background = torch.as_tensor(options.background, dtype=torch.float32, device=device)
     input_preparation_range.__exit__(None, None, None)
-    _cuda_renderer.render_packed_scene(
+    annotation_tensors = _cuda_renderer.render_packed_scene(
         image,
         instance_map,
         semantic_map,
@@ -722,56 +757,58 @@ def _render_packed_scene(
         options.ambient,
         options.shadows,
         options.shadow_strength,
+        return_occlusion,
     )
     if not return_maps:
         return image
 
-    segmentation_range = torch.autograd.profiler.record_function("synthetic_scene::segmentation")
-    segmentation_range.__enter__()
-    # Metadata occupies the integer buffer in this fixed order. These are views,
-    # not new allocations, and are needed only for visible-instance compaction.
-    offset = 0
+    with torch.autograd.profiler.record_function("synthetic_scene::segmentation"):
+        if return_occlusion:
+            visible_count, visible_classes, visible_instance_ids = _occlusion_visible_metadata(annotation_tensors)
+        else:
+            # Metadata occupies the integer buffer in this fixed order. These are views,
+            # not new allocations, and are needed only for visible-instance compaction.
+            offset = 0
 
-    def take(shape: tuple[int, ...]) -> torch.Tensor:
-        nonlocal offset
-        element_count = 1
-        for dimension in shape:
-            element_count *= dimension
-        view = scene.integer_data.narrow(0, offset, element_count).view(shape)
-        offset += element_count
-        return view
+            def take(shape: tuple[int, ...]) -> torch.Tensor:
+                nonlocal offset
+                element_count = 1
+                for dimension in shape:
+                    element_count *= dimension
+                view = scene.integer_data.narrow(0, offset, element_count).view(shape)
+                offset += element_count
+                return view
 
-    batch = scene.batch_size
-    take((batch,))  # sphere counts
-    sphere_classes = take((batch, scene.sphere_count))
-    sphere_instances = take((batch, scene.sphere_count))
-    take((batch,))  # terrain counts
-    take((batch,))  # box counts
-    box_classes = take((batch, scene.box_count))
-    box_instances = take((batch, scene.box_count))
-    take((batch,))  # prism counts
-    prism_classes = take((batch, scene.prism_count))
-    prism_instances = take((batch, scene.prism_count))
-    take((batch,))  # cylinder counts
-    cylinder_classes = take((batch, scene.cylinder_count))
-    cylinder_instances = take((batch, scene.cylinder_count))
-    take((batch,))  # plane counts
-    terrain_classes = take((batch, 1))
-    terrain_instances = take((batch, 1))
-    visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(
-        visible_masks,
-        sphere_instance_ids=sphere_instances,
-        sphere_class_ids=sphere_classes,
-        terrain_instance_ids=terrain_instances,
-        terrain_class_ids=terrain_classes,
-        box_instance_ids=box_instances,
-        box_class_ids=box_classes,
-        prism_instance_ids=prism_instances,
-        prism_class_ids=prism_classes,
-        cylinder_instance_ids=cylinder_instances,
-        cylinder_class_ids=cylinder_classes,
-    )
-    segmentation_range.__exit__(None, None, None)
+            batch = scene.batch_size
+            take((batch,))  # sphere counts
+            sphere_classes = take((batch, scene.sphere_count))
+            sphere_instances = take((batch, scene.sphere_count))
+            take((batch,))  # terrain counts
+            take((batch,))  # box counts
+            box_classes = take((batch, scene.box_count))
+            box_instances = take((batch, scene.box_count))
+            take((batch,))  # prism counts
+            prism_classes = take((batch, scene.prism_count))
+            prism_instances = take((batch, scene.prism_count))
+            take((batch,))  # cylinder counts
+            cylinder_classes = take((batch, scene.cylinder_count))
+            cylinder_instances = take((batch, scene.cylinder_count))
+            take((batch,))  # plane counts
+            terrain_classes = take((batch, 1))
+            terrain_instances = take((batch, 1))
+            visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(
+                visible_masks,
+                sphere_instance_ids=sphere_instances,
+                sphere_class_ids=sphere_classes,
+                terrain_instance_ids=terrain_instances,
+                terrain_class_ids=terrain_classes,
+                box_instance_ids=box_instances,
+                box_class_ids=box_classes,
+                prism_instance_ids=prism_instances,
+                prism_class_ids=prism_classes,
+                cylinder_instance_ids=cylinder_instances,
+                cylinder_class_ids=cylinder_classes,
+            )
     return RenderResult(
         image=image,
         visible_count=visible_count,
@@ -779,6 +816,7 @@ def _render_packed_scene(
         visible_instance_ids=visible_instance_ids,
         instance_map=instance_map,
         semantic_map=semantic_map,
+        amodal=_decode_occlusion(annotation_tensors) if return_occlusion else None,
     )
 
 
@@ -789,7 +827,8 @@ def render_scene(
     *,
     scene: Scene | PackedScene | None = None,
     options: RenderOptions | None = None,
-    return_maps: bool = False,
+    return_maps: Literal[False] = False,
+    return_occlusion: Literal[False] = False,
 ) -> torch.Tensor: ...
 
 
@@ -800,7 +839,8 @@ def render_scene(
     *,
     scene: Scene | PackedScene | None = None,
     options: RenderOptions | None = None,
-    return_maps: bool,
+    return_maps: bool = False,
+    return_occlusion: bool = False,
 ) -> torch.Tensor | RenderResult: ...
 
 
@@ -811,8 +851,13 @@ def render_scene(
     scene: Scene | PackedScene | None = None,
     options: RenderOptions | None = None,
     return_maps: bool = False,
+    return_occlusion: bool = False,
 ) -> torch.Tensor | RenderResult:
-    """Render camera-space scenes into batched RGB, and optionally label maps."""
+    """Render RGB, optional label maps, and optional amodal/occlusion GT.
+
+    return_occlusion=True implies return_maps=True and populates amodal
+    for instances with at least one visible camera pixel.
+    """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to render with this extension")
     if width <= 0 or height <= 0:
@@ -825,8 +870,12 @@ def render_scene(
         raise ValueError("ambient must be in the range [0, 1]")
     if options_data.shadow_strength < 0.0 or options_data.shadow_strength > 1.0:
         raise ValueError("shadow_strength must be in the range [0, 1]")
+    if return_occlusion:
+        return_maps = True
+        if not isinstance(scene, PackedScene):
+            scene = _with_default_metadata(scene if scene is not None else Scene())
     if isinstance(scene, PackedScene):
-        return _render_packed_scene(scene, width, height, options_data, return_maps)
+        return _render_packed_scene(scene, width, height, options_data, return_maps, return_occlusion)
     scene_data = scene or Scene()
 
     input_preparation_range = torch.autograd.profiler.record_function("synthetic_scene::input_preparation")
@@ -1038,7 +1087,7 @@ def render_scene(
         else torch.empty((0,), dtype=torch.int32, device=device)
     )
     input_preparation_range.__exit__(None, None, None)
-    _cuda_renderer.render_scene(
+    annotation_tensors = _cuda_renderer.render_scene(
         image,
         instance_map,
         semantic_map,
@@ -1106,11 +1155,14 @@ def render_scene(
             "ambient": float(options_data.ambient),
             "shadows": bool(options_data.shadows),
             "shadow_strength": float(options_data.shadow_strength),
+            "return_occlusion": return_occlusion,
         },
     )
     if return_maps:
         with torch.autograd.profiler.record_function("synthetic_scene::segmentation"):
-            if has_custom_metadata:
+            if return_occlusion:
+                visible_count, visible_classes, visible_instance_ids = _occlusion_visible_metadata(annotation_tensors)
+            elif has_custom_metadata:
                 visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(
                     visible_primitive_masks,
                     sphere_instance_ids=sphere_instance_ids,
@@ -1146,6 +1198,7 @@ def render_scene(
             visible_instance_ids=visible_instance_ids,
             instance_map=instance_map,
             semantic_map=semantic_map,
+            amodal=_decode_occlusion(annotation_tensors) if return_occlusion else None,
         )
     return image
 
@@ -1188,3 +1241,45 @@ def save_label_map_visualization(label_map: torch.Tensor, path: str | Path, *, s
     """Save an H x W integer label map as a colorized 8-bit RGB PNG."""
     colors = colorize_label_map(label_map, seed=seed).numpy()
     Image.fromarray(colors, mode="RGB").save(path)
+
+
+def save_amodal_visualization(
+    result: RenderResult, path: str | Path = "outputs/amodal.png",
+) -> None:
+    """Save one RGB overlay, with batch images side by side.
+
+    Instance colors match colorize_label_map; overlapping silhouettes blend
+    equally, so every instance contributes regardless of drawing order.
+    This visualization is not a lossless mask encoding.
+    """
+    panels = []
+    if result.amodal is None:
+        raise ValueError("render_scene requires return_occlusion=True for this export")
+    for b, gt in enumerate(result.amodal):
+        rgb = result.image[b].detach().permute(1, 2, 0).cpu().numpy()
+        masks = gt.amodal_masks.detach().cpu().numpy()
+        colors = []
+        for instance_id in gt.instance_ids.tolist():
+            generator = torch.Generator().manual_seed(17 + int(instance_id) * 1009)
+            colors.append(torch.randint(48, 256, (3,), generator=generator).numpy() / 255.)
+        color_sum = np.zeros_like(rgb)
+        coverage = np.zeros(rgb.shape[:2], dtype=np.float32)
+        edge_sum = np.zeros_like(rgb)
+        edge_count = np.zeros_like(coverage)
+        for mask, color in zip(masks, colors):
+            color_sum[mask] += color
+            coverage[mask] += 1
+            padded = np.pad(mask, 1)
+            interior = (padded[:-2, 1:-1] & padded[2:, 1:-1]
+                        & padded[1:-1, :-2] & padded[1:-1, 2:])
+            edge = mask & ~interior
+            edge_sum[edge] += color
+            edge_count[edge] += 1
+        blended = color_sum / np.maximum(coverage[..., None], 1)
+        panel = np.where(coverage[..., None] > 0, .35 * rgb + .65 * blended, .35 * rgb)
+        panel = np.where(edge_count[..., None] > 0,
+                         edge_sum / np.maximum(edge_count[..., None], 1), panel)
+        panels.append((np.clip(panel, 0, 1) * 255).astype(np.uint8))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.concatenate(panels, axis=1)).save(path)

@@ -303,3 +303,111 @@ gaps and instrumentation overhead. Because profiling can slow workloads with
 many small tensor operations, compare the stage rows with the displayed profiled
 total, not with the unprofiled end-to-end result. The benchmark also reports the
 combined output tensor size and PyTorch CUDA allocated/reserved memory peaks.
+
+## Amodal masks and occlusion ground truth
+
+```python
+from synthetic_scene import render_scene, save_amodal_visualization
+
+annotated = render_scene(768, 512, scene=generated, return_occlusion=True)
+# RGB, instance_map, semantic_map, panoptic_map, and amodal share one result.
+save_amodal_visualization(annotated, "outputs/amodal.png")
+amodal = annotated.amodal[0]  # first batch item
+```
+
+`return_occlusion=True` also enables label maps and returns per-image annotations
+on `RenderResult.amodal`. With this flag off, `amodal` is None.
+`panoptic_map` has shape B x H x W x 2, with (semantic class, instance ID)
+in its last dimension.
+This optional path supports structured and packed random scenes. A CUDA coverage
+pass reuses the normal render’s spatial candidate masks and terrain depth, testing
+all relevant primitives without stopping at foreground hits. Parts sharing an
+instance ID contribute to one amodal mask. Terrain is also an annotated instance
+and its coverage counts as occlusion of other instances. Custom
+instance IDs must be positive, with one class per instance ID; default structured
+scenes receive stable IDs before rendering.
+
+Each batch item has `instance_ids` and `class_ids` of length N, containing only
+instances with at least one visible camera pixel. Fully hidden and offscreen
+instances are excluded before allocating masks or testing amodal intersections;
+cast shadows do not qualify an instance as visible. For a retained composite,
+all its parts contribute, including parts with no visible pixels of their own.
+`amodal_masks` and `visible_masks` are boolean N x H x W tensors.
+`occlusion_fraction` is hidden pixel area divided by amodal area.
+`occlusion_matrix` is a boolean N x N tensor: `[i, j]` is true if instance
+`instance_ids[i]` is the frontmost covering object at any hidden pixel of
+`instance_ids[j]`. Rows are occluders and columns are occluded targets. Both axes
+use the same instance ordering as the masks; the diagonal is false. Relationships
+are camera-specific and can point in both directions for different object parts.
+The matrix does not infer indirect edges or include fully hidden instances.
+
+This replaces the previous dense hidden masks and per-pixel occluder-ID maps.
+If needed, a hidden mask is recoverable as `amodal_masks & ~visible_masks`.
+
+```python
+amodal = annotated.amodal[0]
+# Does the first listed instance cover any part of the second?
+first_occludes_second = amodal.occlusion_matrix[0, 1]
+```
+
+Coverage uses the renderer's pixel samples and geometry, within the image frame;
+it does not measure offscreen truncation or hidden 3D surface area. Self overlap
+within an instance and cast shadows do not count as external occlusion.
+CUDA kernels group instance metadata, union primitive silhouettes, compute visible
+masks and pairwise occlusion links, and reduce pixel counts to occlusion
+fractions. The normal visible-instance outputs reuse this metadata instead of
+running a second instance-compaction pass. Candidate masks are shared per image
+tile; known visible intersections and already-covered composite parts are skipped.
+A fused annotation kernel keeps per-ray coverage in a bitset and directly writes
+amodal and visible masks. Warp ballots produce per-tile area
+counts and aggregate pairwise relationship bits; a final reduction emits the
+boolean matrix and occlusion fractions. This avoids clearing/re-reading dense amodal
+masks and a separate dense classification pass. Up to 32 visible instances use a
+single coverage word; larger counts use multiple words.
+Python only wraps the returned tensors; no per-instance rendering is
+performed. One small count readback determines the dense output allocation size.
+Mask storage requires O(B x N x H x W) GPU memory and relationships require
+O(B x N²). Use smaller batches or
+resolutions for large datasets.
+
+The exporter writes a single `amodal.png`: all instance silhouettes are overlaid
+on RGB with colored outlines. Overlapping masks blend equally; colors match the
+instance-map visualization. Batch images appear side by side. This is a visual
+preview; numeric ground truth remains available in `annotated.amodal`.
+
+To render and export the example dataset:
+
+```bash
+conda run -n clipdino-cu117 python -m examples.render --occlusion
+```
+
+Benchmark the normal renderer with and without occlusion outputs (including scene
+generation, excluding image export):
+
+```bash
+conda run -n clipdino-cu117 python -m examples.benchmark --occlusion --batch-size 2 --seed 44
+```
+
+`--occlusion` runs baseline and annotation-enabled measurements using the same
+benchmark loop, scene seeds, CUDA profiler, and memory reporting. Add
+`--export-amodal outputs/amodal.png` to also time PNG overlay export separately.
+
+Measured on NVIDIA RTX 2080 SUPER at 768 x 512, batch 2, 36 generated instances
+per image including terrain, shadows enabled, seeds 44–143, 10 warmups and 100
+measured iterations. Only camera-visible instances receive amodal annotations
+(16 and 24 for the two images at seed 44). Synchronized host timings include
+generation and exclude export:
+
+| Outputs | Mean per batch | Median | p95 | Images/s | Peak allocated GPU memory |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RGB and visible maps | 1.64 ms | 1.55 ms | 2.24 ms | 1222.9 | 20.1 MiB |
+| Also CUDA amodal masks and pairwise occlusion | 1.87 ms | 1.82 ms | 2.31 ms | 1070.2 | 73.4 MiB |
+
+These timings include generation and all returned tensors, with PNG export
+excluded. The pairwise representation removes dense hidden-mask and occluder-ID
+outputs. Matrix construction uses CUDA warp/tile bitsets and is fused with mask
+coverage; Python only wraps the returned tensors. These figures describe this
+machine and scene configuration.
+
+A small visible-count readback determines annotation allocation sizes. Outputs
+contain only visible instances; no workspace API is required to use the renderer.

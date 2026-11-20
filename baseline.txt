@@ -1,0 +1,39 @@
+profiling CUDA stages (excluded from end-to-end timing)...
+device: NVIDIA GeForce RTX 2080 SUPER
+resolution: 1024 x 1024 (1,048,576 pixels per scene)
+batch size: 8 (8,388,608 total pixels)
+scene seeds: 5678 through 6077
+shadows: enabled
+terrain: enabled
+warmup / measured / profiled iterations: 10 / 400 / 400
+outputs: RGB, visible instances/classes/IDs, instance map, semantic map
+
+mean CUDA stage time (profiled pass):
+  scene generation: 0.7138 ms
+  input preparation: 0.1448 ms
+  terrain: 0.4990 ms
+  mask construction: 0.1887 ms
+  rendering: 3.3751 ms
+  segmentation: 1.1991 ms
+  unattributed / profiler overhead: 0.7036 ms
+  profiled total: 6.8241 ms
+
+end-to-end CUDA time:
+  mean: 4.8177 ms
+  median: 4.7756 ms
+  p95: 5.3963 ms
+  min / max: 4.1844 / 5.8098 ms
+  throughput: 1741.21 Mpixels/s
+
+synchronized host wall time:
+  mean: 4.8416 ms
+  median: 4.8001 ms
+  p95: 5.4193 ms
+  min / max: 4.2062 / 5.8329 ms
+
+cuda memory:
+  output tensors: 160.00 MiB
+  allocated before / after: 0.00 B / 160.00 MiB
+  reserved before / after: 394.00 MiB / 394.00 MiB
+  peak allocated / reserved: 374.06 MiB / 394.00 MiB
+

@@ -9,6 +9,14 @@ from synthetic_scene import RandomSceneOptions, generate_random_scene, render_sc
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class RandomGenerationTests(unittest.TestCase):
+    def test_benchmark_without_terrain(self):
+        from examples.benchmark import render_benchmark_scene
+
+        result = render_benchmark_scene(96, 64, 1234, 2, terrain=False)
+        self.assertTrue(torch.isfinite(result.image).all())
+        self.assertFalse((result.semantic_map == 2).any())
+        self.assertTrue((result.semantic_map >= 10).any())
+
     def test_slot_ownership_and_determinism(self):
         # Include absent families, maximum capacities, and more than 64 objects.
         cases = [(10, 10, 5, 5, 5), (64, 0, 0, 0, 0), (0, 64, 0, 0, 0),

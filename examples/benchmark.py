@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
 import statistics
 import time
 import torch
 
-from synthetic_scene import RandomSceneOptions, RenderOptions, RenderResult, generate_random_scene, render_scene
+from synthetic_scene import RandomSceneOptions, RenderOptions, RenderResult, generate_random_scene, render_scene, save_amodal_visualization
 
 
 RANDOM_SCENE_SEED = 1234
@@ -15,6 +16,7 @@ STAGE_RANGES = {
     "terrain": "synthetic_scene::terrain",
     "mask construction": "synthetic_scene::mask_construction",
     "rendering": "synthetic_scene::rendering",
+    "occlusion": "synthetic_scene::occlusion",
 }
 
 
@@ -49,18 +51,24 @@ def render_benchmark_scene(
     batch_size: int,
     shadows: bool = True,
     terrain: bool = True,
+    occlusion: bool = False,
 ) -> RenderResult:
     with torch.autograd.profiler.record_function("synthetic_scene::scene_generation"):
         scene_options = RandomSceneOptions(aspect_ratio=width / height)
         scene = generate_random_scene(seed=seed, batch_size=batch_size, options=scene_options)
         if not terrain:
-            raise ValueError("packed random scenes currently always include terrain")
+            # Packed integer fields start with sphere counts, classes and IDs,
+            # followed by one terrain count per scene. Keep the generated
+            # geometry grounded, but disable terrain intersections.
+            terrain_offset = batch_size * (1 + 2 * scene.sphere_count)
+            scene.integer_data.narrow(0, terrain_offset, batch_size).zero_()
     result = render_scene(
         width=width,
         height=height,
         scene=scene,
         options=RenderOptions(shadows=shadows),
         return_maps=True,
+        return_occlusion=occlusion,
     )
     assert isinstance(result, RenderResult)
     return result
@@ -79,12 +87,13 @@ def profile_stages(
     seed: int,
     shadows: bool = True,
     terrain: bool = True,
+    occlusion: bool = False,
 ) -> tuple[dict[str, float], float]:
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     with torch.profiler.profile(activities=activities) as profile:
         for iteration in range(iterations):
             with torch.autograd.profiler.record_function("synthetic_scene::benchmark_iteration"):
-                render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain)
+                render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain, occlusion)
         torch.cuda.synchronize()
 
     events = profile.key_averages()
@@ -126,7 +135,11 @@ def benchmark(
     seed: int,
     shadows: bool = True,
     terrain: bool = True,
+    occlusion: bool = False,
+    amodal_path: str | None = None,
 ) -> None:
+    if amodal_path is not None and not occlusion:
+        raise ValueError("amodal export requires occlusion outputs")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to benchmark this renderer")
     if width <= 0 or height <= 0:
@@ -147,9 +160,10 @@ def benchmark(
 
     result = None
     for iteration in range(warmup):
-        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain)
+        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain, occlusion)
     torch.cuda.synchronize(device)
     del result
+    result = None
 
     torch.cuda.reset_peak_memory_stats(device)
     before_allocated = torch.cuda.memory_allocated(device)
@@ -158,11 +172,12 @@ def benchmark(
     cuda_times_ms: list[float] = []
 
     for iteration in range(iterations):
+        result = None  # Release the previous frame before measuring its replacement.
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         host_start = time.perf_counter()
         start_event.record()
-        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain)
+        result = render_benchmark_scene(width, height, seed + iteration, batch_size, shadows, terrain, occlusion)
         end_event.record()
         torch.cuda.synchronize(device)
         host_times_ms.append((time.perf_counter() - host_start) * 1000.0)
@@ -177,6 +192,8 @@ def benchmark(
         result.instance_map,
         result.semantic_map,
     )
+    if result.amodal is not None:
+        outputs += tuple(getattr(gt, entry.name) for gt in result.amodal for entry in fields(gt))
     after_allocated = torch.cuda.memory_allocated(device)
     after_reserved = torch.cuda.memory_reserved(device)
     peak_allocated = torch.cuda.max_memory_allocated(device)
@@ -185,7 +202,7 @@ def benchmark(
 
     print("profiling CUDA stages (excluded from end-to-end timing)...")
     stage_times_ms, profiled_total_ms = profile_stages(
-        width, height, batch_size, profile_iterations, seed, shadows, terrain
+        width, height, batch_size, profile_iterations, seed, shadows, terrain, occlusion
     )
 
     pixels_per_scene = width * height
@@ -198,7 +215,10 @@ def benchmark(
     print(f"shadows: {'enabled' if shadows else 'disabled'}")
     print(f"terrain: {'enabled' if terrain else 'disabled'}")
     print(f"warmup / measured / profiled iterations: {warmup} / {iterations} / {profile_iterations}")
-    print("outputs: RGB, visible instances/classes/IDs, instance map, semantic map")
+    print("outputs: RGB, visible instances/classes/IDs, instance map, semantic map"
+          + (", amodal and occlusion ground truth" if occlusion else ""))
+    if result.amodal is not None:
+        print(f"annotated instances in last batch: {[len(gt.instance_ids) for gt in result.amodal]}")
     print()
     print("mean CUDA stage time (profiled pass):")
     for stage in (
@@ -207,22 +227,35 @@ def benchmark(
         "terrain",
         "mask construction",
         "rendering",
+        "occlusion",
         "segmentation",
         "unattributed / profiler overhead",
     ):
-        print(f"  {stage}: {stage_times_ms[stage]:.4f} ms")
+        if stage != "occlusion" or occlusion:
+            print(f"  {stage}: {stage_times_ms[stage]:.4f} ms")
     print(f"  profiled total: {profiled_total_ms:.4f} ms")
     print()
     print_timing_summary("end-to-end CUDA time", cuda_times_ms)
     print(f"  throughput: {pixels / (mean_cuda / 1000.0) / 1_000_000.0:.2f} Mpixels/s")
     print()
     print_timing_summary("synchronized host wall time", host_times_ms)
+    print(f"  throughput: {batch_size * 1000. / fmean(host_times_ms):.2f} images/s")
     print()
     print("cuda memory:")
     print(f"  output tensors: {format_bytes(output_bytes)}")
     print(f"  allocated before / after: {format_bytes(before_allocated)} / {format_bytes(after_allocated)}")
     print(f"  reserved before / after: {format_bytes(before_reserved)} / {format_bytes(after_reserved)}")
     print(f"  peak allocated / reserved: {format_bytes(peak_allocated)} / {format_bytes(peak_reserved)}")
+
+    if amodal_path is not None:
+        export_times_ms = []
+        for _ in range(5):
+            started = time.perf_counter()
+            save_amodal_visualization(result, amodal_path)
+            export_times_ms.append((time.perf_counter() - started) * 1000.)
+        print()
+        print_timing_summary("amodal PNG export wall time (excluded from rendering timing)", export_times_ms)
+        print(f"  wrote {amodal_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -236,22 +269,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=RANDOM_SCENE_SEED)
     parser.add_argument("--no-shadows", action="store_true", help="disable shadow rays")
     parser.add_argument("--no-terrain", action="store_true", help="render generated scenes without terrain")
-    return parser.parse_args()
+    parser.add_argument("--occlusion", action="store_true", help="compare baseline rendering with amodal and occlusion outputs")
+    parser.add_argument("--export-amodal", metavar="PATH", help="also time PNG overlay export (requires --occlusion)")
+    args = parser.parse_args()
+    if args.export_amodal and not args.occlusion:
+        parser.error("--export-amodal requires --occlusion")
+    return args
 
 
 def main() -> None:
     args = parse_args()
-    benchmark(
-        args.width,
-        args.height,
-        args.batch_size,
-        args.warmup,
-        args.iterations,
-        args.profile_iterations,
-        args.seed,
-        not args.no_shadows,
-        not args.no_terrain,
-    )
+    for occlusion in ((False, True) if args.occlusion else (False,)):
+        if args.occlusion:
+            print("\nBaseline render:" if not occlusion else "\nRender with amodal and occlusion ground truth:")
+        benchmark(
+            args.width,
+            args.height,
+            args.batch_size,
+            args.warmup,
+            args.iterations,
+            args.profile_iterations,
+            args.seed,
+            not args.no_shadows,
+            not args.no_terrain,
+            occlusion,
+            args.export_amodal if occlusion else None,
+        )
 
 
 if __name__ == "__main__":

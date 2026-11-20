@@ -26,6 +26,7 @@ from .renderer import (
     CompositeObject,
     Cylinders,
     OrientedBoxes,
+    AmodalAnnotations,
     PackedScene,
     Prisms,
     RenderOptions,
@@ -40,6 +41,7 @@ from .renderer import (
     render_scene,
     render_random_scene,
     save_image,
+    save_amodal_visualization,
     save_label_map_visualization,
 )
 
@@ -55,6 +57,7 @@ __all__ = [
     "PersonConfig",
     "TreeConfig",
     "OrientedBoxes",
+    "AmodalAnnotations",
     "PackedScene",
     "Prisms",
     "Cylinders",
@@ -82,6 +85,7 @@ __all__ = [
     "render_scene",
     "render_random_scene",
     "save_image",
+    "save_amodal_visualization",
     "save_label_map_visualization",
     "tree_scene",
 ]

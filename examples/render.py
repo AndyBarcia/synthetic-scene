@@ -1,21 +1,30 @@
+import argparse
 from pathlib import Path
 
 import torch
 
-from synthetic_scene import colorize_label_map, generate_random_scene, render_scene, save_image
+from synthetic_scene import (colorize_label_map, generate_random_scene, render_scene, save_image,
+                             save_amodal_visualization)
 
 
 RANDOM_SCENE_SEED = 44
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--occlusion", action="store_true", help="export an overlay of all amodal masks")
+    args = parser.parse_args()
     generated = generate_random_scene(seed=RANDOM_SCENE_SEED, batch_size=2)
     result = render_scene(
         width=768,
         height=512,
         scene=generated,
         return_maps=True,
+        return_occlusion=args.occlusion,
     )
+    if args.occlusion:
+        save_amodal_visualization(result, "outputs/amodal.png")
+        print("wrote outputs/amodal.png")
     output = Path("outputs/render.png")
     output.parent.mkdir(parents=True, exist_ok=True)
     image_grid = torch.cat(result.image.permute(0, 2, 3, 1).unbind(0), dim=1)

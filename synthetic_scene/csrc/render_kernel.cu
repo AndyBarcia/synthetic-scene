@@ -1817,6 +1817,269 @@ __device__ void intersect_finite_mask_depth_range(
   }
 }
 
+
+// All metadata and dense annotation work stays on the GPU. One small count
+// readback is used by the host to allocate masks for unique instances, not parts.
+__device__ bool annotation_metadata_for_slot(
+    SceneView scene, int b, int slot, int finite_slots, int* id, int* label) {
+  if (slot == finite_slots) {
+    if (scene.terrain.counts[b] == 0) return false;
+    *id = scene.terrain.instance_ids[b];
+    *label = scene.terrain.class_ids[b];
+    return true;
+  }
+  int kind, index;
+  if (!primitive_slot_to_kind_index(slot, scene, b, &kind, &index)) return false;
+  if (kind == 1) {
+    *id = scene.spheres.instance_ids[b * scene.spheres.count + index];
+    *label = scene.spheres.class_ids[b * scene.spheres.count + index];
+  } else if (kind == 3) {
+    *id = scene.boxes.instance_ids[b * scene.boxes.count + index];
+    *label = scene.boxes.class_ids[b * scene.boxes.count + index];
+  } else if (kind == 5) {
+    *id = scene.prisms.instance_ids[b * scene.prisms.count + index];
+    *label = scene.prisms.class_ids[b * scene.prisms.count + index];
+  } else {
+    *id = scene.cylinders.instance_ids[b * scene.cylinders.count + index];
+    *label = scene.cylinders.class_ids[b * scene.cylinders.count + index];
+  }
+  return true;
+}
+
+__global__ void annotation_metadata_kernel(
+    SceneView scene, int capacity, int batch, int* counts, int* ids,
+    int* labels, int* slot_to_instance, const int* visible_primitives) {
+  const int b = blockIdx.x;
+  int* batch_ids = ids + b * capacity;
+  int* batch_labels = labels + b * capacity;
+  int n = 0;
+  for (int slot = 0; slot < capacity; ++slot) {
+    int id, label;
+    if (!annotation_metadata_for_slot(scene, b, slot, capacity - 1, &id, &label)) continue;
+    if (id <= 0) { atomicMax(counts + batch, 1); continue; }
+    int index = 0;
+    while (index < n && batch_ids[index] < id) ++index;
+    if (index < n && batch_ids[index] == id) {
+      if (batch_labels[index] != label) atomicMax(counts + batch, 2);
+      continue;
+    }
+    for (int k = n; k > index; --k) {
+      batch_ids[k] = batch_ids[k - 1];
+      batch_labels[k] = batch_labels[k - 1];
+    }
+    batch_ids[index] = id;
+    batch_labels[index] = label;
+    ++n;
+  }
+  // Keep only IDs with camera-visible pixels. Visibility is per instance:
+  // hidden parts still contribute when any other part of the same ID is visible.
+  int retained = 0;
+  for (int i = 0; i < n; ++i) {
+    bool visible = false;
+    for (int slot = 0; slot < capacity && !visible; ++slot) {
+      const unsigned int word = static_cast<unsigned int>(
+          visible_primitives[b * kVisibilityMaskWords + slot / 32]);
+      if ((word & (1u << (slot % 32))) == 0) continue;
+      int id, label;
+      if (annotation_metadata_for_slot(scene, b, slot, capacity - 1, &id, &label)
+          && id == batch_ids[i]) visible = true;
+    }
+    if (visible) {
+      batch_ids[retained] = batch_ids[i];
+      batch_labels[retained++] = batch_labels[i];
+    }
+  }
+  n = retained;
+  counts[b] = n;
+  for (int i = n; i < capacity; ++i) {
+    batch_ids[i] = 0;
+    batch_labels[i] = 0;
+  }
+  for (int slot = 0; slot < capacity; ++slot) {
+    int id, label, index = -1;
+    if (annotation_metadata_for_slot(scene, b, slot, capacity - 1, &id, &label) && id > 0) {
+      index = 0;
+      while (index < n && batch_ids[index] != id) ++index;
+      if (index == n) index = -1;
+    }
+    slot_to_instance[b * capacity + slot] = index;
+  }
+}
+
+// Cover an instance once per ray, then emit every dense annotation directly.
+// The common <=32-instance case keeps coverage in one register per thread.
+template <int CoverageWords>
+__global__ void amodal_annotations_kernel(
+    bool* amodal, bool* visible, int* relationship_bits, int* partial_areas,
+    const int* slot_to_instance, const int* primary_masks,
+    const float* terrain_depth, const int* instance_map, const int* ids, const int* counts,
+    int width, int height, int tiles_x, int tiles_y,
+    int capacity, int instances, SceneView scene, RenderOptionsView options) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const int b = blockIdx.z;
+  const int* lookup = slot_to_instance + b * capacity;
+  __shared__ unsigned int tile_masks[kPrimitiveMaskWords];
+  extern __shared__ int warp_areas[];
+  const int pair_words = (instances + 31) / 32;
+  unsigned int* tile_pairs = reinterpret_cast<unsigned int*>(warp_areas + 8 * instances * 2);
+  const int thread = threadIdx.y * blockDim.x + threadIdx.x;
+  if (thread < kPrimitiveMaskWords) {
+    unsigned int bits = 0;
+    for (int bin = 0; bin < kDepthBins; ++bin) {
+      const int cluster = cluster_linear_index(b, blockIdx.y, blockIdx.x, bin, tiles_x, tiles_y);
+      bits |= static_cast<unsigned int>(primary_masks[cluster * kPrimitiveMaskWords + thread]);
+    }
+    unsigned int retained = 0;
+    while (bits) {
+      const int bit = __ffs(bits) - 1;
+      bits &= bits - 1u;
+      if (lookup[thread * 32 + bit] >= 0) retained |= 1u << bit;
+    }
+    tile_masks[thread] = retained;
+  }
+  for (int i = thread; i < instances * pair_words; i += blockDim.x * blockDim.y)
+    tile_pairs[i] = 0;
+  __syncthreads();
+  const bool valid_pixel = x < width && y < height;
+  const int pixels = width * height;
+  const int pixel = y * width + x;
+  unsigned int coverage[CoverageWords] = {};
+  int front_id = 0;
+  int front_instance = -1;
+  if (valid_pixel && counts[b] > 0) {
+    front_id = instance_map[b * pixels + pixel];
+    if (front_id > 0) {
+      int lo = 0, hi = counts[b];
+      while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (ids[b * capacity + mid] < front_id) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo < counts[b] && ids[b * capacity + lo] == front_id) {
+        front_instance = lo;
+        coverage[CoverageWords == 1 ? 0 : lo / 32] |= 1u << (lo & 31);
+      }
+    }
+    const int terrain_instance = lookup[capacity - 1];
+    if (terrain_instance >= 0 && terrain_depth[b * pixels + pixel] < kFloatMax)
+      coverage[CoverageWords == 1 ? 0 : terrain_instance / 32] |= 1u << (terrain_instance & 31);
+    const float scale = tanf(0.5f * options.fov_degrees * 0.017453292519943295f);
+    const float px = ((x + 0.5f) / width * 2.f - 1.f) * (float(width) / height) * scale;
+    const float py = (1.f - (y + 0.5f) / height * 2.f) * scale;
+    const Vec3 origin = make_vec3(0.f, 0.f, 0.f);
+    const Vec3 ray = normalize(make_vec3(px, py, -1.f));
+    for (int word = 0; word < kPrimitiveMaskWords; ++word) {
+      unsigned int bits = tile_masks[word];
+      while (bits) {
+        const int slot = word * 32 + __ffs(bits) - 1;
+        bits &= bits - 1u;
+        const int instance = lookup[slot];
+        const int coverage_word = CoverageWords == 1 ? 0 : instance / 32;
+        const unsigned int bit = 1u << (instance & 31);
+        if (coverage[coverage_word] & bit) continue;
+        int kind, index;
+        if (!primitive_slot_to_kind_index(slot, scene, b, &kind, &index)) continue;
+        float t;
+        Vec3 normal;
+        bool hit;
+        if (kind == 1) {
+          const int o = b * scene.spheres.count + index;
+          hit = intersect_sphere(origin, ray, load_vec3(scene.spheres.centers + o * 3), scene.spheres.radii[o], &t);
+        } else if (kind == 3) {
+          const int o = b * scene.boxes.count + index;
+          hit = intersect_box(origin, ray, load_vec3(scene.boxes.centers + o * 3),
+                              load_vec3(scene.boxes.half_sizes + o * 3), scene.boxes.axes + o * 9, &t, &normal);
+        } else if (kind == 5) {
+          const int o = b * scene.prisms.count + index;
+          hit = intersect_prism(origin, ray, load_vec3(scene.prisms.centers + o * 3),
+                                load_vec3(scene.prisms.half_sizes + o * 3), scene.prisms.axes + o * 9, &t, &normal);
+        } else {
+          const int o = b * scene.cylinders.count + index;
+          hit = intersect_cylinder(origin, ray, load_vec3(scene.cylinders.centers + o * 3),
+                                   scene.cylinders.radii[o], scene.cylinders.half_heights[o],
+                                   scene.cylinders.axes + o * 9, &t, &normal);
+        }
+        if (hit) coverage[coverage_word] |= bit;
+      }
+    }
+  }
+  const int lane = thread & 31;
+  const int warp = thread / 32;
+  const unsigned int same_front = __match_any_sync(0xffffffffu, front_instance);
+  // All threads participate, including padding pixels on partial edge tiles.
+  // Warp ballots give exact area counts without global per-pixel atomics.
+  for (int n = 0; n < instances; ++n) {
+    const bool a = (coverage[CoverageWords == 1 ? 0 : n / 32] & (1u << (n & 31))) != 0;
+    const bool v = valid_pixel && n < counts[b] && front_id == ids[b * capacity + n];
+    const bool h = a && !v;
+    if (valid_pixel) {
+      const int64_t offset = (static_cast<int64_t>(b) * instances + n) * pixels + pixel;
+      amodal[offset] = a;
+      visible[offset] = v;
+    }
+    const unsigned int area_bits = __ballot_sync(0xffffffffu, a);
+    const unsigned int hidden_bits = __ballot_sync(0xffffffffu, h);
+    // Aggregate equal front-instance IDs within the warp before setting an edge.
+    // The shared tile matrix then needs only one global atomic per nonempty word.
+    if (h && front_instance >= 0 && __ffs(same_front & hidden_bits) - 1 == lane)
+      atomicOr(tile_pairs + front_instance * pair_words + n / 32, 1u << (n & 31));
+    if (lane == 0) {
+      warp_areas[(warp * instances + n) * 2] = __popc(area_bits);
+      warp_areas[(warp * instances + n) * 2 + 1] = __popc(hidden_bits);
+    }
+  }
+  __syncthreads();
+  for (int i = thread; i < instances * pair_words; i += blockDim.x * blockDim.y) {
+    const unsigned int bits = tile_pairs[i];
+    if (bits) atomicOr(relationship_bits + b * instances * pair_words + i, static_cast<int>(bits));
+  }
+  const int tiles = tiles_x * tiles_y;
+  const int tile = blockIdx.y * tiles_x + blockIdx.x;
+  for (int n = thread; n < instances; n += blockDim.x * blockDim.y) {
+    int area = 0, hidden_area = 0;
+    for (int w = 0; w < 8; ++w) {
+      area += warp_areas[(w * instances + n) * 2];
+      hidden_area += warp_areas[(w * instances + n) * 2 + 1];
+    }
+    const int offset = ((b * instances + n) * tiles + tile) * 2;
+    partial_areas[offset] = area;
+    partial_areas[offset + 1] = hidden_area;
+  }
+}
+
+__global__ void occlusion_fractions_kernel(
+    const int* partials, float* fractions, const int* relationship_bits,
+    bool* occlusion_matrix, int instances, int tiles) {
+  const int n = blockIdx.x;
+  const int b = blockIdx.y;
+  int area = 0, hidden_area = 0;
+  const int pair_words = (instances + 31) / 32;
+  const int* row = relationship_bits + (b * instances + n) * pair_words;
+  for (int target = threadIdx.x; target < instances; target += blockDim.x)
+    occlusion_matrix[(b * instances + n) * instances + target] =
+        n != target && (static_cast<unsigned int>(row[target / 32]) & (1u << (target & 31))) != 0;
+  const int* values = partials + (b * instances + n) * tiles * 2;
+  for (int tile = threadIdx.x; tile < tiles; tile += blockDim.x) {
+    area += values[tile * 2];
+    hidden_area += values[tile * 2 + 1];
+  }
+  __shared__ int areas[256];
+  __shared__ int hidden_areas[256];
+  areas[threadIdx.x] = area;
+  hidden_areas[threadIdx.x] = hidden_area;
+  __syncthreads();
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      areas[threadIdx.x] += areas[threadIdx.x + stride];
+      hidden_areas[threadIdx.x] += hidden_areas[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    fractions[b * instances + n] = areas[0] ? float(hidden_areas[0]) / areas[0] : nanf("");
+}
+
 __global__ void render_scene_kernel(
     float* image,
     int* instance_map,
@@ -2099,7 +2362,7 @@ __global__ void render_scene_kernel(
 
 }  // namespace
 
-void render_scene_cuda(
+std::vector<torch::Tensor> render_scene_cuda(
     torch::Tensor image,
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
@@ -2151,7 +2414,8 @@ void render_scene_cuda(
     torch::Tensor cylinder_colors,
     double ambient,
     bool shadows,
-    double shadow_strength) {
+    double shadow_strength,
+    bool return_occlusion) {
   const int batch_size = static_cast<int>(image.size(0));
   const int height = static_cast<int>(image.size(2));
   const int width = static_cast<int>(image.size(3));
@@ -2349,5 +2613,60 @@ void render_scene_cuda(
         options);
   }
 
+
+  std::vector<torch::Tensor> annotations;
+  if (return_occlusion) {
+    RECORD_USER_SCOPE("synthetic_scene::occlusion");
+    const int capacity = primitive_slot_count + 1;
+    auto counts = torch::zeros({batch_size + 1}, int_options);
+    auto ids = torch::empty({batch_size, capacity}, int_options);
+    auto labels = torch::empty_like(ids);
+    auto lookup = torch::empty_like(ids);
+    annotation_metadata_kernel<<<batch_size, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scene, capacity, batch_size, counts.data_ptr<int>(), ids.data_ptr<int>(),
+        labels.data_ptr<int>(), lookup.data_ptr<int>(), visible_primitive_masks.data_ptr<int>());
+    // One count readback determines allocation sizes and validates metadata.
+    auto host_counts = counts.cpu();
+    const int* count_data = host_counts.data_ptr<int>();
+    TORCH_CHECK(count_data[batch_size] != 1, "occlusion ground truth requires positive instance IDs");
+    TORCH_CHECK(count_data[batch_size] != 2, "parts sharing an instance ID must share a class ID");
+    int instances = 0;
+    for (int b = 0; b < batch_size; ++b) instances = std::max(instances, count_data[b]);
+    const auto bool_options = image.options().dtype(torch::kBool);
+    auto amodal = torch::empty({batch_size, instances, height, width}, bool_options);
+    auto visible = torch::empty_like(amodal);
+    auto relationships = torch::empty({batch_size, instances, instances}, bool_options);
+    auto fractions = torch::empty({batch_size, instances}, image.options());
+    if (instances > 0) {
+      auto partials = torch::empty({batch_size, instances, total_tiles, 2}, int_options);
+      const int pair_words = (instances + 31) / 32;
+      auto pair_bits = torch::zeros({batch_size, instances, pair_words}, int_options);
+      const int shared_bytes = (8 * instances * 2 + instances * pair_words) * sizeof(int);
+      if (instances <= 32) {
+        amodal_annotations_kernel<1><<<grid, block, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            amodal.data_ptr<bool>(), visible.data_ptr<bool>(), pair_bits.data_ptr<int>(),
+            partials.data_ptr<int>(), lookup.data_ptr<int>(),
+            primary_cluster_masks.data_ptr<int>(), terrain_depth.data_ptr<float>(),
+            instance_map.data_ptr<int>(), ids.data_ptr<int>(), counts.data_ptr<int>(),
+            width, height, tiles_x, tiles_y, capacity, instances, scene, options);
+      } else {
+        amodal_annotations_kernel<kVisibilityMaskWords><<<grid, block, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            amodal.data_ptr<bool>(), visible.data_ptr<bool>(), pair_bits.data_ptr<int>(),
+            partials.data_ptr<int>(), lookup.data_ptr<int>(),
+            primary_cluster_masks.data_ptr<int>(), terrain_depth.data_ptr<float>(),
+            instance_map.data_ptr<int>(), ids.data_ptr<int>(), counts.data_ptr<int>(),
+            width, height, tiles_x, tiles_y, capacity, instances, scene, options);
+      }
+      const dim3 fraction_grid(instances, batch_size);
+      occlusion_fractions_kernel<<<fraction_grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+          partials.data_ptr<int>(), fractions.data_ptr<float>(), pair_bits.data_ptr<int>(),
+          relationships.data_ptr<bool>(), instances, total_tiles);
+    }
+    // Reuse these device metadata tensors for normal visible-instance outputs;
+    // Python must not rediscover the same instance list or read counts again.
+    annotations = {host_counts, ids, labels, amodal, visible, fractions, relationships,
+                   counts.narrow(0, 0, batch_size)};
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return annotations;
 }
