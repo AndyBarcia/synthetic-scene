@@ -1,6 +1,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/record_function.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
 namespace {
@@ -2085,6 +2087,7 @@ __global__ void render_scene_kernel(
     int* instance_map,
     int* semantic_map,
     int* visible_primitive_masks,
+    int* part_map,
     const float* terrain_depth,
     const int* primary_cluster_masks,
     const int* shadow_cluster_masks,
@@ -2336,7 +2339,7 @@ __global__ void render_scene_kernel(
   if (semantic_map != nullptr) {
     semantic_map[map_offset] = semantic_id;
   }
-  if (visible_primitive_masks != nullptr) {
+  if (visible_primitive_masks != nullptr || part_map != nullptr) {
     int primitive_slot = -1;
     if (closest_sphere >= 0) {
       primitive_slot = closest_sphere;
@@ -2349,10 +2352,13 @@ __global__ void render_scene_kernel(
     } else if (closest_terrain >= 0) {
       primitive_slot = scene.spheres.count + scene.boxes.count + scene.prisms.count + scene.cylinders.count;
     }
+    if (part_map != nullptr) {
+      part_map[map_offset] = primitive_slot + 1;
+    }
     const unsigned int active = __activemask();
     const unsigned int peers = __match_any_sync(active, primitive_slot);
     const int lane = (threadIdx.y * blockDim.x + threadIdx.x) & 31;
-    if (primitive_slot >= 0 && __ffs(peers) - 1 == lane) {
+    if (visible_primitive_masks != nullptr && primitive_slot >= 0 && __ffs(peers) - 1 == lane) {
       atomicOr(
           visible_primitive_masks + batch_idx * kVisibilityMaskWords + primitive_slot / 32,
           static_cast<int>(1u << (primitive_slot & 31)));
@@ -2367,6 +2373,7 @@ std::vector<torch::Tensor> render_scene_cuda(
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
     torch::Tensor visible_primitive_masks,
+    torch::Tensor part_map,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
     torch::Tensor sphere_counts,
@@ -2599,6 +2606,7 @@ std::vector<torch::Tensor> render_scene_cuda(
         instance_map.numel() == 0 ? nullptr : instance_map.data_ptr<int>(),
         semantic_map.numel() == 0 ? nullptr : semantic_map.data_ptr<int>(),
         visible_primitive_masks.numel() == 0 ? nullptr : visible_primitive_masks.data_ptr<int>(),
+        part_map.numel() == 0 ? nullptr : part_map.data_ptr<int>(),
         terrain_depth.data_ptr<float>(),
         primary_cluster_masks.data_ptr<int>(),
         shadow_cluster_masks_ptr,
@@ -2669,4 +2677,113 @@ std::vector<torch::Tensor> render_scene_cuda(
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return annotations;
+}
+
+
+namespace {
+// Eight mask planes share each pixel lookup. Adjacent threads write adjacent
+// pixels in each plane, keeping stores coalesced without a B x H x W int64 index.
+__global__ void expand_parts_kernel(const int* raw, const int* remap, int* map,
+                                    bool* masks, int pixels, int slots, int parts) {
+  const int pixel = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pixel >= pixels) return;
+  const int batch = blockIdx.z;
+  const int part = remap[batch * slots + raw[batch * pixels + pixel]];
+  if (blockIdx.y == 0) map[batch * pixels + pixel] = part;
+  #pragma unroll
+  for (int offset = 0; offset < 8; ++offset) {
+    const int plane = blockIdx.y * 8 + offset;
+    if (plane < parts) {
+      masks[(static_cast<int64_t>(batch) * parts + plane) * pixels + pixel] = part == plane + 1;
+    }
+  }
+}
+}  // namespace
+
+void expand_parts_cuda(torch::Tensor raw, torch::Tensor remap,
+                       torch::Tensor map, torch::Tensor masks) {
+  TORCH_CHECK(raw.is_cuda() && remap.is_cuda() && map.is_cuda() && masks.is_cuda(),
+              "part expansion requires CUDA tensors");
+  TORCH_CHECK(raw.device() == remap.device() && raw.device() == map.device() && raw.device() == masks.device(),
+              "part expansion tensors must share a device");
+  TORCH_CHECK(raw.scalar_type() == torch::kInt32 && remap.scalar_type() == torch::kInt32 &&
+              map.scalar_type() == torch::kInt32 && masks.scalar_type() == torch::kBool,
+              "part expansion requires int32 labels and boolean masks");
+  TORCH_CHECK(raw.is_contiguous() && remap.is_contiguous() && map.is_contiguous() && masks.is_contiguous(),
+              "part expansion tensors must be contiguous");
+  TORCH_CHECK(raw.dim() == 3 && map.sizes() == raw.sizes() && remap.dim() == 2 &&
+              remap.size(0) == raw.size(0) && remap.size(1) <= 258 && remap.size(1) > 0 &&
+              masks.dim() == 4 && masks.size(0) == raw.size(0) &&
+              masks.size(2) == raw.size(1) && masks.size(3) == raw.size(2),
+              "invalid part expansion shapes");
+  const c10::cuda::CUDAGuard device_guard(raw.device());
+  const int pixels = raw.size(1) * raw.size(2);
+  if (pixels == 0 || raw.size(0) == 0) return;
+  const int parts = masks.size(1);
+  const dim3 grid((pixels + 255) / 256, std::max(1, (parts + 7) / 8), raw.size(0));
+  expand_parts_kernel<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      raw.data_ptr<int>(), remap.data_ptr<int>(), map.data_ptr<int>(), masks.data_ptr<bool>(),
+      pixels, remap.size(1), parts);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+
+namespace {
+__global__ void prepare_parts_kernel(const int* visibility, const int* ids,
+                                     int* counts, int* remap, int* owners,
+                                     int slots, bool compact_default) {
+  __shared__ int scan[512];
+  __shared__ int active_ids[512];
+  const int slot = threadIdx.x;
+  const int batch = blockIdx.x;
+  int owner = slot < slots ? ids[batch * slots + slot] : 0;
+  const bool visible = slot < slots && owner > 0 &&
+      ((static_cast<unsigned int>(visibility[batch * 9 + slot / 32]) >> (slot % 32)) & 1);
+  scan[slot] = visible;
+  active_ids[slot] = visible ? owner : 0;
+  if (slot < slots) owners[batch * slots + slot] = -1;
+  __syncthreads();
+  // Default IDs are unique per primitive and compacted in ascending ID order.
+  if (visible && compact_default) {
+    int rank = 1;
+    for (int i = 0; i < slots; ++i) {
+      rank += active_ids[i] > 0 && active_ids[i] < owner;
+    }
+    owner = rank;
+  }
+  for (int step = 1; step < 512; step *= 2) {
+    const int prior = slot >= step ? scan[slot - step] : 0;
+    __syncthreads();
+    scan[slot] += prior;
+    __syncthreads();
+  }
+  if (slot < slots) {
+    remap[batch * (slots + 1) + slot + 1] = visible ? scan[slot] : 0;
+    if (visible) owners[batch * slots + scan[slot] - 1] = owner;
+  }
+  if (slot == 0) {
+    remap[batch * (slots + 1)] = 0;
+    counts[batch] = scan[511];
+  }
+}
+}  // namespace
+
+std::vector<torch::Tensor> prepare_parts_cuda(torch::Tensor visibility,
+                                             torch::Tensor ids, bool compact_default) {
+  TORCH_CHECK(visibility.is_cuda() && ids.is_cuda() && visibility.device() == ids.device() &&
+              visibility.scalar_type() == torch::kInt32 && ids.scalar_type() == torch::kInt32 &&
+              visibility.is_contiguous() && ids.is_contiguous() && visibility.dim() == 2 &&
+              ids.dim() == 2 && visibility.size(0) == ids.size(0) && visibility.size(1) == 9 &&
+              ids.size(1) <= 257, "invalid CUDA part metadata");
+  const c10::cuda::CUDAGuard device_guard(ids.device());
+  auto counts = torch::empty({ids.size(0)}, ids.options());
+  auto remap = torch::empty({ids.size(0), ids.size(1) + 1}, ids.options());
+  auto owners = torch::empty_like(ids);
+  if (ids.size(0) > 0) {
+    prepare_parts_kernel<<<ids.size(0), 512, 0, at::cuda::getCurrentCUDAStream()>>>(
+        visibility.data_ptr<int>(), ids.data_ptr<int>(), counts.data_ptr<int>(),
+        remap.data_ptr<int>(), owners.data_ptr<int>(), ids.size(1), compact_default);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {counts, remap, owners};
 }

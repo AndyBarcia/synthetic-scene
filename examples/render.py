@@ -21,6 +21,7 @@ def main() -> None:
         scene=generated,
         return_maps=True,
         return_occlusion=args.occlusion,
+        return_parts=True,
     )
     if args.occlusion:
         save_amodal_visualization(result, "outputs/amodal.png")
@@ -34,6 +35,10 @@ def main() -> None:
     semantic_grid = torch.cat([colorize_label_map(label_map) for label_map in result.semantic_map], dim=1)
     save_image(instance_grid.to(torch.float32).div(255.0), output.with_name("instance_map.png"))
     save_image(semantic_grid.to(torch.float32).div(255.0), output.with_name("semantic_map.png"))
+    part_grid = torch.cat([colorize_label_map(label_map) for label_map in result.part_map], dim=1)
+    save_image(part_grid.to(torch.float32).div(255.0), output.with_name("part_map.png"))
+    print(f"wrote {output.with_name('part_map.png')}")
+    print(f"visible part counts: {result.part_count.tolist()}")
     print(f"wrote {output}")
     print(f"wrote {output.with_name('instance_map.png')}")
     print(f"wrote {output.with_name('semantic_map.png')}")

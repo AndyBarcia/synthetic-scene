@@ -157,6 +157,10 @@ class RenderResult:
     instance_map: torch.Tensor
     semantic_map: torch.Tensor
     amodal: list["AmodalAnnotations"] | None = None
+    part_count: torch.Tensor | None = None
+    part_map: torch.Tensor | None = None
+    part_masks: torch.Tensor | None = None
+    part_belongs_to: torch.Tensor | None = None
 
     @property
     def panoptic_map(self) -> torch.Tensor:
@@ -175,6 +179,22 @@ def _occlusion_visible_metadata(tensors: list[torch.Tensor]) -> tuple[torch.Tens
     # CUDA already produced the visible instance list for the annotation pass.
     max_visible = tensors[3].shape[1]
     return tensors[7], tensors[2][:, :max_visible], tensors[1][:, :max_visible]
+
+
+def _part_outputs(raw_parts: torch.Tensor, visible_instance_ids: torch.Tensor,
+                  visibility: torch.Tensor, primitive_ids: tuple[torch.Tensor, ...],
+                  compact_default: bool = False) -> dict:
+    """Compact the small visibility bitset and expand modal masks on CUDA."""
+    batch, height, width = raw_parts.shape
+    candidates = torch.cat(primitive_ids, dim=1)
+    count, remap, compact_owners = _cuda_renderer.prepare_parts(visibility, candidates, compact_default)
+    capacity = int(count.max().item())
+    part_map = torch.empty_like(raw_parts)
+    masks = torch.empty((batch, capacity, height, width), dtype=torch.bool, device=raw_parts.device)
+    _cuda_renderer.expand_parts(raw_parts, remap, part_map, masks)
+    # Native metadata uses -1 for padded owners; public instance IDs are nonnegative.
+    belongs = compact_owners[:, :capacity, None] == visible_instance_ids[:, None, :]
+    return dict(part_count=count, part_map=part_map, part_masks=masks, part_belongs_to=belongs)
 
 
 def _compact_visible_instances(
@@ -701,6 +721,7 @@ def render_random_scene(
     render_options: RenderOptions | None = None,
     return_maps: bool = False,
     return_occlusion: bool = False,
+    return_parts: bool = False,
 ) -> torch.Tensor | RenderResult:
     """Generate a packed scene and render it without exposing intermediate fields."""
     scene = generate_random_scene(seed, batch_size=batch_size, options=scene_options)
@@ -711,6 +732,7 @@ def render_random_scene(
         options=render_options,
         return_maps=return_maps,
         return_occlusion=return_occlusion,
+        return_parts=return_parts,
     )
 
 
@@ -721,7 +743,9 @@ def _render_packed_scene(
     options: RenderOptions,
     return_maps: bool,
     return_occlusion: bool = False,
+    return_parts: bool = False,
 ) -> torch.Tensor | RenderResult:
+    return_maps = return_maps or return_parts or return_occlusion
     input_preparation_range = torch.autograd.profiler.record_function(
         "synthetic_scene::input_preparation"
     )
@@ -732,6 +756,7 @@ def _render_packed_scene(
         torch.empty((scene.batch_size, height, width), dtype=torch.int32, device=device)
         if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
     )
+    raw_parts = torch.empty_like(instance_map) if return_parts else torch.empty((0,), dtype=torch.int32, device=device)
     semantic_map = torch.empty_like(instance_map)
     visible_masks = (
         torch.zeros((scene.batch_size, 9), dtype=torch.int32, device=device)
@@ -745,6 +770,7 @@ def _render_packed_scene(
         instance_map,
         semantic_map,
         visible_masks,
+        raw_parts,
         scene.float_data,
         scene.integer_data,
         scene.sphere_count,
@@ -765,7 +791,7 @@ def _render_packed_scene(
     with torch.autograd.profiler.record_function("synthetic_scene::segmentation"):
         if return_occlusion:
             visible_count, visible_classes, visible_instance_ids = _occlusion_visible_metadata(annotation_tensors)
-        else:
+        if return_parts or not return_occlusion:
             # Metadata occupies the integer buffer in this fixed order. These are views,
             # not new allocations, and are needed only for visible-instance compaction.
             offset = 0
@@ -796,19 +822,20 @@ def _render_packed_scene(
             take((batch,))  # plane counts
             terrain_classes = take((batch, 1))
             terrain_instances = take((batch, 1))
-            visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(
-                visible_masks,
-                sphere_instance_ids=sphere_instances,
-                sphere_class_ids=sphere_classes,
-                terrain_instance_ids=terrain_instances,
-                terrain_class_ids=terrain_classes,
-                box_instance_ids=box_instances,
-                box_class_ids=box_classes,
-                prism_instance_ids=prism_instances,
-                prism_class_ids=prism_classes,
-                cylinder_instance_ids=cylinder_instances,
-                cylinder_class_ids=cylinder_classes,
-            )
+            if not return_occlusion:
+                visible_count, visible_classes, visible_instance_ids = _visible_custom_instances(
+                    visible_masks,
+                    sphere_instance_ids=sphere_instances,
+                    sphere_class_ids=sphere_classes,
+                    terrain_instance_ids=terrain_instances,
+                    terrain_class_ids=terrain_classes,
+                    box_instance_ids=box_instances,
+                    box_class_ids=box_classes,
+                    prism_instance_ids=prism_instances,
+                    prism_class_ids=prism_classes,
+                    cylinder_instance_ids=cylinder_instances,
+                    cylinder_class_ids=cylinder_classes,
+                )
     return RenderResult(
         image=image,
         visible_count=visible_count,
@@ -817,6 +844,9 @@ def _render_packed_scene(
         instance_map=instance_map,
         semantic_map=semantic_map,
         amodal=_decode_occlusion(annotation_tensors) if return_occlusion else None,
+        **(_part_outputs(raw_parts, visible_instance_ids, visible_masks,
+                        (sphere_instances, box_instances, prism_instances, cylinder_instances, terrain_instances))
+           if return_parts else {}),
     )
 
 
@@ -829,6 +859,7 @@ def render_scene(
     options: RenderOptions | None = None,
     return_maps: Literal[False] = False,
     return_occlusion: Literal[False] = False,
+    return_parts: Literal[False] = False,
 ) -> torch.Tensor: ...
 
 
@@ -841,6 +872,7 @@ def render_scene(
     options: RenderOptions | None = None,
     return_maps: bool = False,
     return_occlusion: bool = False,
+    return_parts: bool = False,
 ) -> torch.Tensor | RenderResult: ...
 
 
@@ -852,11 +884,14 @@ def render_scene(
     options: RenderOptions | None = None,
     return_maps: bool = False,
     return_occlusion: bool = False,
+    return_parts: bool = False,
 ) -> torch.Tensor | RenderResult:
     """Render RGB, optional label maps, and optional amodal/occlusion GT.
 
     return_occlusion=True implies return_maps=True and populates amodal
     for instances with at least one visible camera pixel.
+    return_parts=True also implies return_maps=True and adds modal primitive masks;
+    it can be combined with return_occlusion=True.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to render with this extension")
@@ -875,7 +910,8 @@ def render_scene(
         if not isinstance(scene, PackedScene):
             scene = _with_default_metadata(scene if scene is not None else Scene())
     if isinstance(scene, PackedScene):
-        return _render_packed_scene(scene, width, height, options_data, return_maps, return_occlusion)
+        return _render_packed_scene(scene, width, height, options_data, return_maps, return_occlusion, return_parts)
+    return_maps = return_maps or return_parts or return_occlusion
     scene_data = scene or Scene()
 
     input_preparation_range = torch.autograd.profiler.record_function("synthetic_scene::input_preparation")
@@ -1081,6 +1117,7 @@ def render_scene(
     image = torch.empty((batch_size, 3, height, width), dtype=torch.float32, device=device)
     instance_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
     semantic_map = torch.empty((batch_size, height, width), dtype=torch.int32, device=device) if return_maps else torch.empty((0,), dtype=torch.int32, device=device)
+    raw_parts = torch.empty_like(instance_map) if return_parts else torch.empty((0,), dtype=torch.int32, device=device)
     visible_primitive_masks = (
         torch.zeros((batch_size, 9), dtype=torch.int32, device=device)
         if return_maps
@@ -1092,6 +1129,7 @@ def render_scene(
         instance_map,
         semantic_map,
         visible_primitive_masks,
+        raw_parts,
         {
             "spheres": {
                 "centers": centers,
@@ -1199,6 +1237,10 @@ def render_scene(
             instance_map=instance_map,
             semantic_map=semantic_map,
             amodal=_decode_occlusion(annotation_tensors) if return_occlusion else None,
+            **(_part_outputs(raw_parts, visible_instance_ids, visible_primitive_masks,
+                            (sphere_instance_ids, box_instance_ids, prism_instance_ids,
+                             cylinder_instance_ids, terrain_instance_ids), compact_default=not has_custom_metadata)
+               if return_parts else {}),
         )
     return image
 

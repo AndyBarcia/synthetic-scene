@@ -17,6 +17,7 @@ std::vector<torch::Tensor> render_scene_cuda(
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
     torch::Tensor visible_primitive_masks,
+    torch::Tensor part_map,
     torch::Tensor sphere_centers,
     torch::Tensor sphere_radii,
     torch::Tensor sphere_counts,
@@ -244,6 +245,7 @@ std::vector<torch::Tensor> render_packed_scene(
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
     torch::Tensor visible_masks,
+    torch::Tensor part_map,
     torch::Tensor float_data,
     torch::Tensor integer_data,
     int sphere_count,
@@ -257,12 +259,17 @@ std::vector<torch::Tensor> render_packed_scene(
     bool shadows,
     double shadow_strength,
     bool return_occlusion) {
+  TORCH_CHECK(part_map.is_cuda() && part_map.device() == image.device() &&
+      part_map.scalar_type() == torch::kInt32 && part_map.is_contiguous() &&
+      (part_map.numel() == 0 || (part_map.dim() == 3 &&
+       part_map.size(0) == image.size(0) && part_map.size(1) == image.size(2) &&
+       part_map.size(2) == image.size(3))), "part_map must be empty or contiguous CUDA int32 B x H x W on the image device");
   auto packed = unpack_scene(
       float_data, integer_data, image.size(0), sphere_count, box_count, prism_count, cylinder_count);
   const auto& scene = packed.scene;
   const auto empty_planes = float_data.narrow(0, 0, 0).view({image.size(0), 0, 3});
   return render_scene_cuda(
-      image, instance_map, semantic_map, visible_masks,
+      image, instance_map, semantic_map, visible_masks, part_map,
       scene[0], scene[1], scene[3], scene[4], scene[5],
       empty_planes, empty_planes, packed.plane_counts,
       scene[6], scene[7], scene[8], scene[9], scene[10], scene[11], scene[13],
@@ -280,8 +287,14 @@ std::vector<torch::Tensor> render_scene(
     torch::Tensor instance_map,
     torch::Tensor semantic_map,
     torch::Tensor visible_primitive_masks,
+    torch::Tensor part_map,
     py::dict scene,
     py::dict options) {
+  TORCH_CHECK(part_map.is_cuda() && part_map.device() == image.device() &&
+      part_map.scalar_type() == torch::kInt32 && part_map.is_contiguous() &&
+      (part_map.numel() == 0 || (part_map.dim() == 3 &&
+       part_map.size(0) == image.size(0) && part_map.size(1) == image.size(2) &&
+       part_map.size(2) == image.size(3))), "part_map must be empty or contiguous CUDA int32 B x H x W on the image device");
   const py::dict spheres = require_dict(scene, "spheres");
   const py::dict planes = require_dict(scene, "planes");
   const py::dict terrain = require_dict(scene, "terrain");
@@ -541,6 +554,7 @@ std::vector<torch::Tensor> render_scene(
       instance_map,
       semantic_map,
       visible_primitive_masks,
+      part_map,
       sphere_centers,
       sphere_radii,
       sphere_counts,
@@ -592,7 +606,13 @@ std::vector<torch::Tensor> render_scene(
       options.contains("return_occlusion") && require_bool(options, "return_occlusion"));
 }
 
+void expand_parts_cuda(torch::Tensor raw, torch::Tensor remap, torch::Tensor map, torch::Tensor masks);
+
+std::vector<torch::Tensor> prepare_parts_cuda(torch::Tensor visibility, torch::Tensor ids, bool compact_default);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("prepare_parts", &prepare_parts_cuda, "Compact visible CUDA primitive metadata");
+  m.def("expand_parts", &expand_parts_cuda, "Expand compact modal part masks on CUDA");
   m.def(
       "generate_random_scene",
       &generate_random_scene_packed,

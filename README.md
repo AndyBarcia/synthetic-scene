@@ -12,13 +12,21 @@ renders draw different camera-space scenes.
 ## Build
 
 ```bash
-conda run -n clipdino-cu117 python setup.py build_ext --inplace
+apptainer exec --nv \
+  --bind "$PWD:/workspace/synthetic-scene" \
+  --pwd /workspace/synthetic-scene \
+  /data/Andy/fcclip-torch27-cu126.sif \
+  python setup.py build_ext --inplace
 ```
 
 ## Render
 
 ```bash
-conda run -n clipdino-cu117 python -m examples.render
+apptainer exec --nv \
+  --bind "$PWD:/workspace/synthetic-scene" \
+  --pwd /workspace/synthetic-scene \
+  /data/Andy/fcclip-torch27-cu126.sif \
+  python -m examples.render
 ```
 
 The example writes `outputs/render.png` plus side-by-side colorized instance and
@@ -271,7 +279,11 @@ random draws must also update its draw count in the CUDA dispatcher.
 ## Benchmark
 
 ```bash
-conda run -n clipdino-cu117 python -m examples.benchmark
+apptainer exec --nv \
+  --bind "$PWD:/workspace/synthetic-scene" \
+  --pwd /workspace/synthetic-scene \
+  /data/Andy/fcclip-torch27-cu126.sif \
+  python -m examples.benchmark
 ```
 
 The benchmark generates and renders the same seeded random scene style as
@@ -281,16 +293,15 @@ maps, and visible-instance metadata. You can sweep the image size, batch size,
 sample count, profiler sample count, and random seed:
 
 ```bash
-conda run -n clipdino-cu117 python -m examples.benchmark --width 1920 --height 1080 --batch-size 16 --iterations 200 --profile-iterations 5 --seed 5678
+apptainer exec --nv \
+  --bind "$PWD:/workspace/synthetic-scene" \
+  --pwd /workspace/synthetic-scene \
+  /data/Andy/fcclip-torch27-cu126.sif \
+  python -m examples.benchmark --width 1920 --height 1080 --cameras 16 --iterations 200 --seed 5678
 ```
 
 Pass `--no-shadows` to measure the pipeline with shadow rays disabled, or
 `--no-terrain` to render generated scenes without their procedural terrain:
-
-```bash
-conda run -n clipdino-cu117 python -m examples.benchmark --no-shadows
-conda run -n clipdino-cu117 python -m examples.benchmark --no-terrain
-```
 
 The benchmark uses an unprofiled pass for end-to-end CUDA event and synchronized
 host wall timing. A separate profiler pass attributes GPU execution to random
@@ -411,3 +422,81 @@ machine and scene configuration.
 
 A small visible-count readback determines annotation allocation sizes. Outputs
 contain only visible instances; no workspace API is required to use the renderer.
+
+### Visible object parts
+
+Pass `return_parts=True` to `render_scene` or `render_random_scene` to request
+modal part ground truth (this also enables the instance and semantic maps):
+
+```python
+result = render_scene(width=768, height=512, scene=scene, return_parts=True)
+# result.part_masks[b, p]: boolean H x W visible mask
+# result.part_belongs_to[b, p, o]: part p belongs to visible object o
+# result.visible_instance_ids[b, o]: that object's instance ID
+```
+
+Each geometric primitive is one part: for example, a person's head and separate
+body/limb boxes, or a house's body and roof. Parts are distinguished even when
+primitives share an object instance ID. These are primitive instances, without
+semantic part categories such as “left arm”. Terrain is treated as one part.
+Geometry labeled with instance ID zero is excluded.
+
+`part_count` is an int32 CUDA tensor of shape `B`. `part_map` is an int32 CUDA
+tensor of shape `B x H x W`, with zero for background and compact 1-based part
+IDs. `part_masks` has shape `B x P x H x W` and `part_belongs_to` has shape
+`B x P x O`, both boolean CUDA tensors. `P` is the maximum visible part count
+in the batch, and `O` matches the width of `visible_instance_ids`. Rows beyond
+`part_count[b]` are false; part map ID `p + 1` corresponds to mask row `p`.
+Fully hidden parts are omitted, and masks exclude pixels occluded by other
+parts of the same object as well as other objects. Part ordering follows
+primitive slots and is not a semantic ordering.
+
+Part hits are written during the existing CUDA rendering pass. All scenes reuse
+the primitive visibility bitset and metadata for compaction, avoiding
+full-image ownership scans. A fused CUDA kernel writes the compact label map and
+dense masks. Another CUDA kernel compacts the small metadata table; membership
+is constructed with a CUDA tensor comparison.
+One aggregate count readback sizes the dense mask output. Dense
+masks use `B * P * H * W` bytes, so request parts only when needed. The part
+fields are `None` when `return_parts=False`.
+
+Run `python -m examples.benchmark --compare-outputs` inside the CUDA image to compare RGB,
+object maps, and parts. On an A100 80GB PCIe, an interleaved comparison of the
+original tensor implementation and fused CUDA implementation gave these median
+synchronized wall times for rendering with parts (milliseconds per batch):
+
+| Resolution | Batch | Original | Fused CUDA |
+| --- | ---: | ---: | ---: |
+| 256 x 256 | 1 | 1.51 | 1.27 |
+| 256 x 256 | 8 | 1.95 | 1.54 |
+| 768 x 512 | 1 | 1.59 | 1.35 |
+| 768 x 512 | 8 | 3.79 | 2.33 |
+
+Measurements used seed 1234, default random scenes, shadows enabled, 10 warmups,
+and 50 measured iterations per implementation, excluding scene generation.
+Outputs matched exactly. At 768 x 512 with batch 8, peak additional allocated
+memory decreased from 354 MiB to 330 MiB; dense output sizes remain unchanged.
+
+
+`python -m examples.render` also writes the visible-part visualization to
+[`outputs/part_map.png`](outputs/part_map.png), aligned with
+[`outputs/render.png`](outputs/render.png). Each color denotes one visible part.
+Use `python -m examples.benchmark --parts` to include parts in the existing
+end-to-end benchmark and stage profiler; `--compare-outputs` compares all three
+output modes on pre-generated scenes.
+
+
+Parts and amodal annotations can be requested together:
+
+```python
+result = render_scene(768, 512, scene=generated,
+                      return_parts=True, return_occlusion=True)
+```
+
+Part masks remain modal. Membership columns refer to `visible_instance_ids`;
+match those IDs to each image's `amodal.instance_ids` to associate parts with
+amodal object masks. The union of an object's part masks equals its visible
+object mask. `python -m examples.render --occlusion` exports both visualizations.
+`python -m examples.benchmark --compare-outputs --occlusion` also compares
+amodal-only and combined parts/amodal output modes. The normal benchmark accepts
+`--parts --occlusion` together and counts both annotation types in output memory.

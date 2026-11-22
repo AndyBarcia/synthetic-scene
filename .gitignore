@@ -6,3 +6,4 @@ __pycache__/
 *.py[cod]
 outputs/*
 !outputs/render.png
+!outputs/part_map.png
